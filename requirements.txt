@@ -1,0 +1,27 @@
+# FastAPI and server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# Database
+supabase>=2.10.0
+sqlalchemy>=2.0.36
+
+# Authentication
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+python-multipart>=0.0.17
+
+# AI/ML
+openai>=1.57.0
+langchain>=0.3.13
+
+# Settings and validation
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+python-dotenv>=1.0.1
+
+# HTTP client
+httpx>=0.28.0
+
+# Utilities
+python-dateutil>=2.9.0
