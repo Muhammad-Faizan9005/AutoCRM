@@ -12,8 +12,10 @@ class Settings(BaseSettings):
     SUPABASE_KEY: Optional[str] = None
     DATABASE_URL: Optional[str] = None
     
-    # OpenAI Settings for AI features
-    OPENAI_API_KEY: Optional[str] = None
+    # LLM Settings (supports any LLM provider)
+    LLM_API_KEY: Optional[str] = None
+    LLM_MODEL: str = "gpt-4"  # Model name (e.g., gpt-4, claude-3, gemini-pro, llama-3)
+    LLM_BASE_URL: Optional[str] = None  # Custom API endpoint for local/alternative LLMs
     
     # JWT Settings
     SECRET_KEY: str = "your-secret-key-change-in-production"
