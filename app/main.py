@@ -1,11 +1,16 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.middleware.error_handler import setup_exception_handlers
+
 app = FastAPI(
     title="AutoCRM API",
     description="AI-Powered Customer Relationship Management System",
     version="1.0.0"
 )
+
+# Setup exception handlers
+setup_exception_handlers(app)
 
 # CORS middleware for frontend integration
 app.add_middleware(
@@ -26,7 +31,8 @@ async def health_check():
 
 
 # Include routers
-from app.routers import customers, tickets
+from app.routers import customers, tickets, auth
 
+app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(customers.router, prefix="/api/customers", tags=["Customers"])
 app.include_router(tickets.router, prefix="/api/tickets", tags=["Tickets"])

@@ -18,9 +18,10 @@ class Settings(BaseSettings):
     LLM_BASE_URL: Optional[str] = None  # Custom API endpoint for local/alternative LLMs
     
     # JWT Settings
-    SECRET_KEY: str = "your-secret-key-change-in-production"
-    ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    jwt_secret_key: str = "your-secret-key-change-in-production-min-32-chars"
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = 30
+    jwt_refresh_token_expire_days: int = 7
     
     class Config:
         env_file = ".env"

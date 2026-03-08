@@ -59,6 +59,7 @@ CREATE TABLE ticket_messages (
 CREATE TABLE agents (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
     full_name VARCHAR(255) NOT NULL,
     role VARCHAR(50) DEFAULT 'agent' CHECK (role IN ('admin', 'agent', 'supervisor')),
     is_active BOOLEAN DEFAULT true,
