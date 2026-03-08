@@ -8,6 +8,7 @@ from app.schemas.ticket import (
     TicketCreate, TicketUpdate, TicketResponse,
     TicketMessageCreate, TicketMessageResponse
 )
+from app.auth.dependencies import get_current_user
 
 router = APIRouter()
 
@@ -19,6 +20,7 @@ async def get_tickets(
     status: str = None,
     priority: str = None,
     customer_id: UUID = None,
+    current_user: dict = Depends(get_current_user),
     db: Client = Depends(get_db)
 ):
     """Get all tickets with optional filtering"""
@@ -36,7 +38,11 @@ async def get_tickets(
 
 
 @router.get("/{ticket_id}", response_model=TicketResponse)
-async def get_ticket(ticket_id: UUID, db: Client = Depends(get_db)):
+async def get_ticket(
+    ticket_id: UUID,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_db)
+):
     """Get a specific ticket by ID"""
     response = db.table("tickets").select("*").eq("id", str(ticket_id)).execute()
     
@@ -47,7 +53,11 @@ async def get_ticket(ticket_id: UUID, db: Client = Depends(get_db)):
 
 
 @router.post("/", response_model=TicketResponse, status_code=201)
-async def create_ticket(ticket: TicketCreate, db: Client = Depends(get_db)):
+async def create_ticket(
+    ticket: TicketCreate,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_db)
+):
     """Create a new ticket"""
     ticket_data = ticket.model_dump()
     ticket_data["customer_id"] = str(ticket_data["customer_id"])
@@ -64,6 +74,7 @@ async def create_ticket(ticket: TicketCreate, db: Client = Depends(get_db)):
 async def update_ticket(
     ticket_id: UUID,
     ticket: TicketUpdate,
+    current_user: dict = Depends(get_current_user),
     db: Client = Depends(get_db)
 ):
     """Update a ticket"""
@@ -85,7 +96,11 @@ async def update_ticket(
 
 
 @router.delete("/{ticket_id}", status_code=204)
-async def delete_ticket(ticket_id: UUID, db: Client = Depends(get_db)):
+async def delete_ticket(
+    ticket_id: UUID,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_db)
+):
     """Delete a ticket"""
     response = db.table("tickets").delete().eq("id", str(ticket_id)).execute()
     
@@ -100,7 +115,11 @@ async def delete_ticket(ticket_id: UUID, db: Client = Depends(get_db)):
 # =============================================
 
 @router.get("/{ticket_id}/messages", response_model=List[TicketMessageResponse])
-async def get_ticket_messages(ticket_id: UUID, db: Client = Depends(get_db)):
+async def get_ticket_messages(
+    ticket_id: UUID,
+    current_user: dict = Depends(get_current_user),
+    db: Client = Depends(get_db)
+):
     """Get all messages for a ticket"""
     response = db.table("ticket_messages").select("*").eq(
         "ticket_id", str(ticket_id)
@@ -113,6 +132,7 @@ async def get_ticket_messages(ticket_id: UUID, db: Client = Depends(get_db)):
 async def create_ticket_message(
     ticket_id: UUID,
     message: TicketMessageCreate,
+    current_user: dict = Depends(get_current_user),
     db: Client = Depends(get_db)
 ):
     """Add a message to a ticket"""
