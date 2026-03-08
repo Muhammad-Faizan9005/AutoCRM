@@ -48,6 +48,7 @@ MIGRATION_GUIDE.md
 setup_migrations.md
 DEPLOYMENT_GUIDE.md
 FRONTEND_INTEGRATION_GUIDE.md
+DEVELOPMENT_PLAN.md
 
 # Node modules (if you add frontend later)
 node_modules/
