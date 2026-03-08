@@ -1,98 +1,29 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# PyInstaller
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-
-# Translations
-*.mo
-*.pot
-
-# Environments
-.env
-.env.local
-.env.*.local
-.venv
-env/
+# Virtual Environment
 venv/
 ENV/
-env.bak/
-venv.bak/
+env/
+.venv
 
-# Spyder project settings
-.spyderproject
-.spyproject
+# Environment variables (IMPORTANT: Never commit these!)
+.env
+*.env
+!.env.example
 
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# IDEs
-.idea/
+# IDE
 .vscode/
+.idea/
 *.swp
 *.swo
 *~
 
-# OS files
+# OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
 # Logs
@@ -103,27 +34,21 @@ logs/
 *.db
 *.sqlite3
 
-# Secrets & credentials
-*.pem
-*.key
-secrets.json
-credentials.json
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
 
-# Development planning documents
-DEVELOPMENT_PLAN.md
+# Alembic
+backend/alembic/versions/__pycache__/
+
+# Documentation (generated files)
 AUTHENTICATION_SETUP.md
 MIGRATION_GUIDE.md
 setup_migrations.md
+DEPLOYMENT_GUIDE.md
+FRONTEND_INTEGRATION_GUIDE.md
+DEVELOPMENT_PLAN.md
 
-# Alembic migrations tracking (optional - comment out if you want to track migrations)
-# alembic/versions/*.py
-
-# Backend specific
-backend/.env
-backend/*.log
-backend/logs/
-backend/.pytest_cache/
-backend/htmlcov/
-
-# Database connection strings backup
-database/.applied_migrations
+# Node modules (if you add frontend later)
+node_modules/
