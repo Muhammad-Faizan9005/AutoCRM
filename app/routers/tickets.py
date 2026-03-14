@@ -8,7 +8,7 @@ from app.schemas.ticket import (
     TicketCreate, TicketUpdate, TicketResponse,
     TicketMessageCreate, TicketMessageResponse
 )
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import require_auth
 
 router = APIRouter()
 
@@ -20,7 +20,7 @@ async def get_tickets(
     status: str = None,
     priority: str = None,
     customer_id: UUID = None,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
 ):
     """Get all tickets with optional filtering"""
@@ -40,7 +40,7 @@ async def get_tickets(
 @router.get("/{ticket_id}", response_model=TicketResponse)
 async def get_ticket(
     ticket_id: UUID,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
 ):
     """Get a specific ticket by ID"""
@@ -55,7 +55,7 @@ async def get_ticket(
 @router.post("/", response_model=TicketResponse, status_code=201)
 async def create_ticket(
     ticket: TicketCreate,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
 ):
     """Create a new ticket"""
@@ -74,7 +74,7 @@ async def create_ticket(
 async def update_ticket(
     ticket_id: UUID,
     ticket: TicketUpdate,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
 ):
     """Update a ticket"""
@@ -98,7 +98,7 @@ async def update_ticket(
 @router.delete("/{ticket_id}", status_code=204)
 async def delete_ticket(
     ticket_id: UUID,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
 ):
     """Delete a ticket"""
@@ -117,7 +117,7 @@ async def delete_ticket(
 @router.get("/{ticket_id}/messages", response_model=List[TicketMessageResponse])
 async def get_ticket_messages(
     ticket_id: UUID,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
 ):
     """Get all messages for a ticket"""
@@ -132,7 +132,7 @@ async def get_ticket_messages(
 async def create_ticket_message(
     ticket_id: UUID,
     message: TicketMessageCreate,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
 ):
     """Add a message to a ticket"""

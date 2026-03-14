@@ -1,7 +1,6 @@
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import Optional
-from uuid import UUID
+from typing import Any, Dict
 from supabase import Client
 
 from app.database import get_db
@@ -13,7 +12,7 @@ security = HTTPBearer()
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Client = Depends(get_db)
-):
+) -> Dict[str, Any]:
     """
     Get the current authenticated user from JWT token.
     
@@ -31,7 +30,7 @@ async def get_current_user(
     
     # Verify and decode token
     payload = verify_token(token)
-    if payload is None:
+    if payload is None or payload.get("type") != "access":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials",
@@ -67,12 +66,13 @@ async def get_current_user(
             )
         
         return user
-        
-    except Exception as e:
+
+    except HTTPException:
+        raise
+    except Exception:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication service temporarily unavailable",
         )
 
 
@@ -94,6 +94,16 @@ async def get_current_active_user(current_user: dict = Depends(get_current_user)
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Inactive user"
         )
+    return current_user
+
+
+async def require_auth(current_user: dict = Depends(get_current_user)) -> dict:
+    """
+    Explicit dependency alias for protected endpoints.
+
+    Keeps route signatures consistent and reduces the chance of accidentally
+    exposing endpoints by forgetting the auth dependency.
+    """
     return current_user
 
 

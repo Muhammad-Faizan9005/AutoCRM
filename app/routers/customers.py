@@ -5,7 +5,7 @@ from supabase import Client
 
 from app.database import get_db
 from app.schemas.customer import CustomerCreate, CustomerUpdate, CustomerResponse
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import require_auth
 
 router = APIRouter()
 
@@ -15,7 +15,7 @@ async def get_customers(
     skip: int = 0,
     limit: int = 100,
     status: str = None,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
 ):
     """Get all customers with optional filtering"""
@@ -31,7 +31,7 @@ async def get_customers(
 @router.get("/{customer_id}", response_model=CustomerResponse)
 async def get_customer(
     customer_id: UUID,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
 ):
     """Get a specific customer by ID"""
@@ -46,7 +46,7 @@ async def get_customer(
 @router.post("/", response_model=CustomerResponse, status_code=201)
 async def create_customer(
     customer: CustomerCreate,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
 ):
     """Create a new customer"""
@@ -62,7 +62,7 @@ async def create_customer(
 async def update_customer(
     customer_id: UUID,
     customer: CustomerUpdate,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
 ):
     """Update a customer"""
@@ -82,7 +82,7 @@ async def update_customer(
 @router.delete("/{customer_id}", status_code=204)
 async def delete_customer(
     customer_id: UUID,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
 ):
     """Delete a customer"""
