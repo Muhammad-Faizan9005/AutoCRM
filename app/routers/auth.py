@@ -8,6 +8,7 @@ from app.schemas.auth import (
     LoginRequest,
     LoginResponse,
     RegisterRequest,
+    RegisterResponse,
     UserResponse,
     RefreshTokenRequest,
     TokenResponse
@@ -19,13 +20,13 @@ from app.auth.utils import (
     create_refresh_token,
     verify_token
 )
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import get_current_user, require_auth
 from app.config import settings
 
 router = APIRouter()
 
 
-@router.post("/register", response_model=LoginResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 async def register(
     user_data: RegisterRequest,
     db: Client = Depends(get_db)
@@ -36,7 +37,7 @@ async def register(
     Creates a new agent account with hashed password and returns authentication tokens.
     """
     # Check if user already exists
-    existing_user = db.table("agents").select("*").eq("email", user_data.email).execute()
+    existing_user = db.table("agents").select("id").eq("email", user_data.email).limit(1).execute()
     if existing_user.data:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -63,7 +64,7 @@ async def register(
     access_token = create_access_token(data={"sub": created_user["id"]})
     refresh_token = create_refresh_token(data={"sub": created_user["id"]})
     
-    # Remove password hash from response
+    # Never expose password hashes in API responses.
     created_user.pop("password_hash", None)
     
     return {
@@ -85,7 +86,7 @@ async def login(
     Returns JWT access and refresh tokens upon successful authentication.
     """
     # Get user by email
-    response = db.table("agents").select("*").eq("email", credentials.email).execute()
+    response = db.table("agents").select("*").eq("email", credentials.email).limit(1).execute()
     
     if not response.data:
         raise HTTPException(
@@ -97,7 +98,8 @@ async def login(
     user = response.data[0]
     
     # Verify password
-    if not verify_password(credentials.password, user["password_hash"]):
+    stored_hash = user.get("password_hash")
+    if not stored_hash or not verify_password(credentials.password, stored_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
@@ -127,7 +129,7 @@ async def login(
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_current_user_profile(current_user: dict = Depends(get_current_user)):
+async def get_current_user_profile(current_user: dict = Depends(require_auth)):
     """
     Get current authenticated user profile.
     
@@ -188,7 +190,7 @@ async def refresh_access_token(
 
 
 @router.post("/logout")
-async def logout(current_user: dict = Depends(get_current_user)):
+async def logout(current_user: dict = Depends(require_auth)):
     """
     Logout current user.
     

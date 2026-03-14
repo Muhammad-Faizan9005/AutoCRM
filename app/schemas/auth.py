@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional
+from typing import Literal
 from uuid import UUID
 from datetime import datetime
 
@@ -15,7 +15,20 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=6)
     full_name: str = Field(..., min_length=2, max_length=255)
-    role: Optional[str] = "agent"  # agent, supervisor, admin
+    role: Literal["agent", "supervisor", "admin"] = "agent"
+
+
+class UserPublic(BaseModel):
+    """Safe user payload for API responses"""
+    id: UUID
+    email: str
+    full_name: str
+    role: str
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class TokenResponse(BaseModel):
@@ -31,7 +44,12 @@ class LoginResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
-    user: dict
+    user: UserPublic
+
+
+class RegisterResponse(LoginResponse):
+    """Registration response; same contract as login for frontend simplicity"""
+    pass
 
 
 class RefreshTokenRequest(BaseModel):
