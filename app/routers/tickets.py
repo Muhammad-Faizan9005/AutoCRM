@@ -8,7 +8,7 @@ from app.schemas.ticket import (
     TicketCreate, TicketUpdate, TicketResponse,
     TicketMessageCreate, TicketMessageResponse
 )
-from app.auth.dependencies import require_auth
+from app.auth.dependencies import require_admin, require_auth
 
 router = APIRouter()
 
@@ -85,6 +85,8 @@ async def update_ticket(
     
     # Convert UUID to string if present
     if "assigned_to" in update_data and update_data["assigned_to"]:
+        if current_user.get("role") not in {"sales_manager", "admin"}:
+            raise HTTPException(status_code=403, detail="Only sales_manager or admin can assign tickets")
         update_data["assigned_to"] = str(update_data["assigned_to"])
     
     response = db.table("tickets").update(update_data).eq("id", str(ticket_id)).execute()
@@ -98,7 +100,7 @@ async def update_ticket(
 @router.delete("/{ticket_id}", status_code=204)
 async def delete_ticket(
     ticket_id: UUID,
-    current_user: dict = Depends(require_auth),
+    current_user: dict = Depends(require_admin()),
     db: Client = Depends(get_db)
 ):
     """Delete a ticket"""

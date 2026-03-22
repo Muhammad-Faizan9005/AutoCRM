@@ -5,7 +5,7 @@ from supabase import Client
 
 from app.database import get_db
 from app.schemas.customer import CustomerCreate, CustomerUpdate, CustomerResponse
-from app.auth.dependencies import require_auth
+from app.auth.dependencies import require_admin, require_auth
 
 router = APIRouter()
 
@@ -82,7 +82,7 @@ async def update_customer(
 @router.delete("/{customer_id}", status_code=204)
 async def delete_customer(
     customer_id: UUID,
-    current_user: dict = Depends(require_auth),
+    current_user: dict = Depends(require_admin()),
     db: Client = Depends(get_db)
 ):
     """Delete a customer"""

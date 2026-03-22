@@ -5,6 +5,7 @@ from supabase import Client
 
 from app.database import get_db
 from app.auth.utils import verify_token
+from app.auth.token_store import is_token_blacklisted
 
 security = HTTPBearer()
 
@@ -27,6 +28,13 @@ async def get_current_user(
         HTTPException: If token is invalid or user not found
     """
     token = credentials.credentials
+
+    if is_token_blacklisted(token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been invalidated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     
     # Verify and decode token
     payload = verify_token(token)
@@ -107,7 +115,7 @@ async def require_auth(current_user: dict = Depends(get_current_user)) -> dict:
     return current_user
 
 
-def require_role(allowed_roles: list):
+def require_role(allowed_roles: list[str]):
     """
     Dependency factory to require specific roles.
     
@@ -118,7 +126,7 @@ def require_role(allowed_roles: list):
         Dependency function that checks user role
     """
     async def role_checker(current_user: dict = Depends(get_current_user)):
-        user_role = current_user.get("role", "agent")
+        user_role = current_user.get("role", "sales_rep")
         if user_role not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -127,3 +135,13 @@ def require_role(allowed_roles: list):
         return current_user
     
     return role_checker
+
+
+def require_admin():
+    """Dependency that allows only admin users."""
+    return require_role(["admin"])
+
+
+def require_sales_manager_or_admin():
+    """Dependency that allows sales managers and admins."""
+    return require_role(["sales_manager", "admin"])

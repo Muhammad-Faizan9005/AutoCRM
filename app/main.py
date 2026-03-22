@@ -31,8 +31,9 @@ async def health_check():
 
 
 # Include routers
-from app.routers import customers, tickets, auth
+from app.routers import customers, tickets, auth, users
 
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
+app.include_router(users.router, prefix="/api/users", tags=["Users"])
 app.include_router(customers.router, prefix="/api/customers", tags=["Customers"])
 app.include_router(tickets.router, prefix="/api/tickets", tags=["Tickets"])
