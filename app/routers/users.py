@@ -6,10 +6,16 @@ from supabase import Client
 
 from app.auth.dependencies import require_admin, require_auth
 from app.auth.utils import hash_password
-from app.database import get_db, run_db_operation
+from app.database import get_db
+from app.exceptions.custom_exceptions import ValidationError
+from app.repositories.user_repository import UserRepository
 from app.schemas.user import UserCreate, UserResponse, UserUpdate
 
 router = APIRouter()
+
+
+def get_user_repository(db: Client = Depends(get_db)) -> UserRepository:
+    return UserRepository(db)
 
 
 def _sanitize_user_payload(user: dict) -> dict:
@@ -21,18 +27,18 @@ def _sanitize_user_payload(user: dict) -> dict:
 @router.get("/", response_model=list[UserResponse])
 async def list_users(
     current_user: dict = Depends(require_admin()),
-    db: Client = Depends(get_db),
+    repository: UserRepository = Depends(get_user_repository),
 ):
     """List all users. Admin only."""
-    response = await run_db_operation(lambda: db.table("agents").select("*").execute())
-    return [_sanitize_user_payload(row) for row in response.data]
+    users = await repository.list(limit=1000)
+    return [_sanitize_user_payload(row) for row in users]
 
 
 @router.get("/{user_id}", response_model=UserResponse)
 async def get_user(
     user_id: UUID,
     current_user: dict = Depends(require_auth),
-    db: Client = Depends(get_db),
+    repository: UserRepository = Depends(get_user_repository),
 ):
     """Get user details. Admin can view all; others can view themselves."""
     requester_id = str(current_user.get("id"))
@@ -45,26 +51,19 @@ async def get_user(
             detail="Insufficient permissions",
         )
 
-    response = await run_db_operation(
-        lambda: db.table("agents").select("*").eq("id", target_id).limit(1).execute()
-    )
-    if not response.data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    return _sanitize_user_payload(response.data[0])
+    user = await repository.get_by_id(target_id)
+    return _sanitize_user_payload(user)
 
 
 @router.post("/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(
     payload: UserCreate,
     current_user: dict = Depends(require_admin()),
-    db: Client = Depends(get_db),
+    repository: UserRepository = Depends(get_user_repository),
 ):
     """Create a new user. Admin only."""
-    existing = await run_db_operation(
-        lambda: db.table("agents").select("id").eq("email", payload.email).limit(1).execute()
-    )
-    if existing.data:
+    existing = await repository.find_by_email(str(payload.email))
+    if existing:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
 
     user_data = payload.model_dump(exclude={"password"})
@@ -72,11 +71,8 @@ async def create_user(
     user_data["password_hash"] = hash_password(payload.password)
     user_data["is_active"] = True
 
-    created = await run_db_operation(lambda: db.table("agents").insert(user_data).execute())
-    if not created.data:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Failed to create user")
-
-    return _sanitize_user_payload(created.data[0])
+    created = await repository.create(user_data)
+    return _sanitize_user_payload(created)
 
 
 @router.patch("/{user_id}", response_model=UserResponse)
@@ -84,7 +80,7 @@ async def update_user(
     user_id: UUID,
     payload: UserUpdate,
     current_user: dict = Depends(require_auth),
-    db: Client = Depends(get_db),
+    repository: UserRepository = Depends(get_user_repository),
 ):
     """Update user profile; role/status changes are admin-only."""
     requester_id = str(current_user.get("id"))
@@ -99,7 +95,7 @@ async def update_user(
 
     update_data = payload.model_dump(exclude_unset=True)
     if not update_data:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
+        raise ValidationError(detail="No fields to update")
 
     if requester_role != "admin" and ({"role", "is_active"} & set(update_data.keys())):
         raise HTTPException(
@@ -110,26 +106,17 @@ async def update_user(
     if "password" in update_data:
         update_data["password_hash"] = hash_password(update_data.pop("password"))
 
-    updated = await run_db_operation(
-        lambda: db.table("agents").update(update_data).eq("id", target_id).execute()
-    )
-    if not updated.data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    return _sanitize_user_payload(updated.data[0])
+    updated = await repository.update_by_id(target_id, update_data)
+    return _sanitize_user_payload(updated)
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(
     user_id: UUID,
     current_user: dict = Depends(require_admin()),
-    db: Client = Depends(get_db),
+    repository: UserRepository = Depends(get_user_repository),
 ):
     """Deactivate user account. Admin only."""
-    deactivated = await run_db_operation(
-        lambda: db.table("agents").update({"is_active": False}).eq("id", str(user_id)).execute()
-    )
-    if not deactivated.data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    await repository.update_by_id(str(user_id), {"is_active": False})
 
     return None

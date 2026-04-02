@@ -24,6 +24,7 @@ from app.auth.utils import (
 from app.auth.dependencies import require_auth
 from app.auth.token_store import blacklist_token, is_token_blacklisted
 from app.config import settings
+from app.utils.sanitization import sanitize_payload
 
 router = APIRouter()
 security = HTTPBearer()
@@ -39,9 +40,11 @@ async def register(
     
     Creates a new sales_rep account with hashed password and returns authentication tokens.
     """
+    sanitized_payload = sanitize_payload(user_data.model_dump(), skip_keys={"password"})
+
     # Check if user already exists
     existing_user = await run_db_operation(
-        lambda: db.table("agents").select("id").eq("email", user_data.email).limit(1).execute()
+        lambda: db.table("agents").select("id").eq("email", sanitized_payload["email"]).limit(1).execute()
     )
     if existing_user.data:
         raise HTTPException(
@@ -55,9 +58,9 @@ async def register(
     # Create user
     new_user = {
         "id": str(uuid.uuid4()),
-        "email": user_data.email,
+        "email": sanitized_payload["email"],
         "password_hash": hashed_password,
-        "full_name": user_data.full_name,
+        "full_name": sanitized_payload["full_name"],
         "role": "sales_rep",
         "is_active": True
     }

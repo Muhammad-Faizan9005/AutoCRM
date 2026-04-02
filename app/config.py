@@ -45,6 +45,12 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Security hardening settings
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_REQUESTS_PER_MINUTE: int = 120
+    MAX_REQUEST_SIZE_BYTES: int = 1_048_576
+    SECURITY_HEADERS_ENABLED: bool = True
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 
     @property
