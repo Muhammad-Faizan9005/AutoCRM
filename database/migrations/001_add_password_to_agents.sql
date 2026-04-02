@@ -12,12 +12,12 @@ BEGIN
         AND column_name = 'password_hash'
     ) THEN
         ALTER TABLE agents ADD COLUMN password_hash VARCHAR(255);
-        
-        -- Make it required for new records (optional: update existing records first)
-        -- You may want to update existing records with a default password hash before running this
+
+        -- Existing rows receive a forced-reset placeholder before NOT NULL is enforced.
+        UPDATE agents
+        SET password_hash = '__PASSWORD_RESET_REQUIRED__'
+        WHERE password_hash IS NULL;
+
         ALTER TABLE agents ALTER COLUMN password_hash SET NOT NULL;
     END IF;
 END $$;
-
--- Note: For existing agents, you need to set a password_hash before this migration
--- Example: UPDATE agents SET password_hash = '$2b$12$...' WHERE password_hash IS NULL;

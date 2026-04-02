@@ -1,13 +1,16 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.middleware.error_handler import setup_exception_handlers
+from app.middleware.error_handler import error_handler_middleware, setup_exception_handlers
 
 app = FastAPI(
     title="AutoCRM API",
     description="AI-Powered Customer Relationship Management System",
     version="1.0.0"
 )
+
+# Attach request id middleware before handlers and routers.
+app.middleware("http")(error_handler_middleware)
 
 # Setup exception handlers
 setup_exception_handlers(app)

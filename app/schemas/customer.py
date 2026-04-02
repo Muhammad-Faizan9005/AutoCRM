@@ -1,7 +1,10 @@
 from pydantic import BaseModel, EmailStr
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime
 from uuid import UUID
+
+
+CustomerStatus = Literal["active", "inactive", "lead", "churned"]
 
 
 class CustomerBase(BaseModel):
@@ -9,7 +12,7 @@ class CustomerBase(BaseModel):
     full_name: str
     phone: Optional[str] = None
     company: Optional[str] = None
-    status: Optional[str] = "active"
+    status: Optional[CustomerStatus] = "active"
     notes: Optional[str] = None
 
 
@@ -22,7 +25,7 @@ class CustomerUpdate(BaseModel):
     full_name: Optional[str] = None
     phone: Optional[str] = None
     company: Optional[str] = None
-    status: Optional[str] = None
+    status: Optional[CustomerStatus] = None
     notes: Optional[str] = None
 
 

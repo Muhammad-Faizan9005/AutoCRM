@@ -3,10 +3,10 @@ from typing import List
 from uuid import UUID
 from supabase import Client
 
-from app.database import get_db
+from app.database import get_db, run_db_operation
 from app.schemas.ticket import (
     TicketCreate, TicketUpdate, TicketResponse,
-    TicketMessageCreate, TicketMessageResponse
+    TicketMessageCreate, TicketMessageResponse, TicketPriority, TicketStatus
 )
 from app.auth.dependencies import require_admin, require_auth
 
@@ -17,8 +17,8 @@ router = APIRouter()
 async def get_tickets(
     skip: int = 0,
     limit: int = 100,
-    status: str = None,
-    priority: str = None,
+    status: TicketStatus | None = None,
+    priority: TicketPriority | None = None,
     customer_id: UUID = None,
     current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db)
@@ -33,7 +33,9 @@ async def get_tickets(
     if customer_id:
         query = query.eq("customer_id", str(customer_id))
     
-    response = query.order("created_at", desc=True).range(skip, skip + limit - 1).execute()
+    response = await run_db_operation(
+        lambda: query.order("created_at", desc=True).range(skip, skip + limit - 1).execute()
+    )
     return response.data
 
 
@@ -44,7 +46,9 @@ async def get_ticket(
     db: Client = Depends(get_db)
 ):
     """Get a specific ticket by ID"""
-    response = db.table("tickets").select("*").eq("id", str(ticket_id)).execute()
+    response = await run_db_operation(
+        lambda: db.table("tickets").select("*").eq("id", str(ticket_id)).execute()
+    )
     
     if not response.data:
         raise HTTPException(status_code=404, detail="Ticket not found")
@@ -62,7 +66,7 @@ async def create_ticket(
     ticket_data = ticket.model_dump()
     ticket_data["customer_id"] = str(ticket_data["customer_id"])
     
-    response = db.table("tickets").insert(ticket_data).execute()
+    response = await run_db_operation(lambda: db.table("tickets").insert(ticket_data).execute())
     
     if not response.data:
         raise HTTPException(status_code=400, detail="Failed to create ticket")
@@ -84,12 +88,15 @@ async def update_ticket(
         raise HTTPException(status_code=400, detail="No fields to update")
     
     # Convert UUID to string if present
-    if "assigned_to" in update_data and update_data["assigned_to"]:
+    if "assigned_to" in update_data:
         if current_user.get("role") not in {"sales_manager", "admin"}:
             raise HTTPException(status_code=403, detail="Only sales_manager or admin can assign tickets")
-        update_data["assigned_to"] = str(update_data["assigned_to"])
+        assigned_to = update_data["assigned_to"]
+        update_data["assigned_to"] = str(assigned_to) if assigned_to else None
     
-    response = db.table("tickets").update(update_data).eq("id", str(ticket_id)).execute()
+    response = await run_db_operation(
+        lambda: db.table("tickets").update(update_data).eq("id", str(ticket_id)).execute()
+    )
     
     if not response.data:
         raise HTTPException(status_code=404, detail="Ticket not found")
@@ -104,7 +111,9 @@ async def delete_ticket(
     db: Client = Depends(get_db)
 ):
     """Delete a ticket"""
-    response = db.table("tickets").delete().eq("id", str(ticket_id)).execute()
+    response = await run_db_operation(
+        lambda: db.table("tickets").delete().eq("id", str(ticket_id)).execute()
+    )
     
     if not response.data:
         raise HTTPException(status_code=404, detail="Ticket not found")
@@ -123,9 +132,11 @@ async def get_ticket_messages(
     db: Client = Depends(get_db)
 ):
     """Get all messages for a ticket"""
-    response = db.table("ticket_messages").select("*").eq(
-        "ticket_id", str(ticket_id)
-    ).order("created_at").execute()
+    response = await run_db_operation(
+        lambda: db.table("ticket_messages").select("*").eq(
+            "ticket_id", str(ticket_id)
+        ).order("created_at").execute()
+    )
     
     return response.data
 
@@ -144,7 +155,9 @@ async def create_ticket_message(
     if message_data.get("sender_id"):
         message_data["sender_id"] = str(message_data["sender_id"])
     
-    response = db.table("ticket_messages").insert(message_data).execute()
+    response = await run_db_operation(
+        lambda: db.table("ticket_messages").insert(message_data).execute()
+    )
     
     if not response.data:
         raise HTTPException(status_code=400, detail="Failed to create message")

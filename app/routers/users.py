@@ -6,7 +6,7 @@ from supabase import Client
 
 from app.auth.dependencies import require_admin, require_auth
 from app.auth.utils import hash_password
-from app.database import get_db
+from app.database import get_db, run_db_operation
 from app.schemas.user import UserCreate, UserResponse, UserUpdate
 
 router = APIRouter()
@@ -24,7 +24,7 @@ async def list_users(
     db: Client = Depends(get_db),
 ):
     """List all users. Admin only."""
-    response = db.table("agents").select("*").execute()
+    response = await run_db_operation(lambda: db.table("agents").select("*").execute())
     return [_sanitize_user_payload(row) for row in response.data]
 
 
@@ -45,7 +45,9 @@ async def get_user(
             detail="Insufficient permissions",
         )
 
-    response = db.table("agents").select("*").eq("id", target_id).limit(1).execute()
+    response = await run_db_operation(
+        lambda: db.table("agents").select("*").eq("id", target_id).limit(1).execute()
+    )
     if not response.data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
@@ -59,7 +61,9 @@ async def create_user(
     db: Client = Depends(get_db),
 ):
     """Create a new user. Admin only."""
-    existing = db.table("agents").select("id").eq("email", payload.email).limit(1).execute()
+    existing = await run_db_operation(
+        lambda: db.table("agents").select("id").eq("email", payload.email).limit(1).execute()
+    )
     if existing.data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
 
@@ -68,7 +72,7 @@ async def create_user(
     user_data["password_hash"] = hash_password(payload.password)
     user_data["is_active"] = True
 
-    created = db.table("agents").insert(user_data).execute()
+    created = await run_db_operation(lambda: db.table("agents").insert(user_data).execute())
     if not created.data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Failed to create user")
 
@@ -106,7 +110,9 @@ async def update_user(
     if "password" in update_data:
         update_data["password_hash"] = hash_password(update_data.pop("password"))
 
-    updated = db.table("agents").update(update_data).eq("id", target_id).execute()
+    updated = await run_db_operation(
+        lambda: db.table("agents").update(update_data).eq("id", target_id).execute()
+    )
     if not updated.data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
@@ -120,7 +126,9 @@ async def delete_user(
     db: Client = Depends(get_db),
 ):
     """Deactivate user account. Admin only."""
-    deactivated = db.table("agents").update({"is_active": False}).eq("id", str(user_id)).execute()
+    deactivated = await run_db_operation(
+        lambda: db.table("agents").update({"is_active": False}).eq("id", str(user_id)).execute()
+    )
     if not deactivated.data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 

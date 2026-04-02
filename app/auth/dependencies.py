@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Any, Dict
 from supabase import Client
 
-from app.database import get_db
+from app.database import get_db, run_db_operation
 from app.auth.utils import verify_token
 from app.auth.token_store import is_token_blacklisted
 
@@ -29,7 +29,7 @@ async def get_current_user(
     """
     token = credentials.credentials
 
-    if is_token_blacklisted(token):
+    if await is_token_blacklisted(db, token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has been invalidated",
@@ -56,7 +56,9 @@ async def get_current_user(
     
     # Get user from database
     try:
-        response = db.table("agents").select("*").eq("id", user_id).single().execute()
+        response = await run_db_operation(
+            lambda: db.table("agents").select("*").eq("id", user_id).single().execute()
+        )
         user = response.data
         
         if not user:

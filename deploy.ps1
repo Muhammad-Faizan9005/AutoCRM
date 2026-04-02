@@ -68,35 +68,13 @@ Write-Host "Checking Git status..." -ForegroundColor Yellow
 $gitStatus = git status --porcelain
 if ($gitStatus) {
     Write-Host "You have uncommitted changes" -ForegroundColor Yellow
+    Write-Host "Deployment scripts no longer modify git state automatically." -ForegroundColor Yellow
     Write-Host ""
-    $commit = Read-Host "Commit and push changes? (y/n)"
+    $continueDeploy = Read-Host "Continue deployment anyway? (y/n)"
 
-    if ($commit -eq "y" -or $commit -eq "Y") {
-        Write-Host ""
-        $message = Read-Host "Commit message (or press Enter for default)"
-        if ([string]::IsNullOrWhiteSpace($message)) {
-            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm"
-            $message = "Deploy to Railway - $timestamp"
-        }
-
-        Write-Host "Committing changes..." -ForegroundColor Yellow
-        git add .
-        git commit -m $message
-
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "[OK] Changes committed" -ForegroundColor Green
-
-            Write-Host ""
-            Write-Host "Pushing to remote..." -ForegroundColor Yellow
-            git push
-
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "[OK] Changes pushed" -ForegroundColor Green
-            }
-            else {
-                Write-Host "Push failed, but continuing with deployment" -ForegroundColor Yellow
-            }
-        }
+    if ($continueDeploy -ne "y" -and $continueDeploy -ne "Y") {
+        Write-Host "Deployment canceled. Commit/push manually and rerun." -ForegroundColor Yellow
+        exit 0
     }
 }
 

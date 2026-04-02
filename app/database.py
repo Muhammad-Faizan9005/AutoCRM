@@ -1,5 +1,11 @@
+from typing import Callable, TypeVar
+
+from fastapi.concurrency import run_in_threadpool
 from supabase import create_client, Client
+
 from app.config import settings
+
+T = TypeVar("T")
 
 
 def get_supabase_client() -> Client:
@@ -25,3 +31,8 @@ def get_db() -> Client:
     if supabase is None:
         supabase = get_supabase_client()
     return supabase
+
+
+async def run_db_operation(operation: Callable[[], T]) -> T:
+    """Run synchronous Supabase operations in a thread to avoid event-loop blocking."""
+    return await run_in_threadpool(operation)

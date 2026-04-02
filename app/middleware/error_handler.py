@@ -9,32 +9,14 @@ import uuid
 
 async def error_handler_middleware(request: Request, call_next):
     """
-    Global error handling middleware for all requests.
+    Attach request_id to every request/response for traceability.
     """
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
-    
-    try:
-        response = await call_next(request)
-        return response
-    except Exception as exc:
-        # Log the error
-        print(f"[ERROR] {request_id} - {str(exc)}")
-        print(traceback.format_exc())
-        
-        # Return standardized error response
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "error": {
-                    "code": "INTERNAL_SERVER_ERROR",
-                    "message": "An unexpected error occurred",
-                    "request_id": request_id,
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-            }
-        )
+
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 def setup_exception_handlers(app):

@@ -68,6 +68,15 @@ CREATE TABLE agents (
 );
 
 -- =============================================
+-- REVOKED TOKENS (JWT invalidation)
+-- =============================================
+CREATE TABLE revoked_tokens (
+    token_hash VARCHAR(64) PRIMARY KEY,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- =============================================
 -- AI INTERACTIONS LOG (for analytics)
 -- =============================================
 CREATE TABLE ai_interactions (
@@ -92,6 +101,7 @@ CREATE INDEX idx_tickets_priority ON tickets(priority);
 CREATE INDEX idx_tickets_created_at ON tickets(created_at DESC);
 CREATE INDEX idx_ticket_messages_ticket_id ON ticket_messages(ticket_id);
 CREATE INDEX idx_ai_interactions_ticket_id ON ai_interactions(ticket_id);
+CREATE INDEX idx_revoked_tokens_expires_at ON revoked_tokens(expires_at);
 
 -- =============================================
 -- UPDATE TIMESTAMP TRIGGER
@@ -127,10 +137,41 @@ ALTER TABLE tickets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ticket_messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ai_interactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE revoked_tokens ENABLE ROW LEVEL SECURITY;
 
--- Allow all operations for authenticated users (adjust as needed)
-CREATE POLICY "Allow all for authenticated users" ON customers FOR ALL USING (true);
-CREATE POLICY "Allow all for authenticated users" ON tickets FOR ALL USING (true);
-CREATE POLICY "Allow all for authenticated users" ON ticket_messages FOR ALL USING (true);
-CREATE POLICY "Allow all for authenticated users" ON agents FOR ALL USING (true);
-CREATE POLICY "Allow all for authenticated users" ON ai_interactions FOR ALL USING (true);
+-- App data tables are accessible only to authenticated users.
+CREATE POLICY "authenticated_customers_access"
+    ON customers FOR ALL TO authenticated
+    USING (auth.role() = 'authenticated')
+    WITH CHECK (auth.role() = 'authenticated');
+
+CREATE POLICY "authenticated_tickets_access"
+    ON tickets FOR ALL TO authenticated
+    USING (auth.role() = 'authenticated')
+    WITH CHECK (auth.role() = 'authenticated');
+
+CREATE POLICY "authenticated_ticket_messages_access"
+    ON ticket_messages FOR ALL TO authenticated
+    USING (auth.role() = 'authenticated')
+    WITH CHECK (auth.role() = 'authenticated');
+
+CREATE POLICY "authenticated_ai_interactions_access"
+    ON ai_interactions FOR ALL TO authenticated
+    USING (auth.role() = 'authenticated')
+    WITH CHECK (auth.role() = 'authenticated');
+
+-- Agents can view/update their own profile when using Supabase Auth JWTs.
+CREATE POLICY "agents_self_read"
+    ON agents FOR SELECT TO authenticated
+    USING (id = auth.uid());
+
+CREATE POLICY "agents_self_update"
+    ON agents FOR UPDATE TO authenticated
+    USING (id = auth.uid())
+    WITH CHECK (id = auth.uid());
+
+-- Revocation table is intended for backend service usage.
+CREATE POLICY "service_role_revoked_tokens_access"
+    ON revoked_tokens FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);

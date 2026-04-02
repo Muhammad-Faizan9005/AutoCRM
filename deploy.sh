@@ -66,34 +66,13 @@ echo "✓ Railway project linked"
 echo ""
 echo "Checking Git status..."
 if [[ -n $(git status --porcelain) ]]; then
-    echo "⚠️  You have uncommitted changes"
-    echo ""
-    read -p "Commit and push changes? (y/n): " commit
-    
-    if [[ $commit == "y" || $commit == "Y" ]]; then
-        echo ""
-        read -p "Commit message (or press Enter for default): " message
-        if [[ -z "$message" ]]; then
-            message="Deploy to Railway - $(date '+%Y-%m-%d %H:%M')"
-        fi
-        
-        echo "Committing changes..."
-        git add .
-        git commit -m "$message"
-        
-        if [ $? -eq 0 ]; then
-            echo "✓ Changes committed"
-            
-            echo ""
-            echo "Pushing to remote..."
-            git push
-            
-            if [ $? -eq 0 ]; then
-                echo "✓ Changes pushed"
-            else
-                echo "⚠️  Push failed, but continuing with deployment"
-            fi
-        fi
+    echo "⚠️  You have uncommitted changes."
+    echo "Deployment scripts no longer modify git state automatically."
+    read -p "Continue deployment anyway? (y/n): " continueDeploy
+
+    if [[ $continueDeploy != "y" && $continueDeploy != "Y" ]]; then
+        echo "Deployment canceled. Commit/push manually and rerun."
+        exit 0
     fi
 fi
 

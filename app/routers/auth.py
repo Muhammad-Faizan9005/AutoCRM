@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import Client
 import uuid
 
-from app.database import get_db
+from app.database import get_db, run_db_operation
 from app.schemas.auth import (
     LoginRequest,
     LoginResponse,
@@ -21,7 +21,7 @@ from app.auth.utils import (
     create_refresh_token,
     verify_token
 )
-from app.auth.dependencies import get_current_user, require_auth
+from app.auth.dependencies import require_auth
 from app.auth.token_store import blacklist_token, is_token_blacklisted
 from app.config import settings
 
@@ -37,10 +37,12 @@ async def register(
     """
     Register a new agent/user.
     
-    Creates a new agent account with hashed password and returns authentication tokens.
+    Creates a new sales_rep account with hashed password and returns authentication tokens.
     """
     # Check if user already exists
-    existing_user = db.table("agents").select("id").eq("email", user_data.email).limit(1).execute()
+    existing_user = await run_db_operation(
+        lambda: db.table("agents").select("id").eq("email", user_data.email).limit(1).execute()
+    )
     if existing_user.data:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -56,11 +58,11 @@ async def register(
         "email": user_data.email,
         "password_hash": hashed_password,
         "full_name": user_data.full_name,
-        "role": user_data.role,
+        "role": "sales_rep",
         "is_active": True
     }
     
-    response = db.table("agents").insert(new_user).execute()
+    response = await run_db_operation(lambda: db.table("agents").insert(new_user).execute())
     created_user = response.data[0]
     
     # Create tokens
@@ -89,7 +91,9 @@ async def login(
     Returns JWT access and refresh tokens upon successful authentication.
     """
     # Get user by email
-    response = db.table("agents").select("*").eq("email", credentials.email).limit(1).execute()
+    response = await run_db_operation(
+        lambda: db.table("agents").select("*").eq("email", credentials.email).limit(1).execute()
+    )
     
     if not response.data:
         raise HTTPException(
@@ -153,7 +157,7 @@ async def refresh_access_token(
     
     Returns new access and refresh tokens.
     """
-    if is_token_blacklisted(refresh_data.refresh_token):
+    if await is_token_blacklisted(db, refresh_data.refresh_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token has been invalidated",
@@ -179,7 +183,7 @@ async def refresh_access_token(
         )
     
     # Verify user still exists and is active
-    response = db.table("agents").select("*").eq("id", user_id).execute()
+    response = await run_db_operation(lambda: db.table("agents").select("*").eq("id", user_id).execute())
     if not response.data or not response.data[0].get("is_active", True):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -192,13 +196,13 @@ async def refresh_access_token(
     new_refresh_token = create_refresh_token(data={"sub": user_id})
 
     # Refresh token rotation: old refresh token is no longer valid.
-    blacklist_token(refresh_data.refresh_token, payload.get("exp"))
+    await blacklist_token(db, refresh_data.refresh_token, payload.get("exp"))
     
     return {
         "access_token": access_token,
         "refresh_token": new_refresh_token,
         "token_type": "bearer",
-        "expires_in": settings.jwt_access_token_expire_minutes * 60
+        "expires_in": settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60
     }
 
 
@@ -207,6 +211,7 @@ async def logout(
     payload: LogoutRequest | None = None,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     current_user: dict = Depends(require_auth),
+    db: Client = Depends(get_db),
 ):
     """
     Logout current user.
@@ -216,13 +221,13 @@ async def logout(
     """
     access_payload = verify_token(credentials.credentials)
     if access_payload and access_payload.get("exp"):
-        blacklist_token(credentials.credentials, access_payload.get("exp"))
+        await blacklist_token(db, credentials.credentials, access_payload.get("exp"))
 
     refresh_token = payload.refresh_token if payload else None
     if refresh_token:
         refresh_payload = verify_token(refresh_token)
         if refresh_payload and refresh_payload.get("exp"):
-            blacklist_token(refresh_token, refresh_payload.get("exp"))
+            await blacklist_token(db, refresh_token, refresh_payload.get("exp"))
 
     return {
         "success": True,

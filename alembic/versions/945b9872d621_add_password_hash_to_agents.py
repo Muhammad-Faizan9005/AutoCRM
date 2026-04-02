@@ -20,15 +20,20 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Upgrade schema - Add password_hash column to agents table."""
-    # Add password_hash column (nullable initially to support existing records)
-    op.add_column('agents', 
-        sa.Column('password_hash', sa.String(255), nullable=True)
+    op.add_column("agents", sa.Column("password_hash", sa.String(length=255), nullable=True))
+
+    # Existing accounts must receive a forced-reset placeholder before NOT NULL enforcement.
+    op.execute(
+        """
+        UPDATE agents
+        SET password_hash = '__PASSWORD_RESET_REQUIRED__'
+        WHERE password_hash IS NULL
+        """
     )
-    
-    # NOTE: After ensuring all agents have passwords set, you can make it NOT NULL:
-    # op.alter_column('agents', 'password_hash', nullable=False)
+
+    op.alter_column("agents", "password_hash", existing_type=sa.String(length=255), nullable=False)
 
 
 def downgrade() -> None:
     """Downgrade schema - Remove password_hash column from agents table."""
-    op.drop_column('agents', 'password_hash')
+    op.drop_column("agents", "password_hash")

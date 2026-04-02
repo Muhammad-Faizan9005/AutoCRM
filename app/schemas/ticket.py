@@ -1,14 +1,19 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime
 from uuid import UUID
+
+
+TicketStatus = Literal["open", "in_progress", "pending", "resolved", "closed"]
+TicketPriority = Literal["low", "medium", "high", "urgent"]
+TicketSenderType = Literal["customer", "agent", "ai"]
 
 
 class TicketBase(BaseModel):
     subject: str
     description: Optional[str] = None
-    status: Optional[str] = "open"
-    priority: Optional[str] = "medium"
+    status: Optional[TicketStatus] = "open"
+    priority: Optional[TicketPriority] = "medium"
     category: Optional[str] = None
 
 
@@ -19,8 +24,8 @@ class TicketCreate(TicketBase):
 class TicketUpdate(BaseModel):
     subject: Optional[str] = None
     description: Optional[str] = None
-    status: Optional[str] = None
-    priority: Optional[str] = None
+    status: Optional[TicketStatus] = None
+    priority: Optional[TicketPriority] = None
     category: Optional[str] = None
     assigned_to: Optional[UUID] = None
 
@@ -42,11 +47,10 @@ class TicketResponse(TicketBase):
 
 class TicketMessageBase(BaseModel):
     content: str
-    sender_type: str  # 'customer', 'agent', 'ai'
+    sender_type: TicketSenderType
 
 
 class TicketMessageCreate(TicketMessageBase):
-    ticket_id: UUID
     sender_id: Optional[UUID] = None
 
 

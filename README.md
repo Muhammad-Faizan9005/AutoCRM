@@ -37,7 +37,7 @@ AutoCRM addresses these challenges by integrating AI-powered automation.
 - 👥 **Customer Management** - Complete customer profiles with contact info, company details, and interaction history
 - 🎫 **Ticket System** - Full-featured support ticket lifecycle management
 - 💬 **Conversation Threads** - Threaded messaging for each ticket with agent/customer/AI attribution
-- 👨‍💼 **Agent Management** - Role-based access for admins, supervisors, and agents
+- 👨‍💼 **Agent Management** - Role-based access for admins, sales managers, and sales reps
 
 ### AI-Powered Features
 - 🧠 **Smart Ticket Categorization** - Automatic classification of incoming tickets
@@ -205,10 +205,14 @@ GET /api/tickets?status=open&priority=high&customer_id=uuid
 |----------|-------------|----------|
 | `SUPABASE_URL` | Supabase project URL | ✅ |
 | `SUPABASE_KEY` | Supabase anon/public key | ✅ |
+| `DATABASE_URL` | PostgreSQL URL for Alembic migrations | ✅ (for migrations) |
 | `LLM_API_KEY` | API key for LLM provider | ❌ |
 | `LLM_MODEL` | Model name (e.g., gpt-4, claude-3) | ❌ |
 | `LLM_BASE_URL` | Custom endpoint for local LLMs | ❌ |
-| `SECRET_KEY` | JWT signing key | ✅ |
+| `JWT_SECRET_KEY` | JWT signing key | ✅ |
+| `JWT_ALGORITHM` | JWT signing algorithm | ❌ (default: HS256) |
+| `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | Access-token expiry in minutes | ❌ (default: 30) |
+| `JWT_REFRESH_TOKEN_EXPIRE_DAYS` | Refresh-token expiry in days | ❌ (default: 7) |
 
 ---
 
