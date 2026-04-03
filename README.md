@@ -7,9 +7,9 @@
 ![Supabase](https://img.shields.io/badge/Supabase-Database-3ECF8E?style=for-the-badge&logo=supabase&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
 
-**AI-Powered Customer Relationship Management System**
+**AI-Ready Customer Relationship Management System**
 
-[Features](#-features) • [Installation](#-installation) • [API Documentation](#-api-documentation) • [Architecture](#-architecture) • [Contributing](#-contributing)
+[Features](#-features) • [Installation](#-installation) • [API Documentation](#-api-documentation) • [Project Structure](#-project-structure) • [Contributing](#-contributing)
 
 </div>
 
@@ -17,7 +17,7 @@
 
 ## 📋 Overview
 
-AutoCRM is an intelligent Customer Relationship Management system that leverages AI/LLM capabilities to automate and enhance customer support operations. Built as a Final Year Project, it demonstrates the integration of modern AI technologies with traditional CRM functionality.
+AutoCRM is a Customer Relationship Management backend built with FastAPI and Supabase. The current implementation delivers production-oriented CRM fundamentals (auth, RBAC, CRUD, imports, security middleware), while AI/LLM features are scaffolded and planned in the roadmap.
 
 ### 🎯 Problem Statement
 
@@ -43,7 +43,7 @@ AutoCRM addresses these challenges by integrating AI-powered automation.
 - 🧱 **Repository Architecture** - Centralized data access layer with reusable CRUD and error mapping
 - 🛡️ **Security Hardening** - Request correlation IDs, structured logs, rate limiting, request-size guard, and secure headers
 
-### AI-Powered Features
+### Planned AI Features
 
 - 🧠 **Smart Ticket Categorization** - Automatic classification of incoming tickets
 - 📊 **Sentiment Analysis** - Real-time customer mood detection
@@ -60,7 +60,7 @@ AutoCRM addresses these challenges by integrating AI-powered automation.
 | **Backend**        | Python, FastAPI                                      |
 | **Database**       | Supabase (PostgreSQL)                                |
 | **AI/LLM**         | Configurable (OpenAI, Anthropic, Gemini, Local LLMs) |
-| **Authentication** | JWT, Supabase Auth                                   |
+| **Authentication** | JWT, RBAC, refresh-token rotation + revocation       |
 | **API Docs**       | OpenAPI/Swagger                                      |
 
 ---
@@ -104,14 +104,26 @@ AutoCRM addresses these challenges by integrating AI-powered automation.
 4. **Configure environment variables**
 
    ```bash
+   # macOS/Linux
    cp .env.example .env
+
+   # Windows PowerShell
+   Copy-Item .env.example .env
+
    # Edit .env with your credentials
    ```
 
-5. **Set up Supabase database**
+5. **Set up Supabase database and run migrations**
    - Create a new project at [supabase.com](https://supabase.com)
-   - Go to SQL Editor and run the schema from `database/schema.sql`
-   - Copy your project URL and anon key to `.env`
+   - Fill `.env` with `SUPABASE_URL`, an API key (`SUPABASE_KEY` or fallback keys), and `DATABASE_URL`
+   - Apply schema/migrations:
+
+   ```bash
+   python -m alembic upgrade head
+   python -m alembic current
+   ```
+
+   Note: on a fresh database, migration `945b9872d621` bootstraps the base schema automatically.
 
 6. **Run the server**
 
@@ -131,22 +143,37 @@ AutoCRM addresses these challenges by integrating AI-powered automation.
 ```
 AutoCRM/
 ├── backend/
+│   ├── alembic/                  # Alembic environment + revision scripts
 │   ├── app/
 │   │   ├── __init__.py
 │   │   ├── main.py           # FastAPI application entry
 │   │   ├── config.py         # Settings & environment config
 │   │   ├── database.py       # Supabase client connection
+│   │   ├── auth/             # JWT helpers, dependencies, token revocation
+│   │   ├── middleware/       # Error handling, logging, security, rate limiting
+│   │   ├── repositories/     # Data access layer
 │   │   ├── routers/          # API route handlers
+│   │   │   ├── auth.py
+│   │   │   ├── users.py
 │   │   │   ├── customers.py
+│   │   │   ├── imports.py
 │   │   │   ├── tickets.py
-│   │   │   └── ai.py
 │   │   ├── schemas/          # Pydantic models
+│   │   │   ├── auth.py
 │   │   │   ├── customer.py
-│   │   │   └── ticket.py
+│   │   │   ├── imports.py
+│   │   │   ├── ticket.py
+│   │   │   └── user.py
 │   │   ├── services/         # Business logic
-│   │   └── models/           # Database models
+│   │   │   └── import_service.py
+│   │   └── ...               # Validators, utils, exceptions
 │   ├── database/
-│   │   └── schema.sql        # Database schema
+│   │   ├── schema.sql        # Base schema
+│   │   ├── migrations/       # Raw SQL migration notes/scripts
+│   │   └── seeds/
+│   ├── docs/
+│   │   └── API.md            # Implementation-accurate API contract
+│   ├── tests/
 │   ├── requirements.txt
 │   ├── .env.example
 │   └── .env
@@ -162,27 +189,47 @@ For implementation-accurate endpoint contracts, payload examples, auth flow, and
 - `docs/API.md`
 - `FRONTEND_INTEGRATION_GUIDE.md`
 
+### Authentication
+
+| Method | Endpoint            | Description                |
+| ------ | ------------------- | -------------------------- |
+| `POST` | `/api/auth/register`| Register and return tokens |
+| `POST` | `/api/auth/login`   | Login and return tokens    |
+| `GET`  | `/api/auth/me`      | Current user profile       |
+| `POST` | `/api/auth/refresh` | Rotate access/refresh pair |
+| `POST` | `/api/auth/logout`  | Revoke current token(s)    |
+
+### Users
+
+| Method   | Endpoint                | Description                    |
+| -------- | ----------------------- | ------------------------------ |
+| `GET`    | `/api/users/`           | List users (admin)             |
+| `GET`    | `/api/users/{user_id}`  | Get user (admin or self)       |
+| `POST`   | `/api/users/`           | Create user (admin)            |
+| `PATCH`  | `/api/users/{user_id}`  | Update user (self/admin rules) |
+| `DELETE` | `/api/users/{user_id}`  | Deactivate user (admin)        |
+
 ### Customers
 
 | Method   | Endpoint              | Description         |
 | -------- | --------------------- | ------------------- |
 | `GET`    | `/api/customers`      | List all customers  |
-| `GET`    | `/api/customers/{id}` | Get customer by ID  |
+| `GET`    | `/api/customers/{customer_id}` | Get customer by ID  |
 | `POST`   | `/api/customers`      | Create new customer |
-| `PATCH`  | `/api/customers/{id}` | Update customer     |
-| `DELETE` | `/api/customers/{id}` | Delete customer     |
+| `PATCH`  | `/api/customers/{customer_id}` | Update customer     |
+| `DELETE` | `/api/customers/{customer_id}` | Delete customer     |
 
 ### Tickets
 
 | Method   | Endpoint                     | Description           |
 | -------- | ---------------------------- | --------------------- |
 | `GET`    | `/api/tickets`               | List all tickets      |
-| `GET`    | `/api/tickets/{id}`          | Get ticket by ID      |
+| `GET`    | `/api/tickets/{ticket_id}`   | Get ticket by ID      |
 | `POST`   | `/api/tickets`               | Create new ticket     |
-| `PATCH`  | `/api/tickets/{id}`          | Update ticket         |
-| `DELETE` | `/api/tickets/{id}`          | Delete ticket         |
-| `GET`    | `/api/tickets/{id}/messages` | Get ticket messages   |
-| `POST`   | `/api/tickets/{id}/messages` | Add message to ticket |
+| `PATCH`  | `/api/tickets/{ticket_id}`   | Update ticket         |
+| `DELETE` | `/api/tickets/{ticket_id}`   | Delete ticket         |
+| `GET`    | `/api/tickets/{ticket_id}/messages` | Get ticket messages   |
+| `POST`   | `/api/tickets/{ticket_id}/messages` | Add message to ticket |
 
 ### Data Import
 
@@ -202,20 +249,18 @@ GET /api/tickets?status=open&priority=high&customer_id=uuid
 
 ## 🗄 Database Schema
 
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────────┐
-│  customers   │     │   tickets    │     │  ticket_messages │
-├──────────────┤     ├──────────────┤     ├──────────────────┤
-│ id (PK)      │◄────│ customer_id  │◄────│ ticket_id        │
-│ email        │     │ id (PK)      │     │ id (PK)          │
-│ full_name    │     │ subject      │     │ sender_type      │
-│ phone        │     │ description  │     │ content          │
-│ company      │     │ status       │     │ created_at       │
-│ status       │     │ priority     │     └──────────────────┘
-│ created_at   │     │ ai_summary   │
-└──────────────┘     │ ai_sentiment │
-                     └──────────────┘
-```
+Core tables currently used by the backend:
+
+- `customers`
+- `tickets`
+- `ticket_messages`
+- `agents`
+- `revoked_tokens`
+- `ai_interactions`
+
+Source of truth SQL:
+
+- `database/schema.sql`
 
 ---
 
@@ -226,8 +271,10 @@ GET /api/tickets?status=open&priority=high&customer_id=uuid
 | Variable                          | Description                                 | Required              |
 | --------------------------------- | ------------------------------------------- | --------------------- |
 | `SUPABASE_URL`                    | Supabase project URL                        | ✅                    |
-| `SUPABASE_KEY`                    | Supabase anon/public key                    | ✅                    |
-| `DATABASE_URL`                    | PostgreSQL URL for Alembic migrations       | ✅ (for migrations)   |
+| `SUPABASE_KEY`                    | Primary Supabase API key used by backend    | ✅*                   |
+| `SUPABASE_SERVICE_ROLE_KEY`       | Optional fallback Supabase key (server-side)| ❌                    |
+| `SUPABASE_ANON_KEY`               | Optional fallback Supabase key              | ❌                    |
+| `DATABASE_URL`                    | PostgreSQL URL for Alembic migrations       | ✅ (migrations)       |
 | `LLM_API_KEY`                     | API key for LLM provider                    | ❌                    |
 | `LLM_MODEL`                       | Model name (e.g., gpt-4, claude-3)          | ❌                    |
 | `LLM_BASE_URL`                    | Custom endpoint for local LLMs              | ❌                    |
@@ -240,14 +287,20 @@ GET /api/tickets?status=open&priority=high&customer_id=uuid
 | `MAX_REQUEST_SIZE_BYTES`          | Maximum allowed HTTP request body size      | ❌ (default: 1048576) |
 | `SECURITY_HEADERS_ENABLED`        | Enable security response headers            | ❌ (default: True)    |
 
+\* One of `SUPABASE_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, or `SUPABASE_ANON_KEY` must be configured.
+
 ---
 
 ## 🗺 Roadmap
 
 - [x] Project setup & FastAPI configuration
 - [x] Supabase database integration
+- [x] JWT authentication + refresh flow
+- [x] RBAC user management
 - [x] Customer CRUD operations
 - [x] Ticket management system
+- [x] CSV/XLSX customer and ticket import
+- [x] Security hardening middleware
 - [ ] AI ticket categorization
 - [ ] Sentiment analysis integration
 - [ ] AI response suggestions
