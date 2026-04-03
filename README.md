@@ -329,10 +329,14 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-## 👨‍💻 Author
+## 👨‍💻 Authors
 
-**Final Year Project**
-
+| | Name |
+|---|---|
+| 👤 | Muhammad Faizan Haider |
+| 👤 | Muhammad Tayyab |
+| 👤 | Umer Shahid |
+| 👤 | Iqra Mubarik |
 ---
 
 <div align="center">
