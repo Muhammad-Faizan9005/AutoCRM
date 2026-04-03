@@ -1,4 +1,11 @@
-from app.auth.dependencies import get_current_active_user, get_current_user, require_auth, require_role
+from app.auth.dependencies import (
+    get_current_active_user,
+    get_current_user,
+    require_admin,
+    require_auth,
+    require_role,
+    require_sales_manager_or_admin,
+)
 from app.auth.utils import (
     create_access_token,
     create_refresh_token,
@@ -17,4 +24,6 @@ __all__ = [
     "get_current_active_user",
     "require_auth",
     "require_role",
+    "require_admin",
+    "require_sales_manager_or_admin",
 ]

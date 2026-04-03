@@ -3,8 +3,9 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Any, Dict
 from supabase import Client
 
-from app.database import get_db
+from app.database import get_db, run_db_operation
 from app.auth.utils import verify_token
+from app.auth.token_store import is_token_blacklisted
 
 security = HTTPBearer()
 
@@ -27,6 +28,13 @@ async def get_current_user(
         HTTPException: If token is invalid or user not found
     """
     token = credentials.credentials
+
+    if await is_token_blacklisted(db, token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been invalidated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     
     # Verify and decode token
     payload = verify_token(token)
@@ -48,7 +56,9 @@ async def get_current_user(
     
     # Get user from database
     try:
-        response = db.table("agents").select("*").eq("id", user_id).single().execute()
+        response = await run_db_operation(
+            lambda: db.table("agents").select("*").eq("id", user_id).single().execute()
+        )
         user = response.data
         
         if not user:
@@ -107,7 +117,7 @@ async def require_auth(current_user: dict = Depends(get_current_user)) -> dict:
     return current_user
 
 
-def require_role(allowed_roles: list):
+def require_role(allowed_roles: list[str]):
     """
     Dependency factory to require specific roles.
     
@@ -118,7 +128,7 @@ def require_role(allowed_roles: list):
         Dependency function that checks user role
     """
     async def role_checker(current_user: dict = Depends(get_current_user)):
-        user_role = current_user.get("role", "agent")
+        user_role = current_user.get("role", "sales_rep")
         if user_role not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -127,3 +137,13 @@ def require_role(allowed_roles: list):
         return current_user
     
     return role_checker
+
+
+def require_admin():
+    """Dependency that allows only admin users."""
+    return require_role(["admin"])
+
+
+def require_sales_manager_or_admin():
+    """Dependency that allows sales managers and admins."""
+    return require_role(["sales_manager", "admin"])
