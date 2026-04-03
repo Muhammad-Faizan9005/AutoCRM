@@ -106,13 +106,16 @@ Expected UI behavior:
 
 Backend returns structured errors with `request_id`.
 
+`error.code` may be either a machine string (for validation/custom errors) or
+an HTTP status integer (for standard HTTP exceptions).
+
 Example shape:
 
 ```json
 {
   "success": false,
   "error": {
-    "code": 422,
+    "code": "VALIDATION_ERROR",
     "message": "Request validation failed",
     "request_id": "uuid",
     "timestamp": "2026-04-03T12:00:00+00:00",

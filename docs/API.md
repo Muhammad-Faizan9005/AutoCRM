@@ -84,11 +84,14 @@ When `SECURITY_HEADERS_ENABLED=True`, responses include:
 
 Most errors follow this structure:
 
+- `error.code` may be a string machine code (for framework/custom handlers)
+  or an HTTP status integer (for standard HTTP exceptions).
+
 ```json
 {
   "success": false,
   "error": {
-    "code": 422,
+    "code": "VALIDATION_ERROR",
     "message": "Request validation failed",
     "request_id": "f7d2e9a4-...",
     "timestamp": "2026-04-03T12:00:00.000000+00:00",
