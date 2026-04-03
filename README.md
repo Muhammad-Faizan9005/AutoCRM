@@ -331,7 +331,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 👨‍💻 Author
 
-**Final Year Project**
+Muhammad Faizan Haider
+Muhammad Tayyab
+Umer Shahid
+Iqra Mubarik
 
 ---
 
