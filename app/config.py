@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     # Database Settings (Supabase)
     SUPABASE_URL: Optional[str] = None
     SUPABASE_KEY: Optional[str] = None
+    SUPABASE_ANON_KEY: Optional[str] = None
+    SUPABASE_SERVICE_ROLE_KEY: Optional[str] = None
     DATABASE_URL: Optional[str] = None
     
     # LLM Settings (supports any LLM provider)
@@ -51,7 +53,11 @@ class Settings(BaseSettings):
     MAX_REQUEST_SIZE_BYTES: int = 1_048_576
     SECURITY_HEADERS_ENABLED: bool = True
 
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
+
+    @property
+    def supabase_api_key(self) -> Optional[str]:
+        return self.SUPABASE_KEY or self.SUPABASE_SERVICE_ROLE_KEY or self.SUPABASE_ANON_KEY
 
     @property
     def jwt_secret_key(self) -> str:

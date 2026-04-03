@@ -12,10 +12,14 @@ def get_supabase_client() -> Client:
     """
     Create and return a Supabase client instance.
     """
-    if not settings.SUPABASE_URL or not settings.SUPABASE_KEY:
-        raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in environment variables")
+    supabase_key = settings.supabase_api_key
+    if not settings.SUPABASE_URL or not supabase_key:
+        raise ValueError(
+            "SUPABASE_URL and one of SUPABASE_KEY/SUPABASE_SERVICE_ROLE_KEY/"
+            "SUPABASE_ANON_KEY must be set in environment variables"
+        )
     
-    return create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+    return create_client(settings.SUPABASE_URL, supabase_key)
 
 
 # Singleton client instance
