@@ -4,7 +4,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?style=for-the-badge&logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-green?style=for-the-badge&logo=fastapi&logoColor=white)
-![Supabase](https://img.shields.io/badge/Supabase-Database-3ECF8E?style=for-the-badge&logo=supabase&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Database-336791?style=for-the-badge&logo=postgresql&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
 
 **AI-Ready Customer Relationship Management System**
@@ -17,7 +17,7 @@
 
 ## 📋 Overview
 
-AutoCRM is a Customer Relationship Management backend built with FastAPI and Supabase. The current implementation delivers production-oriented CRM fundamentals (auth, RBAC, CRUD, imports, security middleware), while AI/LLM features are scaffolded and planned in the roadmap.
+AutoCRM is a Customer Relationship Management backend built with FastAPI and PostgreSQL. The current implementation delivers production-oriented CRM fundamentals (auth, RBAC, CRUD, imports, security middleware), while AI/LLM features are scaffolded and planned in the roadmap.
 
 ### 🎯 Problem Statement
 
@@ -58,7 +58,7 @@ AutoCRM addresses these challenges by integrating AI-powered automation.
 | Layer              | Technology                                           |
 | ------------------ | ---------------------------------------------------- |
 | **Backend**        | Python, FastAPI                                      |
-| **Database**       | Supabase (PostgreSQL)                                |
+| **Database**       | PostgreSQL (Supabase/Neon/managed Postgres)          |
 | **AI/LLM**         | Configurable (OpenAI, Anthropic, Gemini, Local LLMs) |
 | **Authentication** | JWT, RBAC, refresh-token rotation + revocation       |
 | **API Docs**       | OpenAPI/Swagger                                      |
@@ -70,7 +70,7 @@ AutoCRM addresses these challenges by integrating AI-powered automation.
 ### Prerequisites
 
 - Python 3.10 or higher
-- Supabase account (free tier works)
+- PostgreSQL database URL (Supabase, Neon, or another managed PostgreSQL)
 - LLM API key (optional, for AI features)
 
 ### Quick Start
@@ -113,9 +113,10 @@ AutoCRM addresses these challenges by integrating AI-powered automation.
    # Edit .env with your credentials
    ```
 
-5. **Set up Supabase database and run migrations**
-   - Create a new project at [supabase.com](https://supabase.com)
-   - Fill `.env` with `SUPABASE_URL`, an API key (`SUPABASE_KEY` or fallback keys), and `DATABASE_URL`
+5. **Set `DATABASE_URL` and run migrations**
+   - Fill `.env` with one PostgreSQL connection string:
+       - Supabase pooler example: `DATABASE_URL=postgresql://postgres.<project-ref>:<password>@aws-<region>.pooler.supabase.com:6543/postgres?sslmode=require`
+       - Neon example: `DATABASE_URL=postgresql://<user>:<password>@<endpoint>.neon.tech/<database>?sslmode=require`
    - Apply schema/migrations:
 
    ```bash
@@ -148,7 +149,8 @@ AutoCRM/
 │   │   ├── __init__.py
 │   │   ├── main.py           # FastAPI application entry
 │   │   ├── config.py         # Settings & environment config
-│   │   ├── database.py       # Supabase client connection
+│   │   ├── database.py       # Database client bootstrap (DATABASE_URL)
+│   │   ├── postgres_client.py# PostgreSQL query adapter
 │   │   ├── auth/             # JWT helpers, dependencies, token revocation
 │   │   ├── middleware/       # Error handling, logging, security, rate limiting
 │   │   ├── repositories/     # Data access layer
@@ -270,11 +272,7 @@ Source of truth SQL:
 
 | Variable                          | Description                                 | Required              |
 | --------------------------------- | ------------------------------------------- | --------------------- |
-| `SUPABASE_URL`                    | Supabase project URL                        | ✅                    |
-| `SUPABASE_KEY`                    | Primary Supabase API key used by backend    | ✅*                   |
-| `SUPABASE_SERVICE_ROLE_KEY`       | Optional fallback Supabase key (server-side)| ❌                    |
-| `SUPABASE_ANON_KEY`               | Optional fallback Supabase key              | ❌                    |
-| `DATABASE_URL`                    | PostgreSQL URL for Alembic migrations       | ✅ (migrations)       |
+| `DATABASE_URL`                    | PostgreSQL URL for API + Alembic (Supabase/Neon/managed Postgres) | ✅ |
 | `LLM_API_KEY`                     | API key for LLM provider                    | ❌                    |
 | `LLM_MODEL`                       | Model name (e.g., gpt-4, claude-3)          | ❌                    |
 | `LLM_BASE_URL`                    | Custom endpoint for local LLMs              | ❌                    |
@@ -287,14 +285,16 @@ Source of truth SQL:
 | `MAX_REQUEST_SIZE_BYTES`          | Maximum allowed HTTP request body size      | ❌ (default: 1048576) |
 | `SECURITY_HEADERS_ENABLED`        | Enable security response headers            | ❌ (default: True)    |
 
-\* One of `SUPABASE_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, or `SUPABASE_ANON_KEY` must be configured.
+Examples:
+- Supabase pooler: `postgresql://postgres.<project-ref>:<password>@aws-<region>.pooler.supabase.com:6543/postgres?sslmode=require`
+- Neon: `postgresql://<user>:<password>@<endpoint>.neon.tech/<database>?sslmode=require`
 
 ---
 
 ## 🗺 Roadmap
 
 - [x] Project setup & FastAPI configuration
-- [x] Supabase database integration
+- [x] PostgreSQL database integration
 - [x] JWT authentication + refresh flow
 - [x] RBAC user management
 - [x] Customer CRUD operations

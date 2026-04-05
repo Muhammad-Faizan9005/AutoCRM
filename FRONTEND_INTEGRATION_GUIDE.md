@@ -1,6 +1,6 @@
 # Frontend Integration Guide
 
-Last Updated: 2026-04-03
+Last Updated: 2026-04-06
 
 This guide explains how frontend teams should connect with the current backend implementation.
 
@@ -14,7 +14,7 @@ Use this guide for implementation workflow and the API document for exact endpoi
 
 1. Set backend base URL:
    - Local: `http://localhost:8000`
-   - Production: `https://autocrmbackend-production-f017.up.railway.app`
+  - Production: your current deployment URL
 2. Confirm backend health using `GET /health`.
 3. Confirm API docs are reachable on `/docs`.
 4. Implement auth storage for access and refresh tokens.
@@ -30,6 +30,17 @@ The current backend uses these methods for updates:
 
 Do not use `PUT` for these routes.
 
+### Canonical Paths (Important)
+
+Use trailing slash for collection routes:
+
+- `GET/POST /api/users/`
+- `GET/POST /api/customers/`
+- `GET/POST /api/tickets/`
+
+Calling collection endpoints without trailing slash can return `307` redirect.
+Some clients drop `Authorization` on redirected requests, causing false `401/403` errors.
+
 ## 3. Auth Flow (Required)
 
 1. Login/register:
@@ -37,10 +48,11 @@ Do not use `PUT` for these routes.
    - `POST /api/auth/register`
 2. Store returned `access_token` and `refresh_token`.
 3. Send `Authorization: Bearer <access_token>` for protected endpoints.
-4. On `401`, call `POST /api/auth/refresh`.
-5. Replace both tokens with returned values (rotation).
-6. Retry the failed request once.
-7. On refresh failure, clear session and redirect to login.
+4. On `401` (expired/invalid access token), call `POST /api/auth/refresh`.
+5. Do not run refresh flow on `403`.
+6. Replace both tokens with returned values (rotation).
+7. Retry the failed request once.
+8. On refresh failure, clear session and redirect to login.
 
 ## 4. RBAC Rules Frontend Must Respect
 
@@ -57,6 +69,8 @@ Do not use `PUT` for these routes.
   - `admin`
   - `sales_manager`
 - A normal user can fetch/update own user record, but cannot change `role` or `is_active`.
+- `POST /api/auth/register` always creates users with role `sales_rep`.
+- `DELETE /api/users/{user_id}` is a soft delete (`is_active=false`), not row removal.
 
 ## 4.1 Data Import Endpoints (CSV/XLSX)
 
@@ -127,7 +141,7 @@ Example shape:
 UI handling recommendations:
 
 - `401`: try refresh flow
-- `403`: show permission denied message
+- `403`: show permission/auth message (RBAC, missing bearer, or inactive user)
 - `413`: show request too large
 - `422`: map field-level errors
 - `429`: show retry countdown from `Retry-After`
@@ -149,8 +163,10 @@ REACT_APP_API_BASE_URL=http://localhost:8000
 - [ ] Login/register works and stores tokens
 - [ ] Protected requests include bearer token
 - [ ] Auto-refresh works and retries once
+- [ ] Refresh runs on `401` only (not on `403`)
 - [ ] Enum values are aligned with backend
 - [ ] PATCH requests are used for updates
+- [ ] Collection endpoints use canonical trailing-slash paths
 - [ ] RBAC actions are hidden/disabled in UI
 - [ ] 422 field errors display correctly in forms
 - [ ] 429 and 413 are handled with user-friendly messages

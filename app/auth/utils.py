@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -51,6 +51,13 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
 
 
+def _normalize_jwt_claims(data: dict) -> dict:
+    normalized: dict = {}
+    for key, value in data.items():
+        normalized[key] = str(value) if isinstance(value, UUID) else value
+    return normalized
+
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """
     Create a JWT access token.
@@ -62,7 +69,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     Returns:
         Encoded JWT token string
     """
-    to_encode = data.copy()
+    to_encode = _normalize_jwt_claims(data)
     
     now = datetime.now(timezone.utc)
 
@@ -86,7 +93,7 @@ def create_refresh_token(data: dict) -> str:
     Returns:
         Encoded JWT refresh token string
     """
-    to_encode = data.copy()
+    to_encode = _normalize_jwt_claims(data)
     now = datetime.now(timezone.utc)
     expire = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     to_encode.update({"exp": expire, "iat": now, "jti": str(uuid4()), "type": "refresh"})

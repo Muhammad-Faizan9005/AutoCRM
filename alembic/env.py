@@ -7,18 +7,20 @@ from app.config import settings
 
 config = context.config
 
-if not settings.DATABASE_URL:
+runtime_database_url = settings.DATABASE_URL or config.get_main_option("sqlalchemy.url")
+
+if not runtime_database_url or "driver://user:pass@localhost/dbname" in runtime_database_url:
     raise RuntimeError(
-        "DATABASE_URL must be set before running Alembic migrations. "
-        "Set it in backend/.env or your deployment environment."
+        "Database URL is required before running Alembic migrations. "
+        "Set DATABASE_URL in backend/.env or sqlalchemy.url in alembic.ini."
     )
 
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+config.set_main_option("sqlalchemy.url", runtime_database_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# This project uses Supabase directly (no SQLAlchemy ORM models), so metadata stays None.
+# This project uses a repository layer without SQLAlchemy ORM models.
 target_metadata = None
 
 
