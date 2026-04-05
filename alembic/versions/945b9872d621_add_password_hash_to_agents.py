@@ -20,9 +20,25 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
-def _load_base_schema_sql() -> str:
+def _is_supabase_connection(bind) -> bool:
+    host = (bind.engine.url.host or "").lower()
+    return "supabase.co" in host
+
+
+def _load_base_schema_sql(*, include_supabase_rls: bool) -> str:
     schema_file = Path(__file__).resolve().parents[2] / "database" / "schema.sql"
-    return schema_file.read_text(encoding="utf-8")
+    schema_sql = schema_file.read_text(encoding="utf-8")
+
+    if include_supabase_rls:
+        return schema_sql
+
+    rls_marker = "-- =============================================\n-- ROW LEVEL SECURITY (RLS)\n-- ============================================="
+    if rls_marker in schema_sql:
+        # Supabase roles/functions (authenticated, service_role, auth.*) are not available
+        # on plain PostgreSQL and should not block base schema bootstrap.
+        return schema_sql.split(rls_marker, 1)[0].rstrip() + "\n"
+
+    return schema_sql
 
 
 def upgrade() -> None:
@@ -32,7 +48,9 @@ def upgrade() -> None:
 
     # Fresh database path: bootstrap full schema from repository SQL.
     if not inspector.has_table("agents"):
-        bind.exec_driver_sql(_load_base_schema_sql())
+        bind.exec_driver_sql(
+            _load_base_schema_sql(include_supabase_rls=_is_supabase_connection(bind))
+        )
         return
 
     agent_columns = {column["name"] for column in inspector.get_columns("agents")}

@@ -50,10 +50,25 @@ class JsonFormatter(logging.Formatter):
 def configure_logging(debug: bool) -> None:
     """Configure root logging with JSON formatter."""
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    # Keep root at INFO to avoid verbose third-party debug logs in terminal.
+    root_logger.setLevel(logging.INFO)
 
     handler = logging.StreamHandler()
     handler.setFormatter(JsonFormatter())
 
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
+
+    # Allow app-level DEBUG logs when explicitly enabled.
+    logging.getLogger("autocrm").setLevel(logging.DEBUG if debug else logging.INFO)
+
+    # Suppress noisy dependency debug logs (passlib/bcrypt internals).
+    noisy_loggers = (
+        "passlib",
+        "passlib.registry",
+        "passlib.handlers",
+        "passlib.utils.compat",
+        "bcrypt",
+    )
+    for logger_name in noisy_loggers:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)

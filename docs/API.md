@@ -1,7 +1,7 @@
 # AutoCRM Backend API Handover
 
-Last Updated: 2026-04-03
-Backend Version: 1.0.0 (Week 1 baseline)
+Last Updated: 2026-04-06
+Backend Version: 1.0.0
 
 This document is the implementation-accurate API contract for frontend teams.
 It reflects the endpoints, payloads, validation rules, and security middleware currently active in the backend.
@@ -28,7 +28,7 @@ Not yet implemented in this backend version:
 ## 2. Base URLs and API Docs
 
 - Local: `http://localhost:8000`
-- Production (current deployment): `https://autocrmbackend-production-f017.up.railway.app`
+- Production: use your active deployment URL
 - OpenAPI/Swagger: `/docs`
 - ReDoc: `/redoc`
 
@@ -43,6 +43,17 @@ Not yet implemented in this backend version:
 ### Required Header for Protected Endpoints
 
 `Authorization: Bearer <access_token>`
+
+### Canonical Collection Paths
+
+Collection routes in this API are defined with trailing slash:
+
+- `/api/users/`
+- `/api/customers/`
+- `/api/tickets/`
+
+Calling these without the trailing slash returns `307 Temporary Redirect`.
+Some clients may not preserve `Authorization` across redirect hops; prefer canonical paths directly.
 
 ## 4. Global Middleware Contract
 
@@ -110,7 +121,8 @@ Common status codes:
 
 - `400` bad request
 - `401` unauthorized/invalid token
-- `403` forbidden (RBAC)
+- `403` forbidden (RBAC, missing bearer header, or inactive user)
+- `307` temporary redirect (typically path trailing-slash normalization)
 - `404` resource not found
 - `413` request body too large
 - `422` validation error
@@ -231,6 +243,8 @@ Important constraints:
   }
 }
 ```
+
+- Note: newly registered users are always created with role `sales_rep`.
 
 ### POST /api/auth/login
 
@@ -356,6 +370,7 @@ Important constraints:
 - Auth: required
 - Role: `admin`
 - Behavior: soft delete (`is_active=false`)
+- Record is not removed from the database.
 - Response `204`: empty body
 
 ## 8.4 Customers (`/api/customers`)
@@ -577,9 +592,10 @@ Import behavior:
 1. Login/register and store `access_token` + `refresh_token`.
 2. Send bearer token on all protected requests.
 3. On `401`, call `/api/auth/refresh` once.
-4. Replace stored tokens with rotated values.
-5. Retry original request once.
-6. If refresh fails, clear session and redirect to login.
+4. Do not run refresh flow on `403`; treat it as permission/auth-header/inactive-user problem.
+5. Replace stored tokens with rotated values.
+6. Retry original request once.
+7. If refresh fails, clear session and redirect to login.
 
 ## 9.1.1 File Upload Note (Import Endpoints)
 
