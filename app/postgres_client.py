@@ -14,9 +14,10 @@ class QueryResult:
 
 
 class PostgresQueryBuilder:
-    def __init__(self, engine: Engine, table_name: str):
+    def __init__(self, engine: Engine, table: Table):
         self.engine = engine
-        self.table_name = table_name
+        self.table = table
+        self.table_name = table.name
 
         self._operation = "select"
         self._select_columns: list[str] | None = None
@@ -84,19 +85,16 @@ class PostgresQueryBuilder:
         return self
 
     def execute(self) -> QueryResult:
-        metadata = MetaData()
-        table = Table(self.table_name, metadata, autoload_with=self.engine)
-
         if self._operation == "select":
-            return QueryResult(self._execute_select(table))
+            return QueryResult(self._execute_select(self.table))
         if self._operation == "insert":
-            return QueryResult(self._execute_insert(table))
+            return QueryResult(self._execute_insert(self.table))
         if self._operation == "upsert":
-            return QueryResult(self._execute_upsert(table))
+            return QueryResult(self._execute_upsert(self.table))
         if self._operation == "update":
-            return QueryResult(self._execute_update(table))
+            return QueryResult(self._execute_update(self.table))
         if self._operation == "delete":
-            return QueryResult(self._execute_delete(table))
+            return QueryResult(self._execute_delete(self.table))
 
         raise ValueError(f"Unsupported operation: {self._operation}")
 
@@ -192,6 +190,17 @@ class PostgresQueryBuilder:
 class PostgresClient:
     def __init__(self, database_url: str):
         self.engine = create_engine(database_url, future=True, pool_pre_ping=True)
+        self._metadata = MetaData()
+        self._table_cache: dict[str, Table] = {}
+
+    def _get_table(self, table_name: str) -> Table:
+        cached = self._table_cache.get(table_name)
+        if cached is not None:
+            return cached
+
+        table = Table(table_name, self._metadata, autoload_with=self.engine)
+        self._table_cache[table_name] = table
+        return table
 
     def table(self, table_name: str) -> PostgresQueryBuilder:
-        return PostgresQueryBuilder(self.engine, table_name)
+        return PostgresQueryBuilder(self.engine, self._get_table(table_name))
