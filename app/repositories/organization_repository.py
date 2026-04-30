@@ -9,37 +9,28 @@ from app.exceptions.custom_exceptions import DatabaseError
 from app.repositories.base import BaseRepository
 
 
-class LeadRepository(BaseRepository):
+class OrganizationRepository(BaseRepository):
     def __init__(self, db: Client):
-        super().__init__(db=db, table_name="leads", resource_name="Lead")
+        super().__init__(db=db, table_name="organizations", resource_name="Organization")
 
-    async def list_leads(
+    async def list_organizations(
         self,
         *,
         skip: int = 0,
         limit: int = 100,
-        status: str | None = None,
-        owner_id: str | None = None,
-        organization_id: str | None = None,
-        source: str | None = None,
+        industry: str | None = None,
         search: str | None = None,
     ) -> list[dict[str, Any]]:
         try:
             query = self.db.table(self.table_name).select("*")
-            if status:
-                query = query.eq("status", status)
-            if owner_id:
-                query = query.eq("owner_id", owner_id)
-            if organization_id:
-                query = query.eq("organization_id", organization_id)
-            if source:
-                query = query.eq("source", source)
+            if industry:
+                query = query.eq("industry", industry)
             if search:
                 query = query.ilike("name", f"%{search}%")
 
             query = query.order("created_at", desc=True).range(skip, skip + limit - 1)
             response = await run_db_operation(lambda: query.execute())
         except Exception as exc:
-            raise DatabaseError(detail="Failed to list leads") from exc
+            raise DatabaseError(detail="Failed to list organizations") from exc
 
         return response.data or []
