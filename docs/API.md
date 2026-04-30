@@ -1,6 +1,6 @@
 # AutoCRM Backend API Handover
 
-Last Updated: 2026-04-06
+Last Updated: 2026-04-30
 Backend Version: 1.0.0
 
 This document is the implementation-accurate API contract for frontend teams.
@@ -16,6 +16,12 @@ Implemented and ready for frontend integration:
 - Customers (CRUD)
 - Tickets (CRUD)
 - Ticket messages
+- Organizations (CRUD)
+- Leads (CRUD + convert-to-deal)
+- Deals (CRUD)
+- Tasks (CRUD)
+- Notes (CRUD)
+- Dashboard metrics
 - Data import (CSV/XLSX for customers and tickets)
 - Request ID, structured errors, rate limiting, and security headers
 
@@ -51,6 +57,11 @@ Collection routes in this API are defined with trailing slash:
 - `/api/users/`
 - `/api/customers/`
 - `/api/tickets/`
+- `/api/organizations/`
+- `/api/leads/`
+- `/api/deals/`
+- `/api/tasks/`
+- `/api/notes/`
 
 Calling these without the trailing slash returns `307 Temporary Redirect`.
 Some clients may not preserve `Authorization` across redirect hops; prefer canonical paths directly.
@@ -164,6 +175,32 @@ Common status codes:
 - `customer`
 - `agent`
 - `ai`
+
+### Lead Status
+
+- Free-text status string
+- Default: `new`
+- Conversion endpoint sets status to `converted`
+
+### Deal Stage
+
+- Free-text stage string
+- Default: `prospecting`
+
+### Task Status
+
+- Free-text status string
+- Default: `open`
+
+### Task Priority
+
+- Free-text priority string
+- Default: `medium`
+
+### Entity Type Fields
+
+- `tasks.entity_type` and `notes.entity_type` are free-text
+- Recommended values: `lead`, `deal`, `customer`, `organization`, `ticket`
 
 ## 7. Validation and Sanitization Rules
 

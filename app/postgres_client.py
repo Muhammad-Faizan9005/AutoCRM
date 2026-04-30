@@ -67,6 +67,18 @@ class PostgresQueryBuilder:
         self._filters.append(("lt", column, value))
         return self
 
+    def gte(self, column: str, value: Any) -> PostgresQueryBuilder:
+        self._filters.append(("gte", column, value))
+        return self
+
+    def lte(self, column: str, value: Any) -> PostgresQueryBuilder:
+        self._filters.append(("lte", column, value))
+        return self
+
+    def ilike(self, column: str, value: Any) -> PostgresQueryBuilder:
+        self._filters.append(("ilike", column, value))
+        return self
+
     def order(self, column: str, desc: bool = False) -> PostgresQueryBuilder:
         self._order_by = (column, desc)
         return self
@@ -105,6 +117,12 @@ class PostgresQueryBuilder:
                 conditions.append(table.c[column] == value)
             elif op == "lt":
                 conditions.append(table.c[column] < value)
+            elif op == "gte":
+                conditions.append(table.c[column] >= value)
+            elif op == "lte":
+                conditions.append(table.c[column] <= value)
+            elif op == "ilike":
+                conditions.append(table.c[column].ilike(value))
 
         return and_(*conditions) if conditions else None
 

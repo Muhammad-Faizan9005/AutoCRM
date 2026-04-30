@@ -38,7 +38,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to AutoCRM API", "status": "running"}
+    return {"message": "Welcome to AutoCRM an Agentic AI Enabled CRM System", "status": "running"}
 
 @app.get("/health")
 async def health_check():
@@ -46,10 +46,16 @@ async def health_check():
 
 
 # Include routers
-from app.routers import auth, customers, imports, tickets, users
+from app.routers import auth, customers, deals, imports, leads, notes, organizations, tasks, tickets, users, dashboard
 
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(users.router, prefix="/api/users", tags=["Users"])
 app.include_router(customers.router, prefix="/api/customers", tags=["Customers"])
 app.include_router(tickets.router, prefix="/api/tickets", tags=["Tickets"])
 app.include_router(imports.router, prefix="/api/import", tags=["Import"])
+app.include_router(leads.router, prefix="/api/leads", tags=["Leads"])
+app.include_router(deals.router, prefix="/api/deals", tags=["Deals"])
+app.include_router(organizations.router, prefix="/api/organizations", tags=["Organizations"])
+app.include_router(tasks.router, prefix="/api/tasks", tags=["Tasks"])
+app.include_router(notes.router, prefix="/api/notes", tags=["Notes"])
+app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
