@@ -10,6 +10,9 @@ from fastapi import HTTPException, status
 from supabase import Client
 
 from app.repositories.customer_repository import CustomerRepository
+from app.repositories.lead_repository import LeadRepository
+from app.repositories.note_repository import NoteRepository
+from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.ticket_repository import TicketRepository
 from app.schemas.customer import CustomerCreate
 from app.schemas.imports import ImportFailure, ImportResult
@@ -132,9 +135,82 @@ def _parse_rows(file_name: str, file_bytes: bytes) -> list[ParsedRow]:
 class ImportService:
     def __init__(self, db: Client):
         self.customer_repository = CustomerRepository(db)
+        self.lead_repository = LeadRepository(db)
+        self.note_repository = NoteRepository(db)
+        self.organization_repository = OrganizationRepository(db)
         self.ticket_repository = TicketRepository(db)
 
-    async def import_customers(self, *, file_name: str, file_bytes: bytes) -> ImportResult:
+    async def get_or_create_organization(self, *, company_name: str) -> dict[str, Any] | None:
+        """
+        Find or create an organization by company name.
+        Returns the organization dict or None if company_name is empty.
+        """
+        if not company_name or not company_name.strip():
+            return None
+
+        company_name_clean = company_name.strip()
+        existing_org = await self.organization_repository.find_one(filters={"name": company_name_clean})
+        if existing_org:
+            return existing_org
+
+        org_data = {"name": company_name_clean}
+        created_org = await self.organization_repository.create(org_data)
+        return created_org
+
+    async def create_lead_from_customer(self, *, customer: dict[str, Any]) -> dict[str, Any] | None:
+        """
+        Create a lead from customer data.
+        Checks if a lead already exists for this customer to avoid duplicates.
+        Returns the created lead dict or None if it already exists.
+        """
+        customer_id = customer.get("id")
+        if not customer_id:
+            return None
+
+        existing_lead = await self.lead_repository.find_one(filters={"email": customer.get("email")})
+        if existing_lead:
+            return None
+
+        organization_id = None
+        company = customer.get("company")
+        if company:
+            org = await self.get_or_create_organization(company_name=company)
+            if org:
+                organization_id = org.get("id")
+
+        lead_data = {
+            "name": customer.get("full_name", ""),
+            "email": customer.get("email", ""),
+            "phone": customer.get("phone"),
+            "company": customer.get("company"),
+            "source": "import",
+            "status": "new",
+            "organization_id": str(organization_id) if organization_id else None,
+        }
+
+        created_lead = await self.lead_repository.create(lead_data)
+        return created_lead
+
+    async def create_notes_from_customer(self, *, customer: dict[str, Any]) -> dict[str, Any] | None:
+        """
+        Create a note from customer's notes field.
+        Returns the created note dict or None if customer has no notes.
+        """
+        customer_id = customer.get("id")
+        notes_content = customer.get("notes")
+
+        if not customer_id or not notes_content or not notes_content.strip():
+            return None
+
+        note_data = {
+            "entity_type": "customer",
+            "entity_id": str(customer_id),
+            "content": notes_content.strip(),
+            "author_id": None,
+        }
+
+        created_note = await self.note_repository.create(note_data)
+        return created_note
         parsed_rows = _parse_rows(file_name=file_name, file_bytes=file_bytes)
 
         created_count = 0
@@ -158,9 +234,18 @@ class ImportService:
                     update_payload = model.model_dump(exclude_none=True)
                     await self.customer_repository.update_by_id(existing_customer["id"], update_payload)
                     updated_count += 1
+                    customer_to_process = existing_customer
                 else:
-                    await self.customer_repository.create(model.model_dump(exclude_none=True))
+                    created_customer = await self.customer_repository.create(model.model_dump(exclude_none=True))
                     created_count += 1
+                    customer_to_process = created_customer
+
+                # Auto-create lead and organization from customer
+                await self.create_lead_from_customer(customer=customer_to_process)
+
+                # Auto-create notes from customer's notes field
+                await self.create_notes_from_customer(customer=customer_to_process)
+
             except Exception as exc:
                 failures.append(ImportFailure(row_number=parsed_row.row_number, reason=str(exc)))
 
