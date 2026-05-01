@@ -21,7 +21,7 @@ async def get_dashboard_summary(
     service: DashboardService = Depends(get_dashboard_service),
 ):
     """Return high-level KPI metrics for the dashboard."""
-    return service.get_summary()
+    return await service.get_summary()
 
 
 @router.get("/activity", response_model=DashboardActivity)
@@ -31,4 +31,4 @@ async def get_dashboard_activity(
     service: DashboardService = Depends(get_dashboard_service),
 ):
     """Return activity counts grouped by day."""
-    return service.get_activity(days=days)
+    return await service.get_activity(days=days)

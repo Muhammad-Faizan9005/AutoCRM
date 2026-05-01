@@ -106,6 +106,7 @@ class FakeDB:
         self.manager_id = str(uuid4())
         self.rep_id = str(uuid4())
         self.existing_customer_id = str(uuid4())
+        self.existing_lead_id = str(uuid4())
 
         self.tables: dict[str, list[dict[str, Any]]] = {
             "agents": [
@@ -139,6 +140,21 @@ class FakeDB:
                     "created_at": now,
                     "updated_at": now,
                 },
+            ],
+            "organizations": [],
+            "leads": [
+                {
+                    "id": self.existing_lead_id,
+                    "name": "Existing Lead",
+                    "email": "existing@example.com",
+                    "phone": "+1 555 1000",
+                    "company": "Old Co",
+                    "source": "manual",
+                    "status": "new",
+                    "organization_id": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
             ],
             "customers": [
                 {
@@ -191,36 +207,42 @@ def _build_excel_bytes(rows: list[dict[str, str]]) -> bytes:
     return stream.getvalue()
 
 
-def test_import_customers_from_csv_creates_and_updates():
+def test_import_leads_from_csv_creates_and_updates():
     client, fake_db = _client_with_fake_db()
     manager_headers = {"Authorization": f"Bearer {_token_for(fake_db.manager_id)}"}
 
     csv_content = "\n".join(
         [
-            "email,full_name,phone,company,status,notes",
-            "existing@example.com,<b>Existing Updated</b>,+1 555 2000,New Co,lead,Updated note",
+            "email,full_name,phone,company,status,notes_section_1,notes_section_2",
+            "existing@example.com,<b>Existing Updated</b>,+1 555 2000,New Co,lead,Updated note part one,Updated note part two",
             "new@example.com,New Customer,+1 555 3000,Acme Inc,active,Fresh lead",
         ]
     )
 
     response = client.post(
-        "/api/import/customers",
+        "/api/import/leads",
         headers=manager_headers,
         files={"file": ("customers.csv", csv_content.encode("utf-8"), "text/csv")},
     )
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["entity"] == "customers"
+    assert payload["entity"] == "leads"
     assert payload["total_rows"] == 2
     assert payload["created_count"] == 1
     assert payload["updated_count"] == 1
     assert payload["failed_count"] == 0
 
-    updated = next(row for row in fake_db.tables["customers"] if row["email"] == "existing@example.com")
-    assert updated["full_name"] == "Existing Updated"
+    updated = next(row for row in fake_db.tables["leads"] if row["email"] == "existing@example.com")
+    assert updated["name"] == "Existing Updated"
     assert updated["status"] == "lead"
-    assert len(fake_db.tables["customers"]) == 2
+    assert updated["company"] == "New Co"
+    assert len(fake_db.tables["leads"]) == 2
+    assert len(fake_db.tables["notes"]) == 2
+    assert fake_db.tables["notes"][0]["entity_type"] == "lead"
+    assert fake_db.tables["notes"][0]["content"] == "Updated note part one | Updated note part two"
+    assert fake_db.tables["notes"][1]["entity_type"] == "lead"
+    assert fake_db.tables["notes"][1]["content"] == "Fresh lead"
 
 
 def test_import_tickets_from_excel_with_row_level_failure():
@@ -270,7 +292,7 @@ def test_import_requires_manager_or_admin_role():
 
     csv_content = "email,full_name\nrepnew@example.com,Rep Should Fail"
     response = client.post(
-        "/api/import/customers",
+        "/api/import/leads",
         headers=rep_headers,
         files={"file": ("customers.csv", csv_content.encode("utf-8"), "text/csv")},
     )
@@ -283,10 +305,195 @@ def test_import_rejects_unsupported_file_type():
     manager_headers = {"Authorization": f"Bearer {_token_for(fake_db.manager_id)}"}
 
     response = client.post(
-        "/api/import/customers",
+        "/api/import/leads",
         headers=manager_headers,
         files={"file": ("customers.txt", b"invalid", "text/plain")},
     )
 
     assert response.status_code == 400
     assert "Unsupported file type" in response.json()["error"]["message"]
+
+
+def test_ingest_lead_payload_from_connected_site_creates_note():
+    client, fake_db = _client_with_fake_db()
+    manager_headers = {"Authorization": f"Bearer {_token_for(fake_db.manager_id)}"}
+
+    payload = {
+        "email": "sitelead@example.com",
+        "full_name": "Site Lead",
+        "phone": "+1 555 4444",
+        "company": "Site Co",
+        "source": "website",
+        "status": "new",
+        "notes_section_1": "Asked for a demo",
+        "notes_section_2": "Wants follow-up next week",
+    }
+
+    response = client.post("/api/leads/ingest", headers=manager_headers, json=payload)
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["email"] == "sitelead@example.com"
+    assert body["name"] == "Site Lead"
+    assert len(fake_db.tables["leads"]) == 2
+    assert len(fake_db.tables["notes"]) == 1
+    assert fake_db.tables["notes"][0]["entity_type"] == "lead"
+    assert fake_db.tables["notes"][0]["content"] == "Asked for a demo | Wants follow-up next week"
+
+
+# ============================================================================
+# Test: Lead-to-Deal Conversion Workflow
+# ============================================================================
+
+
+def test_lead_to_deal_conversion():
+    """Test converting a lead to a deal."""
+    client, fake_db = _client_with_fake_db()
+    manager_headers = {"Authorization": f"Bearer {_token_for(fake_db.manager_id)}"}
+
+    # Initialize tables if needed
+    if "deals" not in fake_db.tables:
+        fake_db.tables["deals"] = []
+
+    # Create a new lead first
+    csv_content = "email,full_name,phone,company\nnewlead@example.com,New Lead,+1 555 5555,Lead Company"
+
+    response = client.post(
+        "/api/import/leads",
+        headers=manager_headers,
+        files={"file": ("leads.csv", csv_content.encode("utf-8"), "text/csv")},
+    )
+
+    assert response.status_code == 200
+
+    # Get the created lead
+    new_lead = next(row for row in fake_db.tables["leads"] if row["email"] == "newlead@example.com")
+    lead_id = new_lead["id"]
+
+    # Convert the lead to a deal
+    convert_payload = {
+        "stage": "prospecting",
+        "value": 10000.0,
+        "currency": "USD",
+    }
+
+    response = client.post(
+        f"/api/leads/{lead_id}/convert-to-deal",
+        headers=manager_headers,
+        json=convert_payload,
+    )
+
+    assert response.status_code == 201
+    deal = response.json()
+    assert deal["lead_id"] == lead_id
+    assert deal["stage"] == "prospecting"
+    assert deal["status"] == "qualified"
+    assert deal["value"] == 10000.0
+
+    # Verify lead was marked as converted
+    updated_lead = next(row for row in fake_db.tables["leads"] if row["id"] == lead_id)
+    assert updated_lead.get("converted") is True
+    assert updated_lead["status"] == "qualified"
+
+
+def test_deal_to_customer_conversion_on_won_status():
+    """Test converting a deal to a customer when status becomes 'won'."""
+    client, fake_db = _client_with_fake_db()
+    manager_headers = {"Authorization": f"Bearer {_token_for(fake_db.manager_id)}"}
+
+    # Initialize tables
+    if "deals" not in fake_db.tables:
+        fake_db.tables["deals"] = []
+
+    # Create a lead and convert to deal
+    csv_content = "email,full_name,phone,company\nwinlead@example.com,Win Lead,+1 555 6666,Win Company"
+
+    response = client.post(
+        "/api/import/leads",
+        headers=manager_headers,
+        files={"file": ("leads.csv", csv_content.encode("utf-8"), "text/csv")},
+    )
+
+    assert response.status_code == 200
+
+    # Get the created lead
+    lead = next(row for row in fake_db.tables["leads"] if row["email"] == "winlead@example.com")
+    lead_id = lead["id"]
+
+    # Convert to deal
+    convert_payload = {"stage": "closing", "value": 50000.0}
+
+    response = client.post(
+        f"/api/leads/{lead_id}/convert-to-deal",
+        headers=manager_headers,
+        json=convert_payload,
+    )
+
+    assert response.status_code == 201
+    deal = response.json()
+    deal_id = deal["id"]
+
+    # Update deal status to "won"
+    update_payload = {"status": "won"}
+
+    response = client.patch(
+        f"/api/deals/{deal_id}",
+        headers=manager_headers,
+        json=update_payload,
+    )
+
+    assert response.status_code == 200
+    updated_deal = response.json()
+    assert updated_deal["status"] == "won"
+
+    # Verify customer was created and linked to deal
+    customer = next(
+        (row for row in fake_db.tables["customers"] if row["email"] == "winlead@example.com"),
+        None,
+    )
+    assert customer is not None
+    assert customer["status"] == "active"
+
+
+def test_deal_to_customer_fails_if_not_won():
+    """Test that deal-to-customer conversion fails if deal status is not 'won'."""
+    client, fake_db = _client_with_fake_db()
+    manager_headers = {"Authorization": f"Bearer {_token_for(fake_db.manager_id)}"}
+
+    # Initialize tables
+    if "deals" not in fake_db.tables:
+        fake_db.tables["deals"] = []
+
+    # Create a lead and convert to deal
+    csv_content = "email,full_name,phone,company\nnotwinlead@example.com,Not Win Lead,+1 555 7777,Not Win Company"
+
+    response = client.post(
+        "/api/import/leads",
+        headers=manager_headers,
+        files={"file": ("leads.csv", csv_content.encode("utf-8"), "text/csv")},
+    )
+
+    # Get the created lead
+    lead = next(row for row in fake_db.tables["leads"] if row["email"] == "notwinlead@example.com")
+    lead_id = lead["id"]
+
+    # Convert to deal
+    convert_payload = {"stage": "prospecting"}
+
+    response = client.post(
+        f"/api/leads/{lead_id}/convert-to-deal",
+        headers=manager_headers,
+        json=convert_payload,
+    )
+
+    deal = response.json()
+    deal_id = deal["id"]
+
+    # Try to manually convert to customer (should fail - deal status is "qualified", not "won")
+    response = client.post(
+        f"/api/deals/{deal_id}/convert-to-customer",
+        headers=manager_headers,
+    )
+
+    assert response.status_code == 400
+    assert "won" in response.json()["error"]["message"].lower()

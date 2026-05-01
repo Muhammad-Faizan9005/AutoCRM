@@ -17,8 +17,8 @@ Implemented and ready for frontend integration:
 - Tickets (CRUD)
 - Ticket messages
 - Organizations (CRUD)
-- Leads (CRUD + convert-to-deal)
-- Deals (CRUD)
+- Leads (CRUD + lead-to-deal conversion)
+- Deals (CRUD + deal-to-customer conversion)
 - Tasks (CRUD)
 - Notes (CRUD)
 - Dashboard metrics
@@ -180,12 +180,25 @@ Common status codes:
 
 - Free-text status string
 - Default: `new`
-- Conversion endpoint sets status to `converted`
+- Key statuses:
+  - `new`: Newly created lead
+  - `qualified`: Lead converted to deal
+  - `won`: Deal completed successfully (auto-converted to customer)
+  - `lost`: Deal closed without conversion
 
 ### Deal Stage
 
 - Free-text stage string
 - Default: `prospecting`
+
+### Deal Status
+
+- Free-text status string
+- Default: `qualified` (when created from lead conversion)
+- Key statuses:
+  - `qualified`: Deal created from lead
+  - `won`: Deal closed successfully, triggers automatic customer creation
+  - `lost`: Deal closed without conversion
 
 ### Task Status
 
@@ -699,6 +712,86 @@ async function apiFetch(path: string, init: RequestInit = {}, retry = true) {
 - `429`: read `Retry-After` and show retry countdown
 - `500`: show generic server error banner
 
+## 9. CRM Workflow
+
+The AutoCRM follows a strict lead-to-deal-to-customer conversion workflow, matching the reference CRM (Frappe) pattern.
+
+### Lead Lifecycle
+
+1. **Lead Creation**
+   - Leads are created via:
+     - Manual POST `/api/leads/` creation
+     - CSV/Excel import via `/api/import/leads`
+     - Live payload ingestion via `/api/leads/ingest`
+   - Initial status: `new` or custom status from import
+   - A lead stays a lead until explicitly converted
+
+2. **Lead-to-Deal Conversion** (Manual)
+   - Endpoint: `POST /api/leads/{lead_id}/convert-to-deal`
+   - Requires: `sales_manager` or `admin` role
+   - Payload:
+     ```json
+     {
+       "stage": "prospecting",
+       "value": 50000.0,
+       "currency": "USD",
+       "expected_close_at": "2026-06-30T00:00:00Z",
+       "owner_id": "optional-uuid",
+       "organization_id": "optional-uuid"
+     }
+     ```
+   - Response: Created deal with `status="qualified"`
+   - Side effects:
+     - Lead is marked with `converted=true`
+     - Lead status is updated to `"qualified"`
+
+### Deal Lifecycle
+
+3. **Deal Status Updates** (with automatic customer creation)
+   - Endpoint: `PATCH /api/deals/{deal_id}`
+   - Updatable fields: `status`, `stage`, `value`, `currency`, `expected_close_at`, `closed_at`, `lost_reason`
+   - When `status` changes to `"won"`:
+     - Deal is automatically converted to customer
+     - `closed_at` is auto-set to current timestamp
+     - A new customer record is created with:
+       - `full_name`: From lead name (or deal stage fallback)
+       - `email`: From lead email (or generated placeholder)
+       - `phone`: From lead phone (if available)
+       - `company`: From lead company (if available)
+       - `status`: `"active"`
+       - `notes`: "Converted from deal {deal_id}"
+   - When `status` changes to `"lost"`:
+     - `closed_at` is auto-set to current timestamp
+     - No customer record is created
+
+4. **Manual Deal-to-Customer Conversion**
+   - Endpoint: `POST /api/deals/{deal_id}/convert-to-customer`
+   - Only works if deal `status="won"`
+   - Returns: Created customer record
+   - Response `400` if deal status is not `"won"`
+   - If customer already created, returns existing customer
+
+### Customer Lifecycle
+
+- Customers are created **only** when:
+  1. Explicitly via `POST /api/customers/`
+  2. Automatically when deal status becomes `"won"`
+- A customer is a terminal entity (no further conversions)
+- A customer cannot be converted back to a lead
+
+### Key Differences from Old Workflow
+
+**Before:**
+- Leads and customers were treated as interchangeable
+- CSV import created customers directly
+- No explicit deal lifecycle
+
+**Now:**
+- Leads are primary ingestion entity
+- Deals are explicit, status-driven workflow
+- Customers are created only when deal is won
+- Clear status semantics: lead → deal → customer
+
 ## 10. Frontend QA Checklist
 
 - Login and register both store tokens correctly.
@@ -708,9 +801,14 @@ async function apiFetch(path: string, init: RequestInit = {}, retry = true) {
 - `PATCH` methods are used where required (not `PUT`).
 - Rate-limit and validation errors are user-friendly in UI.
 - Logout clears local session and revokes current token.
-- CSV import works for customers.
+- CSV import works for leads.
+- Connected site payload ingestion works for leads.
 - Excel import works for tickets.
 - Partial failures are displayed with row number and reason.
+- Lead-to-deal conversion marks lead as converted with status="qualified".
+- Deal status update to "won" automatically creates customer.
+- Deal status update to "lost" closes deal without customer creation.
+- Customers are never created from leads directly (only via won deals).
 
 ## 11. Notes for Maintainers
 
@@ -718,3 +816,5 @@ async function apiFetch(path: string, init: RequestInit = {}, retry = true) {
 - Re-export OpenAPI spec from `/openapi.json` for generated clients if needed.
 - Keep frontend enum values synchronized with section 6.
 - If backend contracts change, bump API docs and notify frontend team in the same PR.
+- CRM Workflow (section 9) defines the lead → deal → customer conversion rules.
+- Database schema now includes: leads.converted, deals.status, deals.customer_id, deals.closed_at.

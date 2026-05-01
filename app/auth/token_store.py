@@ -6,6 +6,11 @@ from typing import Optional
 from supabase import Client
 
 from app.database import run_db_operation
+from app.utils.cache import (
+    get_cached_token_revocation_status,
+    cache_token_revocation_status,
+    invalidate_token_revocation_cache,
+)
 
 _REVOCATION_TABLE = "revoked_tokens"
 
@@ -39,13 +44,19 @@ def _iso_to_unix(value: str | None) -> int | None:
 
 
 async def blacklist_token(db: Client, token: str, exp_unix: Optional[int]) -> None:
-    """Persist token revocation until token expiry, with in-memory fallback."""
+    """
+    Persist token revocation until token expiry, with in-memory fallback.
+    Invalidates any cached revocation status for this token.
+    """
     if not token or exp_unix is None:
         return
 
     _prune_expired_tokens()
     token_hash = _token_hash(token)
     _BLACKLISTED_TOKENS[token_hash] = int(exp_unix)
+    
+    # Invalidate cache so next check will see the revocation
+    invalidate_token_revocation_cache(token_hash)
 
     payload = {
         "token_hash": token_hash,
@@ -66,16 +77,28 @@ async def blacklist_token(db: Client, token: str, exp_unix: Optional[int]) -> No
 
 
 async def is_token_blacklisted(db: Client, token: str) -> bool:
-    """Return True if token was invalidated before expiry."""
+    """
+    Return True if token was invalidated before expiry.
+    
+    Uses cache first (1 hour TTL) to avoid repeated DB queries.
+    Cache miss falls back to database check.
+    """
     if not token:
         return False
 
     _prune_expired_tokens()
     token_hash = _token_hash(token)
 
+    # Check in-memory fallback first (instant)
     if token_hash in _BLACKLISTED_TOKENS:
         return True
 
+    # Check distributed cache second (1-2ms typical)
+    cached_status = get_cached_token_revocation_status(token_hash)
+    if cached_status is not None:
+        return cached_status
+
+    # Cache miss or expired: query database (this is the slow operation we're optimizing)
     try:
         response = await run_db_operation(
             lambda: db.table(_REVOCATION_TABLE)
@@ -89,11 +112,15 @@ async def is_token_blacklisted(db: Client, token: str) -> bool:
 
     rows = response.data or []
     if not rows:
+        # Token is not revoked - cache this for 1 hour
+        cache_token_revocation_status(token_hash, False, ttl_seconds=3600)
         return False
 
     exp_unix = _iso_to_unix(rows[0].get("expires_at"))
     if exp_unix is not None and exp_unix <= int(time.time()):
+        # Token revocation expired - clean up and cache as not revoked
         _BLACKLISTED_TOKENS.pop(token_hash, None)
+        cache_token_revocation_status(token_hash, False, ttl_seconds=3600)
         try:
             await run_db_operation(
                 lambda: db.table(_REVOCATION_TABLE).delete().eq("token_hash", token_hash).execute()
@@ -102,6 +129,8 @@ async def is_token_blacklisted(db: Client, token: str) -> bool:
             pass
         return False
 
+    # Token is revoked - cache this status for 1 hour
     if exp_unix is not None:
         _BLACKLISTED_TOKENS[token_hash] = exp_unix
+        cache_token_revocation_status(token_hash, True, ttl_seconds=3600)
     return True

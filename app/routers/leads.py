@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from typing import List
 from uuid import UUID
 
@@ -8,10 +9,13 @@ from supabase import Client
 
 from app.auth.dependencies import require_admin, require_auth
 from app.database import get_db
+from app.exceptions.custom_exceptions import ResourceNotFoundError
 from app.repositories.deal_repository import DealRepository
 from app.repositories.lead_repository import LeadRepository
 from app.schemas.deal import DealResponse
 from app.schemas.lead import LeadConvertRequest, LeadCreate, LeadResponse, LeadUpdate
+from app.services.conversion_service import ConversionService
+from app.services.import_service import ImportService
 
 router = APIRouter()
 
@@ -22,6 +26,14 @@ def get_lead_repository(db: Client = Depends(get_db)) -> LeadRepository:
 
 def get_deal_repository(db: Client = Depends(get_db)) -> DealRepository:
     return DealRepository(db)
+
+
+def get_import_service(db: Client = Depends(get_db)) -> ImportService:
+    return ImportService(db)
+
+
+def get_conversion_service(db: Client = Depends(get_db)) -> ConversionService:
+    return ConversionService(db)
 
 
 @router.get("/", response_model=List[LeadResponse])
@@ -116,26 +128,37 @@ async def convert_lead_to_deal(
     lead_id: UUID,
     payload: LeadConvertRequest,
     current_user: dict = Depends(require_auth),
-    lead_repository: LeadRepository = Depends(get_lead_repository),
-    deal_repository: DealRepository = Depends(get_deal_repository),
+    service: ConversionService = Depends(get_conversion_service),
 ):
-    """Convert a lead into a deal."""
-    lead = await lead_repository.get_by_id(lead_id)
+    """
+    Convert a lead into a deal.
 
-    owner_id = payload.owner_id or lead.get("owner_id") or current_user.get("id")
-    organization_id = payload.organization_id or lead.get("organization_id")
+    Following the reference CRM pattern:
+    - Creates a deal linked to the lead
+    - Marks lead as converted with status="qualified"
+    - Only triggers customer creation when deal status becomes "Won"
+    """
+    try:
+        return await service.convert_lead_to_deal(
+            lead_id=str(lead_id),
+            stage=payload.stage or "qualified",
+            value=payload.value,
+            currency=payload.currency or "USD",
+            expected_close_at=payload.expected_close_at,
+            owner_id=str(payload.owner_id) if payload.owner_id else None,
+            organization_id=str(payload.organization_id) if payload.organization_id else None,
+        )
+    except ResourceNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc.detail))
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
-    deal_data = {
-        "lead_id": str(lead_id),
-        "owner_id": str(owner_id) if owner_id else None,
-        "organization_id": str(organization_id) if organization_id else None,
-        "stage": payload.stage or "qualified",
-        "value": payload.value,
-        "currency": payload.currency or "USD",
-        "expected_close_at": payload.expected_close_at,
-    }
 
-    created_deal = await deal_repository.create(deal_data)
-    await lead_repository.update_by_id(lead_id, {"status": "converted"})
-
-    return created_deal
+@router.post("/ingest", response_model=LeadResponse, status_code=status.HTTP_201_CREATED)
+async def ingest_lead_payload(
+    payload: dict[str, Any],
+    current_user: dict = Depends(require_auth),
+    service: ImportService = Depends(get_import_service),
+):
+    """Ingest a lead payload from a connected site or integration."""
+    return await service.ingest_lead_payload(payload=payload)

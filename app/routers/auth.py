@@ -4,6 +4,7 @@ from supabase import Client
 import uuid
 
 from app.database import get_db, run_db_operation
+from app.utils.cache import invalidate_user_cache
 from app.schemas.auth import (
     LoginRequest,
     LoginResponse,
@@ -220,7 +221,7 @@ async def logout(
     Logout current user.
     
     Note: With JWT, actual logout is handled client-side by removing tokens.
-    This endpoint is for logging/audit purposes.
+    This endpoint is for logging/audit purposes and to invalidate cached user data.
     """
     access_payload = verify_token(credentials.credentials)
     if access_payload and access_payload.get("exp"):
@@ -231,6 +232,11 @@ async def logout(
         refresh_payload = verify_token(refresh_token)
         if refresh_payload and refresh_payload.get("exp"):
             await blacklist_token(db, refresh_token, refresh_payload.get("exp"))
+
+    # Invalidate user cache on logout
+    user_id = current_user.get("id")
+    if user_id:
+        invalidate_user_cache(user_id)
 
     return {
         "success": True,

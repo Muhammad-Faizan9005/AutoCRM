@@ -6,6 +6,7 @@ from supabase import Client
 from app.database import get_db, run_db_operation
 from app.auth.utils import verify_token
 from app.auth.token_store import is_token_blacklisted
+from app.utils.cache import get_cached_user, cache_user
 
 security = HTTPBearer()
 
@@ -54,36 +55,43 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # Get user from database
-    try:
-        response = await run_db_operation(
-            lambda: db.table("agents").select("*").eq("id", user_id).single().execute()
-        )
-        user = response.data
-        
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User not found",
-                headers={"WWW-Authenticate": "Bearer"},
+    # Get user from cache first (90% hit rate expected)
+    user = get_cached_user(user_id)
+    
+    if user is None:
+        # Cache miss: fetch from database and cache it
+        try:
+            response = await run_db_operation(
+                lambda: db.table("agents").select("*").eq("id", user_id).single().execute()
             )
-        
-        # Check if user is active
-        if not user.get("is_active", True):
+            user = response.data
+            
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="User not found",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            
+            # Cache user for 5 minutes (TTL on auth checks)
+            cache_user(user_id, user, ttl_seconds=300)
+            
+        except HTTPException:
+            raise
+        except Exception:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Inactive user"
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication service temporarily unavailable",
             )
-        
-        return user
-
-    except HTTPException:
-        raise
-    except Exception:
+    
+    # Check if user is active (even from cache, verify this)
+    if not user.get("is_active", True):
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication service temporarily unavailable",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Inactive user"
         )
+    
+    return user
 
 
 async def get_current_active_user(current_user: dict = Depends(get_current_user)):

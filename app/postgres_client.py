@@ -1,11 +1,48 @@
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import MetaData, Table, and_, create_engine, delete, select, update
+from sqlalchemy import MetaData, Table, and_, create_engine, delete, event, select, update
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import QueuePool
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+logger = logging.getLogger(__name__)
+
+# Configuration for database query logging
+SLOW_QUERY_THRESHOLD_MS = 100  # Log queries taking >100ms
+
+# Store query start time on connection
+_query_start_times: dict[int, float] = {}
+
+
+def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    """Log when a query starts."""
+    _query_start_times[id(cursor)] = time.time()
+
+
+def _after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    """Log slow queries after execution."""
+    start_time = _query_start_times.pop(id(cursor), None)
+    if start_time is None:
+        return
+    
+    elapsed_ms = (time.time() - start_time) * 1000
+    
+    # Log queries slower than threshold
+    if elapsed_ms > SLOW_QUERY_THRESHOLD_MS:
+        # Truncate statement if too long
+        stmt_preview = statement[:200] + "..." if len(statement) > 200 else statement
+        logger.warning(
+            f"SLOW QUERY ({elapsed_ms:.1f}ms): {stmt_preview}",
+            extra={"duration_ms": elapsed_ms}
+        )
+    elif elapsed_ms > 50:
+        # Debug level for moderately slow queries
+        logger.debug(f"Query executed in {elapsed_ms:.1f}ms")
 
 
 @dataclass
@@ -207,7 +244,27 @@ class PostgresQueryBuilder:
 
 class PostgresClient:
     def __init__(self, database_url: str):
-        self.engine = create_engine(database_url, future=True, pool_pre_ping=True)
+        # Configure connection pool for stability:
+        # - pool_size: Number of connections to keep in pool (20 for moderate load)
+        # - max_overflow: Additional connections beyond pool_size (30 for spikes)
+        # - pool_timeout: Seconds to wait for a free connection from pool (30s max)
+        # - pool_recycle: Recycle connections after 3600 seconds (1 hour) to prevent stale connections
+        # - pool_pre_ping: Verify connection health before using it (prevents "connection closed" errors)
+        self.engine = create_engine(
+            database_url,
+            future=True,
+            poolclass=QueuePool,
+            pool_size=20,
+            max_overflow=30,
+            pool_timeout=30,
+            pool_recycle=3600,
+            pool_pre_ping=True,
+        )
+        
+        # Attach query logging event listeners for monitoring slow queries
+        event.listen(self.engine, "before_cursor_execute", _before_cursor_execute)
+        event.listen(self.engine, "after_cursor_execute", _after_cursor_execute)
+        
         self._metadata = MetaData()
         self._table_cache: dict[str, Table] = {}
 
