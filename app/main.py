@@ -17,6 +17,16 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# CORS middleware for frontend integration — register early so preflight
+# requests receive CORS headers before any custom middleware intercepts them.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # only allow known frontend origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Middleware registration order matters.
 # Last registered executes first, so request-id gets attached before request logs.
 app.middleware("http")(security_middleware)
@@ -26,15 +36,6 @@ app.middleware("http")(error_handler_middleware)
 
 # Setup exception handlers
 setup_exception_handlers(app)
-
-# CORS middleware for frontend integration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Update with specific origins in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 @app.get("/")
 async def root():

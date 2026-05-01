@@ -211,6 +211,8 @@ class ImportService:
 
         created_note = await self.note_repository.create(note_data)
         return created_note
+
+    async def import_customers(self, *, file_name: str, file_bytes: bytes) -> ImportResult:
         parsed_rows = _parse_rows(file_name=file_name, file_bytes=file_bytes)
 
         created_count = 0
@@ -240,11 +242,17 @@ class ImportService:
                     created_count += 1
                     customer_to_process = created_customer
 
-                # Auto-create lead and organization from customer
-                await self.create_lead_from_customer(customer=customer_to_process)
+                # Auto-create lead and organization from customer (non-fatal)
+                try:
+                    await self.create_lead_from_customer(customer=customer_to_process)
+                except Exception:
+                    pass
 
-                # Auto-create notes from customer's notes field
-                await self.create_notes_from_customer(customer=customer_to_process)
+                # Auto-create notes from customer's notes field (non-fatal)
+                try:
+                    await self.create_notes_from_customer(customer=customer_to_process)
+                except Exception:
+                    pass
 
             except Exception as exc:
                 failures.append(ImportFailure(row_number=parsed_row.row_number, reason=str(exc)))
@@ -312,3 +320,4 @@ class ImportService:
             failed_count=len(failures),
             failures=failures,
         )
+        
