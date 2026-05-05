@@ -172,6 +172,7 @@ class FakeDB:
                 }
             ],
             "ticket_messages": [],
+            "agent_permissions": [],
         }
 
     def table(self, table_name: str) -> FakeTable:

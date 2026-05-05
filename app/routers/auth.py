@@ -22,9 +22,10 @@ from app.auth.utils import (
     create_refresh_token,
     verify_token
 )
-from app.auth.dependencies import require_auth
+from app.auth.dependencies import require_auth, get_permission_service
 from app.auth.token_store import blacklist_token, is_token_blacklisted
 from app.config import settings
+from app.services.permission_service import PermissionService, is_admin_user
 from app.utils.sanitization import sanitize_payload
 
 router = APIRouter()
@@ -34,7 +35,8 @@ security = HTTPBearer()
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 async def register(
     user_data: RegisterRequest,
-    db: Client = Depends(get_db)
+    db: Client = Depends(get_db),
+    permission_service: PermissionService = Depends(get_permission_service),
 ):
     """
     Register a new agent/user.
@@ -73,21 +75,25 @@ async def register(
     access_token = create_access_token(data={"sub": created_user["id"]})
     refresh_token = create_refresh_token(data={"sub": created_user["id"]})
     
-    # Never expose password hashes in API responses.
-    created_user.pop("password_hash", None)
+    safe_user = dict(created_user)
+    safe_user.pop("password_hash", None)
+    safe_user["permissions"] = await permission_service.get_effective_permissions(safe_user)
+    safe_user["is_admin"] = is_admin_user(safe_user)
+    safe_user["is_superuser"] = bool(safe_user.get("is_superuser", False))
     
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "user": created_user
+        "user": safe_user
     }
 
 
 @router.post("/login", response_model=LoginResponse)
 async def login(
     credentials: LoginRequest,
-    db: Client = Depends(get_db)
+    db: Client = Depends(get_db),
+    permission_service: PermissionService = Depends(get_permission_service),
 ):
     """
     Login with email and password.
@@ -128,27 +134,36 @@ async def login(
     access_token = create_access_token(data={"sub": user["id"]})
     refresh_token = create_refresh_token(data={"sub": user["id"]})
     
-    # Remove password hash from response
-    user.pop("password_hash", None)
+    safe_user = dict(user)
+    safe_user.pop("password_hash", None)
+    safe_user["permissions"] = await permission_service.get_effective_permissions(safe_user)
+    safe_user["is_admin"] = is_admin_user(safe_user)
+    safe_user["is_superuser"] = bool(safe_user.get("is_superuser", False))
     
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "user": user
+        "user": safe_user
     }
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_current_user_profile(current_user: dict = Depends(require_auth)):
+async def get_current_user_profile(
+    current_user: dict = Depends(require_auth),
+    permission_service: PermissionService = Depends(get_permission_service),
+):
     """
     Get current authenticated user profile.
     
     Requires valid JWT token in Authorization header.
     """
-    # Remove password hash if present
-    current_user.pop("password_hash", None)
-    return current_user
+    safe_user = dict(current_user)
+    safe_user.pop("password_hash", None)
+    safe_user["permissions"] = await permission_service.get_effective_permissions(safe_user)
+    safe_user["is_admin"] = is_admin_user(safe_user)
+    safe_user["is_superuser"] = bool(safe_user.get("is_superuser", False))
+    return safe_user
 
 
 @router.post("/refresh", response_model=TokenResponse)

@@ -25,6 +25,9 @@ class UserPublic(BaseModel):
     role: Literal["admin", "sales_manager", "sales_rep"]
     is_active: bool
     created_at: datetime
+    permissions: dict[str, bool] | None = None
+    is_admin: bool | None = None
+    is_superuser: bool | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -68,5 +71,8 @@ class UserResponse(BaseModel):
     role: Literal["admin", "sales_manager", "sales_rep"]
     is_active: bool
     created_at: datetime
+    permissions: dict[str, bool] | None = None
+    is_admin: bool | None = None
+    is_superuser: bool | None = None
     
     model_config = ConfigDict(from_attributes=True)

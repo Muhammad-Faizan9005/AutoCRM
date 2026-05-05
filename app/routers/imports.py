@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from supabase import Client
 
-from app.auth.dependencies import require_sales_manager_or_admin
+from app.auth.dependencies import require_permissions
 from app.database import get_db
 from app.schemas.imports import ImportResult
 from app.services.import_service import ImportService
@@ -24,7 +24,7 @@ async def _validate_uploaded_file(file: UploadFile) -> None:
 @router.post("/leads", response_model=ImportResult)
 async def import_leads(
     file: UploadFile = File(...),
-    current_user: dict = Depends(require_sales_manager_or_admin()),
+    current_user: dict = Depends(require_permissions(["import_data"])),
     service: ImportService = Depends(get_import_service),
 ):
     """Import lead rows from CSV or Excel file."""
@@ -36,7 +36,7 @@ async def import_leads(
 @router.post("/customers", response_model=ImportResult)
 async def import_customers(
     file: UploadFile = File(...),
-    current_user: dict = Depends(require_sales_manager_or_admin()),
+    current_user: dict = Depends(require_permissions(["import_data"])),
     service: ImportService = Depends(get_import_service),
 ):
     """Compatibility alias for lead import."""
@@ -48,7 +48,7 @@ async def import_customers(
 @router.post("/tickets", response_model=ImportResult)
 async def import_tickets(
     file: UploadFile = File(...),
-    current_user: dict = Depends(require_sales_manager_or_admin()),
+    current_user: dict = Depends(require_permissions(["import_data"])),
     service: ImportService = Depends(get_import_service),
 ):
     """Import ticket rows from CSV or Excel file."""

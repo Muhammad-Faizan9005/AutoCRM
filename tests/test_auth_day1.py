@@ -69,6 +69,7 @@ class FakeDB:
     def __init__(self):
         self.tables: dict[str, list[dict[str, Any]]] = {
             "agents": [],
+            "agent_permissions": [],
         }
 
     def table(self, table_name: str) -> FakeTable:

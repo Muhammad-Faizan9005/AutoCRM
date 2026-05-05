@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     MAX_REQUEST_SIZE_BYTES: int = 1_048_576
     SECURITY_HEADERS_ENABLED: bool = True
 
+    # Permissions storage (local JSON files)
+    PERMISSIONS_STORAGE_DIR: str = "storage/permissions"
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 
     @property

@@ -7,6 +7,7 @@ from app.database import get_db, run_db_operation
 from app.auth.utils import verify_token
 from app.auth.token_store import is_token_blacklisted
 from app.utils.cache import get_cached_user, cache_user
+from app.services.permission_service import PermissionService
 
 security = HTTPBearer()
 
@@ -155,3 +156,30 @@ def require_admin():
 def require_sales_manager_or_admin():
     """Dependency that allows sales managers and admins."""
     return require_role(["sales_manager", "admin"])
+
+
+def get_permission_service(db: Client = Depends(get_db)) -> PermissionService:
+    return PermissionService(db)
+
+
+def require_permissions(required_permissions: list[str]):
+    """
+    Dependency factory to require specific permission keys.
+
+    Permissions are resolved from role defaults plus any stored overrides.
+    """
+
+    async def permissions_checker(
+        current_user: dict = Depends(get_current_user),
+        service: PermissionService = Depends(get_permission_service),
+    ) -> dict:
+        permissions = await service.get_effective_permissions(current_user)
+        missing = [key for key in required_permissions if not permissions.get(key, False)]
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions",
+            )
+        return current_user
+
+    return permissions_checker
