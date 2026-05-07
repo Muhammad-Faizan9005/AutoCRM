@@ -26,7 +26,7 @@ class AdminUserList(BaseModel):
 class AdminUserCreate(BaseModel):
     full_name: str = Field(..., min_length=2, max_length=255)
     email: EmailStr
-    role: str = "agent"
+    role: Literal["admin", "manager", "sales_manager", "agent", "sales_rep"] = "agent"
     status: AdminStatus = "invited"
     password: Optional[str] = Field(default=None, min_length=6, max_length=128)
 
@@ -34,7 +34,7 @@ class AdminUserCreate(BaseModel):
 class AdminUserUpdate(BaseModel):
     full_name: Optional[str] = Field(default=None, min_length=2, max_length=255)
     email: Optional[EmailStr] = None
-    role: Optional[str] = None
+    role: Optional[Literal["admin", "manager", "sales_manager", "agent", "sales_rep"]] = None
     status: Optional[AdminStatus] = None
     password: Optional[str] = Field(default=None, min_length=6, max_length=128)
 

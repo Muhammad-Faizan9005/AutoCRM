@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import Client
-import uuid
 
 from app.database import get_db, run_db_operation
 from app.utils.cache import invalidate_user_cache
@@ -16,7 +15,6 @@ from app.schemas.auth import (
     LogoutRequest,
 )
 from app.auth.utils import (
-    hash_password,
     verify_password,
     create_access_token,
     create_refresh_token,
@@ -26,50 +24,82 @@ from app.auth.dependencies import require_auth, get_permission_service
 from app.auth.token_store import blacklist_token, is_token_blacklisted
 from app.config import settings
 from app.services.permission_service import PermissionService, is_admin_user
-from app.utils.sanitization import sanitize_payload
+from app.services.registration_service import register_user_account
 
 router = APIRouter()
 security = HTTPBearer()
+optional_security = HTTPBearer(auto_error=False)
+
+
+async def _assert_admin_for_role_override(
+    db: Client,
+    credentials: HTTPAuthorizationCredentials | None,
+) -> None:
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admin can assign this role",
+        )
+
+    token = credentials.credentials
+    if await is_token_blacklisted(db, token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been invalidated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token_payload = verify_token(token)
+    if token_payload is None or token_payload.get("type") != "access":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    requester_id = token_payload.get("sub")
+    if not requester_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    response = await run_db_operation(
+        lambda: db.table("agents").select("*").eq("id", requester_id).limit(1).execute()
+    )
+    requester = (response.data or [None])[0]
+    if not requester or requester.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admin can assign this role",
+        )
 
 
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 async def register(
     user_data: RegisterRequest,
+    credentials: HTTPAuthorizationCredentials | None = Depends(optional_security),
     db: Client = Depends(get_db),
     permission_service: PermissionService = Depends(get_permission_service),
 ):
     """
     Register a new agent/user.
-    
-    Creates a new sales_rep account with hashed password and returns authentication tokens.
-    """
-    sanitized_payload = sanitize_payload(user_data.model_dump(), skip_keys={"password"})
 
-    # Check if user already exists
-    existing_user = await run_db_operation(
-        lambda: db.table("agents").select("id").eq("email", sanitized_payload["email"]).limit(1).execute()
+    By default, registration creates a sales_rep. Admin-authenticated requests can
+    assign elevated roles.
+    """
+    if user_data.role != "sales_rep":
+        await _assert_admin_for_role_override(db=db, credentials=credentials)
+
+    created_user = await register_user_account(
+        db,
+        email=str(user_data.email),
+        password=user_data.password,
+        full_name=user_data.full_name,
+        role=user_data.role,
+        is_active=True,
     )
-    if existing_user.data:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
-    
-    # Hash password
-    hashed_password = hash_password(user_data.password)
-    
-    # Create user
-    new_user = {
-        "id": str(uuid.uuid4()),
-        "email": sanitized_payload["email"],
-        "password_hash": hashed_password,
-        "full_name": sanitized_payload["full_name"],
-        "role": "sales_rep",
-        "is_active": True
-    }
-    
-    response = await run_db_operation(lambda: db.table("agents").insert(new_user).execute())
-    created_user = response.data[0]
     
     # Create tokens
     access_token = create_access_token(data={"sub": created_user["id"]})

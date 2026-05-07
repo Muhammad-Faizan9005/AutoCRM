@@ -15,6 +15,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=6)
     full_name: str = Field(..., min_length=2, max_length=255)
+    role: Literal["admin", "sales_manager", "sales_rep"] = "sales_rep"
 
 
 class UserPublic(BaseModel):

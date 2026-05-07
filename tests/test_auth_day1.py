@@ -83,7 +83,7 @@ def _client_with_fake_db() -> TestClient:
 
 
 def test_day1_auth_flow_with_logout_invalidation(monkeypatch):
-    monkeypatch.setattr("app.routers.auth.hash_password", lambda password: f"hashed::{password}")
+    monkeypatch.setattr("app.services.registration_service.hash_password", lambda password: f"hashed::{password}")
     monkeypatch.setattr(
         "app.routers.auth.verify_password",
         lambda plain_password, hashed_password: hashed_password == f"hashed::{plain_password}",
@@ -148,6 +148,60 @@ def test_day1_auth_flow_with_logout_invalidation(monkeypatch):
         json={"refresh_token": refresh_token},
     )
     assert refresh_after_logout.status_code == 401
+
+
+def test_register_blocks_elevated_role_without_admin_auth(monkeypatch):
+    monkeypatch.setattr("app.services.registration_service.hash_password", lambda password: f"hashed::{password}")
+
+    client = _client_with_fake_db()
+
+    register_res = client.post(
+        "/api/auth/register",
+        json={
+            "email": "manager@example.com",
+            "password": "secure-pass-123",
+            "full_name": "Manager User",
+            "role": "sales_manager",
+        },
+    )
+
+    assert register_res.status_code == 403
+    assert "Only admin can assign this role" in str(register_res.json())
+
+
+def test_register_allows_elevated_role_for_admin(monkeypatch):
+    monkeypatch.setattr("app.services.registration_service.hash_password", lambda password: f"hashed::{password}")
+    monkeypatch.setattr(
+        "app.routers.auth.verify_token",
+        lambda token: {"type": "access", "sub": "admin-1"} if token == "admin-token" else None,
+    )
+
+    client = _client_with_fake_db()
+    fake_db = app.dependency_overrides[get_db]()
+    fake_db.tables["agents"].append(
+        {
+            "id": "admin-1",
+            "email": "admin@example.com",
+            "password_hash": "hashed::secret",
+            "full_name": "Admin User",
+            "role": "admin",
+            "is_active": True,
+        }
+    )
+
+    register_res = client.post(
+        "/api/auth/register",
+        json={
+            "email": "manager@example.com",
+            "password": "secure-pass-123",
+            "full_name": "Manager User",
+            "role": "sales_manager",
+        },
+        headers={"Authorization": "Bearer admin-token"},
+    )
+
+    assert register_res.status_code == 201
+    assert register_res.json()["user"]["role"] == "sales_manager"
 
 
 if __name__ == "__main__":
