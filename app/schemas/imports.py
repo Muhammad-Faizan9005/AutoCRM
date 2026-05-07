@@ -11,7 +11,7 @@ class ImportFailure(BaseModel):
 
 
 class ImportResult(BaseModel):
-    entity: Literal["customers", "tickets"]
+    entity: Literal["leads", "tickets"]
     file_name: str
     total_rows: int
     successful_rows: int

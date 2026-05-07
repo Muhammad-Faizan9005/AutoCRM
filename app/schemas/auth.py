@@ -15,6 +15,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=6)
     full_name: str = Field(..., min_length=2, max_length=255)
+    role: Literal["admin", "sales_manager", "sales_rep"] = "sales_rep"
 
 
 class UserPublic(BaseModel):
@@ -25,6 +26,9 @@ class UserPublic(BaseModel):
     role: Literal["admin", "sales_manager", "sales_rep"]
     is_active: bool
     created_at: datetime
+    permissions: dict[str, bool] | None = None
+    is_admin: bool | None = None
+    is_superuser: bool | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -68,5 +72,8 @@ class UserResponse(BaseModel):
     role: Literal["admin", "sales_manager", "sales_rep"]
     is_active: bool
     created_at: datetime
+    permissions: dict[str, bool] | None = None
+    is_admin: bool | None = None
+    is_superuser: bool | None = None
     
     model_config = ConfigDict(from_attributes=True)

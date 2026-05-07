@@ -17,6 +17,16 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# CORS middleware for frontend integration — register early so preflight
+# requests receive CORS headers before any custom middleware intercepts them.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # only allow known frontend origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Middleware registration order matters.
 # Last registered executes first, so request-id gets attached before request logs.
 app.middleware("http")(security_middleware)
@@ -26,15 +36,6 @@ app.middleware("http")(error_handler_middleware)
 
 # Setup exception handlers
 setup_exception_handlers(app)
-
-# CORS middleware for frontend integration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Update with specific origins in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 @app.get("/")
 async def root():
@@ -46,7 +47,7 @@ async def health_check():
 
 
 # Include routers
-from app.routers import auth, customers, deals, imports, leads, notes, organizations, tasks, tickets, users, dashboard
+from app.routers import auth, customers, deals, imports, leads, notes, organizations, tasks, tickets, users, dashboard, admin
 
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(users.router, prefix="/api/users", tags=["Users"])
@@ -59,3 +60,4 @@ app.include_router(organizations.router, prefix="/api/organizations", tags=["Org
 app.include_router(tasks.router, prefix="/api/tasks", tags=["Tasks"])
 app.include_router(notes.router, prefix="/api/notes", tags=["Notes"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
+app.include_router(admin.router, prefix="/api/admin", tags=["Admin"])

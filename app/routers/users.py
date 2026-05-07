@@ -1,15 +1,14 @@
-import uuid
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from supabase import Client
 
 from app.auth.dependencies import require_admin, require_auth
-from app.auth.utils import hash_password
 from app.database import get_db
 from app.exceptions.custom_exceptions import ValidationError
 from app.repositories.user_repository import UserRepository
 from app.schemas.user import UserCreate, UserResponse, UserUpdate
+from app.services.registration_service import register_user_account
 
 router = APIRouter()
 
@@ -62,16 +61,14 @@ async def create_user(
     repository: UserRepository = Depends(get_user_repository),
 ):
     """Create a new user. Admin only."""
-    existing = await repository.find_by_email(str(payload.email))
-    if existing:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
-
-    user_data = payload.model_dump(exclude={"password"})
-    user_data["id"] = str(uuid.uuid4())
-    user_data["password_hash"] = hash_password(payload.password)
-    user_data["is_active"] = True
-
-    created = await repository.create(user_data)
+    created = await register_user_account(
+        repository.db,
+        email=str(payload.email),
+        password=payload.password,
+        full_name=payload.full_name,
+        role=payload.role,
+        is_active=True,
+    )
     return _sanitize_user_payload(created)
 
 

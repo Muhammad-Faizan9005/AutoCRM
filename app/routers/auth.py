@@ -1,9 +1,9 @@
 from fastapi import APIRouter, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import Client
-import uuid
 
 from app.database import get_db, run_db_operation
+from app.utils.cache import invalidate_user_cache
 from app.schemas.auth import (
     LoginRequest,
     LoginResponse,
@@ -15,78 +15,115 @@ from app.schemas.auth import (
     LogoutRequest,
 )
 from app.auth.utils import (
-    hash_password,
     verify_password,
     create_access_token,
     create_refresh_token,
     verify_token
 )
-from app.auth.dependencies import require_auth
+from app.auth.dependencies import require_auth, get_permission_service
 from app.auth.token_store import blacklist_token, is_token_blacklisted
 from app.config import settings
-from app.utils.sanitization import sanitize_payload
+from app.services.permission_service import PermissionService, is_admin_user
+from app.services.registration_service import register_user_account
 
 router = APIRouter()
 security = HTTPBearer()
+optional_security = HTTPBearer(auto_error=False)
+
+
+async def _assert_admin_for_role_override(
+    db: Client,
+    credentials: HTTPAuthorizationCredentials | None,
+) -> None:
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admin can assign this role",
+        )
+
+    token = credentials.credentials
+    if await is_token_blacklisted(db, token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been invalidated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token_payload = verify_token(token)
+    if token_payload is None or token_payload.get("type") != "access":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    requester_id = token_payload.get("sub")
+    if not requester_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    response = await run_db_operation(
+        lambda: db.table("agents").select("*").eq("id", requester_id).limit(1).execute()
+    )
+    requester = (response.data or [None])[0]
+    if not requester or requester.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admin can assign this role",
+        )
 
 
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 async def register(
     user_data: RegisterRequest,
-    db: Client = Depends(get_db)
+    credentials: HTTPAuthorizationCredentials | None = Depends(optional_security),
+    db: Client = Depends(get_db),
+    permission_service: PermissionService = Depends(get_permission_service),
 ):
     """
     Register a new agent/user.
-    
-    Creates a new sales_rep account with hashed password and returns authentication tokens.
-    """
-    sanitized_payload = sanitize_payload(user_data.model_dump(), skip_keys={"password"})
 
-    # Check if user already exists
-    existing_user = await run_db_operation(
-        lambda: db.table("agents").select("id").eq("email", sanitized_payload["email"]).limit(1).execute()
+    By default, registration creates a sales_rep. Admin-authenticated requests can
+    assign elevated roles.
+    """
+    if user_data.role != "sales_rep":
+        await _assert_admin_for_role_override(db=db, credentials=credentials)
+
+    created_user = await register_user_account(
+        db,
+        email=str(user_data.email),
+        password=user_data.password,
+        full_name=user_data.full_name,
+        role=user_data.role,
+        is_active=True,
     )
-    if existing_user.data:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
-    
-    # Hash password
-    hashed_password = hash_password(user_data.password)
-    
-    # Create user
-    new_user = {
-        "id": str(uuid.uuid4()),
-        "email": sanitized_payload["email"],
-        "password_hash": hashed_password,
-        "full_name": sanitized_payload["full_name"],
-        "role": "sales_rep",
-        "is_active": True
-    }
-    
-    response = await run_db_operation(lambda: db.table("agents").insert(new_user).execute())
-    created_user = response.data[0]
     
     # Create tokens
     access_token = create_access_token(data={"sub": created_user["id"]})
     refresh_token = create_refresh_token(data={"sub": created_user["id"]})
     
-    # Never expose password hashes in API responses.
-    created_user.pop("password_hash", None)
+    safe_user = dict(created_user)
+    safe_user.pop("password_hash", None)
+    safe_user["permissions"] = await permission_service.get_effective_permissions(safe_user)
+    safe_user["is_admin"] = is_admin_user(safe_user)
+    safe_user["is_superuser"] = bool(safe_user.get("is_superuser", False))
     
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "user": created_user
+        "user": safe_user
     }
 
 
 @router.post("/login", response_model=LoginResponse)
 async def login(
     credentials: LoginRequest,
-    db: Client = Depends(get_db)
+    db: Client = Depends(get_db),
+    permission_service: PermissionService = Depends(get_permission_service),
 ):
     """
     Login with email and password.
@@ -127,27 +164,36 @@ async def login(
     access_token = create_access_token(data={"sub": user["id"]})
     refresh_token = create_refresh_token(data={"sub": user["id"]})
     
-    # Remove password hash from response
-    user.pop("password_hash", None)
+    safe_user = dict(user)
+    safe_user.pop("password_hash", None)
+    safe_user["permissions"] = await permission_service.get_effective_permissions(safe_user)
+    safe_user["is_admin"] = is_admin_user(safe_user)
+    safe_user["is_superuser"] = bool(safe_user.get("is_superuser", False))
     
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "user": user
+        "user": safe_user
     }
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_current_user_profile(current_user: dict = Depends(require_auth)):
+async def get_current_user_profile(
+    current_user: dict = Depends(require_auth),
+    permission_service: PermissionService = Depends(get_permission_service),
+):
     """
     Get current authenticated user profile.
     
     Requires valid JWT token in Authorization header.
     """
-    # Remove password hash if present
-    current_user.pop("password_hash", None)
-    return current_user
+    safe_user = dict(current_user)
+    safe_user.pop("password_hash", None)
+    safe_user["permissions"] = await permission_service.get_effective_permissions(safe_user)
+    safe_user["is_admin"] = is_admin_user(safe_user)
+    safe_user["is_superuser"] = bool(safe_user.get("is_superuser", False))
+    return safe_user
 
 
 @router.post("/refresh", response_model=TokenResponse)
@@ -220,7 +266,7 @@ async def logout(
     Logout current user.
     
     Note: With JWT, actual logout is handled client-side by removing tokens.
-    This endpoint is for logging/audit purposes.
+    This endpoint is for logging/audit purposes and to invalidate cached user data.
     """
     access_payload = verify_token(credentials.credentials)
     if access_payload and access_payload.get("exp"):
@@ -231,6 +277,11 @@ async def logout(
         refresh_payload = verify_token(refresh_token)
         if refresh_payload and refresh_payload.get("exp"):
             await blacklist_token(db, refresh_token, refresh_payload.get("exp"))
+
+    # Invalidate user cache on logout
+    user_id = current_user.get("id")
+    if user_id:
+        invalidate_user_cache(user_id)
 
     return {
         "success": True,

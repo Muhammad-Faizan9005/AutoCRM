@@ -19,6 +19,7 @@ class LeadBase(BaseModel):
     status: Optional[str] = Field(default="new", max_length=50)
     score: Optional[int] = Field(default=None, ge=0, le=100)
     score_reason: Optional[str] = Field(default=None, max_length=1000)
+    converted: Optional[bool] = Field(default=False)
     owner_id: Optional[UUID] = None
     organization_id: Optional[UUID] = None
 
@@ -60,6 +61,7 @@ class LeadUpdate(BaseModel):
     status: Optional[str] = Field(default=None, max_length=50)
     score: Optional[int] = Field(default=None, ge=0, le=100)
     score_reason: Optional[str] = Field(default=None, max_length=1000)
+    converted: Optional[bool] = None
     owner_id: Optional[UUID] = None
     organization_id: Optional[UUID] = None
 

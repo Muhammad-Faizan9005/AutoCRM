@@ -6,6 +6,8 @@ from supabase import Client
 from app.database import get_db, run_db_operation
 from app.auth.utils import verify_token
 from app.auth.token_store import is_token_blacklisted
+from app.utils.cache import get_cached_user, cache_user
+from app.services.permission_service import PermissionService
 
 security = HTTPBearer()
 
@@ -54,36 +56,43 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # Get user from database
-    try:
-        response = await run_db_operation(
-            lambda: db.table("agents").select("*").eq("id", user_id).single().execute()
-        )
-        user = response.data
-        
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User not found",
-                headers={"WWW-Authenticate": "Bearer"},
+    # Get user from cache first (90% hit rate expected)
+    user = get_cached_user(user_id)
+    
+    if user is None:
+        # Cache miss: fetch from database and cache it
+        try:
+            response = await run_db_operation(
+                lambda: db.table("agents").select("*").eq("id", user_id).single().execute()
             )
-        
-        # Check if user is active
-        if not user.get("is_active", True):
+            user = response.data
+            
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="User not found",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            
+            # Cache user for 5 minutes (TTL on auth checks)
+            cache_user(user_id, user, ttl_seconds=300)
+            
+        except HTTPException:
+            raise
+        except Exception:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Inactive user"
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication service temporarily unavailable",
             )
-        
-        return user
-
-    except HTTPException:
-        raise
-    except Exception:
+    
+    # Check if user is active (even from cache, verify this)
+    if not user.get("is_active", True):
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication service temporarily unavailable",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Inactive user"
         )
+    
+    return user
 
 
 async def get_current_active_user(current_user: dict = Depends(get_current_user)):
@@ -147,3 +156,30 @@ def require_admin():
 def require_sales_manager_or_admin():
     """Dependency that allows sales managers and admins."""
     return require_role(["sales_manager", "admin"])
+
+
+def get_permission_service(db: Client = Depends(get_db)) -> PermissionService:
+    return PermissionService(db)
+
+
+def require_permissions(required_permissions: list[str]):
+    """
+    Dependency factory to require specific permission keys.
+
+    Permissions are resolved from role defaults plus any stored overrides.
+    """
+
+    async def permissions_checker(
+        current_user: dict = Depends(get_current_user),
+        service: PermissionService = Depends(get_permission_service),
+    ) -> dict:
+        permissions = await service.get_effective_permissions(current_user)
+        missing = [key for key in required_permissions if not permissions.get(key, False)]
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions",
+            )
+        return current_user
+
+    return permissions_checker

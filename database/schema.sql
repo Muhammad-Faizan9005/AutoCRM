@@ -63,6 +63,17 @@ CREATE TABLE agents (
     full_name VARCHAR(255) NOT NULL,
     role VARCHAR(50) DEFAULT 'sales_rep' CHECK (role IN ('admin', 'sales_manager', 'sales_rep')),
     is_active BOOLEAN DEFAULT true,
+    status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'invited', 'disabled')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- =============================================
+-- AGENT PERMISSIONS TABLE
+-- =============================================
+CREATE TABLE agent_permissions (
+    user_id UUID PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+    permission_file VARCHAR(255) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -183,6 +194,7 @@ CREATE INDEX idx_tickets_created_at ON tickets(created_at DESC);
 CREATE INDEX idx_ticket_messages_ticket_id ON ticket_messages(ticket_id);
 CREATE INDEX idx_ai_interactions_ticket_id ON ai_interactions(ticket_id);
 CREATE INDEX idx_revoked_tokens_expires_at ON revoked_tokens(expires_at);
+CREATE INDEX idx_agent_permissions_user_id ON agent_permissions(user_id);
 CREATE INDEX idx_organizations_name ON organizations(name);
 CREATE INDEX idx_organizations_industry ON organizations(industry);
 CREATE INDEX idx_leads_status ON leads(status);
@@ -227,6 +239,11 @@ CREATE TRIGGER update_agents_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+CREATE TRIGGER update_agent_permissions_updated_at
+    BEFORE UPDATE ON agent_permissions
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
 CREATE TRIGGER update_organizations_updated_at
     BEFORE UPDATE ON organizations
     FOR EACH ROW
@@ -259,6 +276,7 @@ ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tickets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ticket_messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_permissions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ai_interactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE revoked_tokens ENABLE ROW LEVEL SECURITY;
 ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
@@ -326,5 +344,10 @@ CREATE POLICY "agents_self_update"
 -- Revocation table is intended for backend service usage.
 CREATE POLICY "service_role_revoked_tokens_access"
     ON revoked_tokens FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY "service_role_agent_permissions_access"
+    ON agent_permissions FOR ALL TO service_role
     USING (true)
     WITH CHECK (true);

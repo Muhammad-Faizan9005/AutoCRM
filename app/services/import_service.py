@@ -14,7 +14,7 @@ from app.repositories.lead_repository import LeadRepository
 from app.repositories.note_repository import NoteRepository
 from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.ticket_repository import TicketRepository
-from app.schemas.customer import CustomerCreate
+from app.schemas.lead import LeadCreate
 from app.schemas.imports import ImportFailure, ImportResult
 from app.schemas.ticket import TicketCreate
 
@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover - validated during runtime if dependency i
 
 
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xlsm"}
+NOTE_HEADER_TOKENS = {"note", "notes", "comment", "comments", "remark", "remarks"}
 
 
 @dataclass
@@ -45,6 +46,30 @@ def _normalize_cell(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _is_note_header(header: str) -> bool:
+    for segment in header.split("_"):
+        cleaned_segment = segment.rstrip("0123456789")
+        if cleaned_segment in NOTE_HEADER_TOKENS:
+            return True
+    return False
+
+
+def _extract_note_content(values: dict[str, Any]) -> str | None:
+    note_fragments: list[str] = []
+    for header, value in values.items():
+        if not _is_note_header(header):
+            continue
+
+        fragment = _normalize_cell(value)
+        if fragment:
+            note_fragments.append(fragment)
+
+    if not note_fragments:
+        return None
+
+    return " | ".join(note_fragments)
 
 
 def _parse_csv(file_bytes: bytes) -> list[ParsedRow]:
@@ -157,60 +182,111 @@ class ImportService:
         created_org = await self.organization_repository.create(org_data)
         return created_org
 
-    async def create_lead_from_customer(self, *, customer: dict[str, Any]) -> dict[str, Any] | None:
+    async def create_or_update_lead_from_row(
+        self,
+        *,
+        row: dict[str, Any],
+        notes_content: str | None,
+    ) -> tuple[dict[str, Any] | None, bool]:
         """
-        Create a lead from customer data.
-        Checks if a lead already exists for this customer to avoid duplicates.
-        Returns the created lead dict or None if it already exists.
+        Create or update a lead from imported row data.
+        Returns the saved lead dict and a flag indicating whether it was created.
         """
-        customer_id = customer.get("id")
-        if not customer_id:
-            return None
-
-        existing_lead = await self.lead_repository.find_one(filters={"email": customer.get("email")})
-        if existing_lead:
-            return None
-
         organization_id = None
-        company = customer.get("company")
+        company = row.get("company")
         if company:
             org = await self.get_or_create_organization(company_name=company)
             if org:
                 organization_id = org.get("id")
 
         lead_data = {
-            "name": customer.get("full_name", ""),
-            "email": customer.get("email", ""),
-            "phone": customer.get("phone"),
-            "company": customer.get("company"),
-            "source": "import",
-            "status": "new",
+            "name": row.get("name", ""),
+            "email": row.get("email") or None,
+            "phone": row.get("phone") or None,
+            "company": row.get("company") or None,
+            "source": row.get("source") or "import",
+            "status": row.get("status") or "new",
             "organization_id": str(organization_id) if organization_id else None,
+            "score": row.get("score"),
+            "score_reason": row.get("score_reason") or None,
         }
 
-        created_lead = await self.lead_repository.create(lead_data)
-        return created_lead
+        model = LeadCreate(**lead_data)
+        payload = model.model_dump(exclude_none=True)
 
-    async def create_notes_from_customer(self, *, customer: dict[str, Any]) -> dict[str, Any] | None:
-        """
-        Create a note from customer's notes field.
-        Returns the created note dict or None if customer has no notes.
-        """
-        customer_id = customer.get("id")
-        notes_content = customer.get("notes")
+        saved_lead: dict[str, Any]
+        created = False
+        if model.email:
+            existing_lead = await self.lead_repository.find_one(filters={"email": str(model.email)})
+            if existing_lead:
+                saved_lead = await self.lead_repository.update_by_id(existing_lead["id"], payload)
+            else:
+                saved_lead = await self.lead_repository.create(payload)
+                created = True
+        else:
+            saved_lead = await self.lead_repository.create(payload)
+            created = True
 
-        if not customer_id or not notes_content or not notes_content.strip():
+        if notes_content:
+            saved_lead = dict(saved_lead)
+            saved_lead["notes"] = notes_content
+
+        return saved_lead, created
+
+    async def create_notes_from_lead(self, *, lead: dict[str, Any]) -> dict[str, Any] | None:
+        """
+        Create a note from lead notes field.
+        Returns the created note dict or None if lead has no notes.
+        """
+        lead_id = lead.get("id")
+        notes_content = lead.get("notes")
+
+        if not lead_id or not notes_content or not notes_content.strip():
             return None
 
+        note_content = notes_content.strip()
+        existing_note = await self.note_repository.find_one(
+            filters={"entity_type": "lead", "entity_id": str(lead_id), "content": note_content}
+        )
+        if existing_note:
+            return existing_note
+
         note_data = {
-            "entity_type": "customer",
-            "entity_id": str(customer_id),
-            "content": notes_content.strip(),
+            "entity_type": "lead",
+            "entity_id": str(lead_id),
+            "content": note_content,
             "author_id": None,
         }
 
         created_note = await self.note_repository.create(note_data)
         return created_note
+
+    async def ingest_lead_payload(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        notes_content = _extract_note_content(payload)
+        lead_payload = {
+            "name": (
+                payload.get("name")
+                or payload.get("full_name")
+                or payload.get("lead_name")
+                or payload.get("company")
+                or (payload.get("email", "").split("@")[0] if payload.get("email") else "")
+            ),
+            "email": payload.get("email") or None,
+            "phone": payload.get("phone") or None,
+            "company": payload.get("company") or None,
+            "source": payload.get("source") or "import",
+            "status": payload.get("status") or "new",
+            "score": payload.get("score") or None,
+            "score_reason": payload.get("score_reason") or None,
+        }
+
+        lead, _created = await self.create_or_update_lead_from_row(row=lead_payload, notes_content=notes_content)
+        if lead:
+            await self.create_notes_from_lead(lead={**lead, "notes": notes_content} if notes_content else lead)
+
+        return lead
+
+    async def import_leads(self, *, file_name: str, file_bytes: bytes) -> ImportResult:
         parsed_rows = _parse_rows(file_name=file_name, file_bytes=file_bytes)
 
         created_count = 0
@@ -219,39 +295,44 @@ class ImportService:
 
         for parsed_row in parsed_rows:
             try:
+                notes_content = _extract_note_content(parsed_row.values)
                 payload = {
-                    "email": parsed_row.values.get("email", ""),
-                    "full_name": parsed_row.values.get("full_name", ""),
+                    "name": (
+                        parsed_row.values.get("name")
+                        or parsed_row.values.get("full_name")
+                        or parsed_row.values.get("lead_name")
+                        or parsed_row.values.get("company")
+                        or (parsed_row.values.get("email", "").split("@")[0] if parsed_row.values.get("email") else "")
+                    ),
+                    "email": parsed_row.values.get("email") or None,
                     "phone": parsed_row.values.get("phone") or None,
                     "company": parsed_row.values.get("company") or None,
-                    "status": (parsed_row.values.get("status") or "active").lower(),
-                    "notes": parsed_row.values.get("notes") or None,
+                    "source": parsed_row.values.get("source") or "import",
+                    "status": parsed_row.values.get("status") or "new",
+                    "score": parsed_row.values.get("score") or None,
+                    "score_reason": parsed_row.values.get("score_reason") or None,
                 }
-                model = CustomerCreate(**payload)
+                lead_to_process, was_created = await self.create_or_update_lead_from_row(
+                    row=payload,
+                    notes_content=notes_content,
+                )
+                if lead_to_process and lead_to_process.get("id"):
+                    if was_created:
+                        created_count += 1
+                    else:
+                        updated_count += 1
 
-                existing_customer = await self.customer_repository.find_one(filters={"email": str(model.email)})
-                if existing_customer:
-                    update_payload = model.model_dump(exclude_none=True)
-                    await self.customer_repository.update_by_id(existing_customer["id"], update_payload)
-                    updated_count += 1
-                    customer_to_process = existing_customer
-                else:
-                    created_customer = await self.customer_repository.create(model.model_dump(exclude_none=True))
-                    created_count += 1
-                    customer_to_process = created_customer
-
-                # Auto-create lead and organization from customer
-                await self.create_lead_from_customer(customer=customer_to_process)
-
-                # Auto-create notes from customer's notes field
-                await self.create_notes_from_customer(customer=customer_to_process)
+                try:
+                    await self.create_notes_from_lead(lead=lead_to_process)
+                except Exception:
+                    pass
 
             except Exception as exc:
                 failures.append(ImportFailure(row_number=parsed_row.row_number, reason=str(exc)))
 
         successful_rows = created_count + updated_count
         return ImportResult(
-            entity="customers",
+            entity="leads",
             file_name=file_name,
             total_rows=len(parsed_rows),
             successful_rows=successful_rows,
@@ -312,3 +393,4 @@ class ImportService:
             failed_count=len(failures),
             failures=failures,
         )
+        

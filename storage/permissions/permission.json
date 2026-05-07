@@ -1,0 +1,13 @@
+{
+  "dashboard": false,
+  "leads": false,
+  "deals": false,
+  "contacts": false,
+  "organizations": false,
+  "notes": false,
+  "tasks": false,
+  "import_data": false,
+  "admin_panel": false,
+  "admin_users": false,
+  "admin_permissions": false
+}

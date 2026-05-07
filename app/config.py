@@ -45,9 +45,13 @@ class Settings(BaseSettings):
 
     # Security hardening settings
     RATE_LIMIT_ENABLED: bool = True
-    RATE_LIMIT_REQUESTS_PER_MINUTE: int = 120
+    RATE_LIMIT_REQUESTS_PER_MINUTE: int = 100  # Tuned down from 120 to prevent overload
+    RATE_LIMIT_MAX_QUEUE_SIZE: int = 500  # Max queued requests before rejecting
     MAX_REQUEST_SIZE_BYTES: int = 1_048_576
     SECURITY_HEADERS_ENABLED: bool = True
+
+    # Permissions storage (local JSON files)
+    PERMISSIONS_STORAGE_DIR: str = "storage/permissions"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 

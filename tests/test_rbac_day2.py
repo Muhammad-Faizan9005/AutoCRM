@@ -172,6 +172,7 @@ class FakeDB:
                 }
             ],
             "ticket_messages": [],
+            "agent_permissions": [],
         }
 
     def table(self, table_name: str) -> FakeTable:
@@ -184,7 +185,7 @@ def _token_for(user_id: str) -> str:
 
 def _client_with_fake_db(monkeypatch) -> tuple[TestClient, FakeDB]:
     fake_db = FakeDB()
-    monkeypatch.setattr("app.routers.users.hash_password", lambda password: f"hashed::{password}")
+    monkeypatch.setattr("app.services.registration_service.hash_password", lambda password: f"hashed::{password}")
     app.dependency_overrides[get_db] = lambda: fake_db
     return TestClient(app), fake_db
 
