@@ -29,6 +29,7 @@ class AdminUserCreate(BaseModel):
     role: Literal["admin", "manager", "sales_manager", "agent", "sales_rep"] = "agent"
     status: AdminStatus = "invited"
     password: Optional[str] = Field(default=None, min_length=6, max_length=128)
+    team_id: Optional[UUID] = None  # required when admin creates a sales rep
 
 
 class AdminUserUpdate(BaseModel):
