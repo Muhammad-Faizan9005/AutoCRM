@@ -27,6 +27,25 @@ from app.services.registration_service import normalize_role_input, register_use
 
 router = APIRouter()
 
+
+async def _auto_assign_to_team(db: PostgresClient, team_id: str, agent_id: str) -> None:
+    """Add the agent to the given team (team_members + agents.team_id)."""
+    def _exec():
+        with db.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO team_members (team_id, agent_id) "
+                    "VALUES (:tid, :aid) ON CONFLICT DO NOTHING"
+                ),
+                {"tid": team_id, "aid": agent_id},
+            )
+            conn.execute(
+                text("UPDATE agents SET team_id = :tid WHERE id = :aid"),
+                {"tid": team_id, "aid": agent_id},
+            )
+    await run_db_operation(_exec)
+
+
 ROLE_OUTPUT_MAP = {
     "admin": "admin",
     "sales_manager": "manager",
@@ -124,9 +143,17 @@ async def list_admin_users(
         if search:
             clauses.append("(email ILIKE :term OR full_name ILIKE :term OR role ILIKE :term)")
             params["term"] = f"%{search}%"
+
         if not requester_is_admin:
-            clauses.append("role = :managed_role")
-            params["managed_role"] = "sales_rep"
+            # Managers only see reps in their own team
+            params["manager_id"] = str(current_user["id"])
+            clauses.append(
+                "id IN ("
+                "  SELECT tm.agent_id FROM team_members tm "
+                "  JOIN teams t ON t.id = tm.team_id "
+                "  WHERE t.manager_id = :manager_id"
+                ")"
+            )
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
@@ -168,6 +195,50 @@ async def create_admin_user(
             detail="Managers can create sales reps only",
         )
 
+    # --- Resolve team_id for sales reps ---
+    is_admin_actor = _is_admin(current_user)
+    team_id_to_assign: str | None = None
+
+    if normalized_role == "sales_rep":
+        if is_admin_actor:
+            # Admin must specify which team to add the rep to
+            if not payload.team_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="team_id is required when creating a sales rep",
+                )
+            # Verify the team exists
+            def _verify_team():
+                with repository.db.engine.connect() as conn:
+                    row = conn.execute(
+                        text("SELECT id FROM teams WHERE id = :tid"),
+                        {"tid": str(payload.team_id)},
+                    ).first()
+                    return row
+            team_row = await run_db_operation(_verify_team)
+            if not team_row:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Team not found",
+                )
+            team_id_to_assign = str(payload.team_id)
+        else:
+            # Manager — look up their own team
+            def _find_manager_team():
+                with repository.db.engine.connect() as conn:
+                    row = conn.execute(
+                        text("SELECT id FROM teams WHERE manager_id = :mid"),
+                        {"mid": str(current_user["id"])},
+                    ).first()
+                    return row
+            team_row = await run_db_operation(_find_manager_team)
+            if not team_row:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="You must create a team before adding sales reps",
+                )
+            team_id_to_assign = str(team_row[0])
+
     status_value = payload.status
     is_active = _status_to_active(status_value)
 
@@ -190,9 +261,16 @@ async def create_admin_user(
         is_active=is_active,
         status_value=status_value,
     )
+
+    # Assign the new sales rep to the resolved team
+    if team_id_to_assign and normalized_role == "sales_rep":
+        await _auto_assign_to_team(
+            repository.db,
+            team_id=team_id_to_assign,
+            agent_id=str(created["id"]),
+        )
+
     return _to_admin_user(created)
-
-
 @router.patch("/users/{user_id}", response_model=AdminUserResponse)
 async def update_admin_user(
     user_id: UUID,

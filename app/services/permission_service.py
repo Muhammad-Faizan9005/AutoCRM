@@ -68,9 +68,12 @@ def _role_defaults(role: str | None) -> dict[str, bool]:
     normalized = _normalize_role(role)
 
     sales_manager_defaults = {key: True for key in CRM_CORE_PERMISSIONS}
-    sales_manager_defaults.update({"import_data": True})
-    for key in ADMIN_PERMISSIONS:
-        sales_manager_defaults[key] = False
+    sales_manager_defaults.update({
+        "import_data": True,
+        "admin_panel": False,
+        "admin_users": True,
+        "admin_permissions": True,
+    })
 
     sales_rep_defaults = {key: True for key in CRM_CORE_PERMISSIONS}
     sales_rep_defaults.update({"import_data": False})

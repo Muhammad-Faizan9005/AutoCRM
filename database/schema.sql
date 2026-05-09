@@ -64,6 +64,7 @@ CREATE TABLE agents (
     role VARCHAR(50) DEFAULT 'sales_rep' CHECK (role IN ('admin', 'sales_manager', 'sales_rep')),
     is_active BOOLEAN DEFAULT true,
     status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'invited', 'disabled')),
+    team_id UUID,  -- FK added after teams table is created
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -77,6 +78,32 @@ CREATE TABLE agent_permissions (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- =============================================
+-- TEAMS TABLE (one team per sales manager)
+-- =============================================
+CREATE TABLE teams (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) NOT NULL,
+    manager_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    CONSTRAINT unique_team_per_manager UNIQUE (manager_id)
+);
+
+-- =============================================
+-- TEAM MEMBERS JOIN TABLE
+-- =============================================
+CREATE TABLE team_members (
+    team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (team_id, agent_id)
+);
+
+-- Add FK from agents.team_id -> teams.id
+ALTER TABLE agents ADD CONSTRAINT fk_agents_team_id
+    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE SET NULL;
 
 -- =============================================
 -- REVOKED TOKENS (JWT invalidation)
@@ -212,6 +239,10 @@ CREATE INDEX idx_notes_entity_type ON notes(entity_type);
 CREATE INDEX idx_notes_entity_id ON notes(entity_id);
 CREATE INDEX idx_notes_author_id ON notes(author_id);
 CREATE INDEX idx_notes_created_at ON notes(created_at DESC);
+CREATE INDEX idx_teams_manager_id ON teams(manager_id);
+CREATE INDEX idx_team_members_team_id ON team_members(team_id);
+CREATE INDEX idx_team_members_agent_id ON team_members(agent_id);
+CREATE INDEX idx_agents_team_id ON agents(team_id);
 
 -- =============================================
 -- UPDATE TIMESTAMP TRIGGER
@@ -241,6 +272,11 @@ CREATE TRIGGER update_agents_updated_at
 
 CREATE TRIGGER update_agent_permissions_updated_at
     BEFORE UPDATE ON agent_permissions
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_teams_updated_at
+    BEFORE UPDATE ON teams
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
@@ -284,6 +320,8 @@ ALTER TABLE leads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE deals ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE teams ENABLE ROW LEVEL SECURITY;
+ALTER TABLE team_members ENABLE ROW LEVEL SECURITY;
 
 -- App data tables are accessible only to authenticated users.
 CREATE POLICY "authenticated_customers_access"
@@ -331,6 +369,16 @@ CREATE POLICY "authenticated_notes_access"
     USING (auth.role() = 'authenticated')
     WITH CHECK (auth.role() = 'authenticated');
 
+CREATE POLICY "authenticated_teams_access"
+    ON teams FOR ALL TO authenticated
+    USING (auth.role() = 'authenticated')
+    WITH CHECK (auth.role() = 'authenticated');
+
+CREATE POLICY "authenticated_team_members_access"
+    ON team_members FOR ALL TO authenticated
+    USING (auth.role() = 'authenticated')
+    WITH CHECK (auth.role() = 'authenticated');
+
 -- Agents can view/update their own profile when using Supabase Auth JWTs.
 CREATE POLICY "agents_self_read"
     ON agents FOR SELECT TO authenticated
@@ -349,5 +397,26 @@ CREATE POLICY "service_role_revoked_tokens_access"
 
 CREATE POLICY "service_role_agent_permissions_access"
     ON agent_permissions FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY "service_role_teams_access"
+    ON teams FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY "service_role_team_members_access"
+    ON team_members FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+-- Anon role access for pooler connections
+CREATE POLICY "anon_teams_access"
+    ON teams FOR ALL TO anon
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY "anon_team_members_access"
+    ON team_members FOR ALL TO anon
     USING (true)
     WITH CHECK (true);
