@@ -1,2 +1,1 @@
 python-3.13.5
-postgresql://neondb_owner:npg_0jvKy3ESfFJW@ep-bitter-silence-an7q1ofj.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require
