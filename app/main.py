@@ -21,7 +21,11 @@ app = FastAPI(
 # requests receive CORS headers before any custom middleware intercepts them.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # only allow known frontend origins
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://auto-crm-frontend-pink.vercel.app",
+    ],  # only allow known frontend origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
