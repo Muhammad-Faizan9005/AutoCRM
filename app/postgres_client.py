@@ -268,6 +268,11 @@ class PostgresClient:
         self._metadata = MetaData()
         self._table_cache: dict[str, Table] = {}
 
+    def warmup_tables(self, table_names: list[str]) -> None:
+        """Preload table metadata to avoid first-request reflection latency."""
+        for table_name in table_names:
+            self._get_table(table_name)
+
     def _get_table(self, table_name: str) -> Table:
         cached = self._table_cache.get(table_name)
         if cached is not None:
