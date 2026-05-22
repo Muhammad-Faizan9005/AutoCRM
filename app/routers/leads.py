@@ -15,7 +15,7 @@ from app.exceptions.custom_exceptions import ResourceNotFoundError
 from app.repositories.deal_repository import DealRepository
 from app.repositories.lead_repository import LeadRepository
 from app.schemas.deal import DealResponse
-from app.schemas.lead import LeadConvertRequest, LeadCreate, LeadResponse, LeadUpdate
+from app.schemas.lead import LeadBulkAssignRequest, LeadConvertRequest, LeadCreate, LeadResponse, LeadUpdate
 from app.services.conversion_service import ConversionService
 from app.services.import_service import ImportService
 from app.services.notification_service import NotificationService
@@ -148,6 +148,43 @@ async def get_leads(
     )
 
 
+@router.get("/assignment-reps")
+async def get_assignment_reps(
+    db: Client = Depends(get_db),
+    current_user: dict = Depends(require_auth),
+):
+    """List reps available for lead assignment."""
+    if not _can_manage_leads(current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+
+    def _query():
+        with db.engine.connect() as conn:
+            if str(current_user.get("role") or "").strip().lower() == "admin":
+                rows = conn.execute(
+                    text(
+                        "SELECT id, full_name, email, role FROM agents "
+                        "WHERE role IN ('sales_rep', 'agent') "
+                        "ORDER BY created_at DESC"
+                    )
+                ).mappings().all()
+                return [dict(row) for row in rows]
+
+            rows = conn.execute(
+                text(
+                    "SELECT a.id, a.full_name, a.email, a.role "
+                    "FROM team_members tm "
+                    "JOIN teams t ON t.id = tm.team_id "
+                    "JOIN agents a ON a.id = tm.agent_id "
+                    "WHERE t.manager_id = :mid "
+                    "ORDER BY a.created_at DESC"
+                ),
+                {"mid": str(current_user.get("id"))},
+            ).mappings().all()
+            return [dict(row) for row in rows]
+
+    return await run_db_operation(_query)
+
+
 @router.get("/{lead_id}", response_model=LeadResponse)
 async def get_lead(
     lead_id: UUID,
@@ -244,6 +281,23 @@ async def delete_lead(
     """Delete a lead."""
     await repository.delete_by_id(lead_id)
     return None
+
+
+@router.post("/assign-bulk", response_model=List[LeadResponse])
+async def bulk_assign_leads(
+    payload: LeadBulkAssignRequest,
+    db: Client = Depends(get_db),
+    current_user: dict = Depends(require_auth),
+    repository: LeadRepository = Depends(get_lead_repository),
+):
+    """Assign multiple leads in one request."""
+    updated_rows: list[dict[str, Any]] = []
+    for item in payload.assignments:
+        owner_id = str(item.owner_id) if item.owner_id else None
+        await _assert_lead_assignment_permissions(db, current_user, owner_id)
+        updated = await repository.update_by_id(str(item.lead_id), {"owner_id": owner_id})
+        updated_rows.append(updated)
+    return updated_rows
 
 
 @router.get("/{lead_id}/owner")
