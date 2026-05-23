@@ -53,6 +53,20 @@ class Settings(BaseSettings):
     # Permissions storage (local JSON files)
     PERMISSIONS_STORAGE_DIR: str = "storage/permissions"
 
+    # Mailjet (email invitations + notifications)
+    MAILJET_API_KEY: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("MAILJET_API_KEY", "MJ_APIKEY", "api_key"),
+    )
+    MAILJET_SECRET_KEY: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("MAILJET_SECRET_KEY", "MJ_SECRET", "secret_key"),
+    )
+    MAILJET_SENDER_EMAIL: Optional[str] = None
+    MAILJET_SENDER_NAME: str = "AutoCRM"
+    FRONTEND_BASE_URL: str = "http://localhost:5173"
+    INVITE_TOKEN_TTL_HOURS: int = 72
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 
     @property

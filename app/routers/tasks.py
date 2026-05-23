@@ -12,6 +12,7 @@ from app.database import get_db, run_db_operation
 from app.repositories.task_repository import TaskRepository
 from app.schemas.task import TaskCreate, TaskResponse, TaskUpdate
 from app.services.notification_service import NotificationService
+from app.services.email_service import MailjetEmailService
 
 router = APIRouter()
 
@@ -21,6 +22,10 @@ def get_task_repository(db: Client = Depends(get_db)) -> TaskRepository:
 
 def get_notification_service(db: Client = Depends(get_db)) -> NotificationService:
     return NotificationService(db)
+
+
+def get_email_service(db: Client = Depends(get_db)) -> MailjetEmailService:
+    return MailjetEmailService(db)
 
 
 def _ensure_assignment_permissions(current_user: dict, assigned_to: UUID | None) -> None:
@@ -134,6 +139,7 @@ async def create_task(
     current_user: dict = Depends(require_auth),
     repository: TaskRepository = Depends(get_task_repository),
     notification_service: NotificationService = Depends(get_notification_service),
+    email_service: MailjetEmailService = Depends(get_email_service),
 ):
     """Create a new task."""
     task_data = payload.model_dump()
@@ -158,6 +164,17 @@ async def create_task(
             entity_type="task",
             entity_id=str(created.get("id")),
         )
+        try:
+            recipient_email = await email_service.get_recipient_email(assigned_to)
+            if recipient_email:
+                await email_service.send_task_assigned_email(
+                    recipient_id=assigned_to,
+                    recipient_email=recipient_email,
+                    actor_name=actor_name or "Manager",
+                    task_title=created.get("title") or "Untitled Task",
+                )
+        except Exception:
+            pass
     return created
 
 
@@ -168,6 +185,7 @@ async def update_task(
     current_user: dict = Depends(require_auth),
     repository: TaskRepository = Depends(get_task_repository),
     notification_service: NotificationService = Depends(get_notification_service),
+    email_service: MailjetEmailService = Depends(get_email_service),
 ):
     """Update a task."""
     existing_task = await repository.get_by_id(task_id)
@@ -208,6 +226,17 @@ async def update_task(
             entity_type="task",
             entity_id=str(updated.get("id")),
         )
+        try:
+            recipient_email = await email_service.get_recipient_email(new_assignee)
+            if recipient_email:
+                await email_service.send_task_assigned_email(
+                    recipient_id=new_assignee,
+                    recipient_email=recipient_email,
+                    actor_name=actor_name or "Manager",
+                    task_title=updated.get("title") or "Untitled Task",
+                )
+        except Exception:
+            pass
     return updated
 
 

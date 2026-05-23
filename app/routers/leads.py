@@ -19,6 +19,7 @@ from app.schemas.lead import LeadBulkAssignRequest, LeadConvertRequest, LeadCrea
 from app.services.conversion_service import ConversionService
 from app.services.import_service import ImportService
 from app.services.notification_service import NotificationService
+from app.services.email_service import MailjetEmailService
 
 router = APIRouter()
 
@@ -41,6 +42,10 @@ def get_conversion_service(db: Client = Depends(get_db)) -> ConversionService:
 
 def get_notification_service(db: Client = Depends(get_db)) -> NotificationService:
     return NotificationService(db)
+
+
+def get_email_service(db: Client = Depends(get_db)) -> MailjetEmailService:
+    return MailjetEmailService(db)
 
 
 def _can_manage_leads(current_user: dict) -> bool:
@@ -202,6 +207,7 @@ async def create_lead(
     current_user: dict = Depends(require_auth),
     repository: LeadRepository = Depends(get_lead_repository),
     notification_service: NotificationService = Depends(get_notification_service),
+    email_service: MailjetEmailService = Depends(get_email_service),
 ):
     """Create a new lead."""
     lead_data = payload.model_dump()
@@ -228,6 +234,18 @@ async def create_lead(
             entity_type="lead",
             entity_id=str(created.get("id")),
         )
+        try:
+            recipient_id = str(created.get("owner_id"))
+            recipient_email = await email_service.get_recipient_email(recipient_id)
+            if recipient_email:
+                await email_service.send_lead_assigned_email(
+                    recipient_id=recipient_id,
+                    recipient_email=recipient_email,
+                    actor_name=actor_name or "Manager",
+                    lead_name=created.get("name") or "Untitled Lead",
+                )
+        except Exception:
+            pass
     return created
 
 
@@ -239,6 +257,7 @@ async def update_lead(
     current_user: dict = Depends(require_auth),
     repository: LeadRepository = Depends(get_lead_repository),
     notification_service: NotificationService = Depends(get_notification_service),
+    email_service: MailjetEmailService = Depends(get_email_service),
 ):
     """Update a lead."""
     existing = await repository.get_by_id(lead_id)
@@ -269,6 +288,17 @@ async def update_lead(
             entity_type="lead",
             entity_id=str(updated.get("id")),
         )
+        try:
+            recipient_email = await email_service.get_recipient_email(next_owner_id)
+            if recipient_email:
+                await email_service.send_lead_assigned_email(
+                    recipient_id=next_owner_id,
+                    recipient_email=recipient_email,
+                    actor_name=actor_name or "Manager",
+                    lead_name=updated.get("name") or "Untitled Lead",
+                )
+        except Exception:
+            pass
     return updated
 
 

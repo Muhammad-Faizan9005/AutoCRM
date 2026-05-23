@@ -19,9 +19,12 @@ from app.schemas.admin import (
     AdminUserResponse,
     AdminUserUpdate,
 )
+from app.schemas.failed_invite import FailedInviteResponse
 from app.schemas.permissions import PermissionSet, PermissionUpdate
 from app.services import permission_service
 from app.services.admin_overview_service import AdminOverviewService
+from app.services.email_service import MailjetEmailService
+from app.services.invite_service import InviteService
 from app.services.permission_service import PermissionService, sanitize_permissions_map
 from app.services.registration_service import normalize_role_input, register_user_account
 
@@ -63,6 +66,17 @@ def get_permission_service(db: PostgresClient = Depends(get_db)) -> PermissionSe
 
 def get_overview_service(db: PostgresClient = Depends(get_db)) -> AdminOverviewService:
     return AdminOverviewService(db)
+
+
+def get_email_service(db: PostgresClient = Depends(get_db)) -> MailjetEmailService:
+    return MailjetEmailService(db)
+
+
+def get_invite_service(
+    db: PostgresClient = Depends(get_db),
+    email_service: MailjetEmailService = Depends(get_email_service),
+) -> InviteService:
+    return InviteService(db, email_service=email_service)
 
 
 def _map_role_output(role: str | None) -> str:
@@ -131,7 +145,9 @@ async def list_admin_users(
     page_size: int = 20,
     current_user: dict = Depends(require_permissions(["admin_users"])),
     db: PostgresClient = Depends(get_db),
+    invite_service: InviteService = Depends(get_invite_service),
 ):
+    await invite_service.cleanup_expired_invites()
     requester_is_admin = _is_admin(current_user)
     safe_page = max(page, 1)
     safe_page_size = max(1, min(page_size, 200))
@@ -185,6 +201,7 @@ async def create_admin_user(
     payload: AdminUserCreate,
     current_user: dict = Depends(require_permissions(["admin_users"])),
     repository: UserRepository = Depends(get_user_repository),
+    invite_service: InviteService = Depends(get_invite_service),
 ):
     normalized_role = normalize_role_input(payload.role)
     if not normalized_role:
@@ -270,6 +287,14 @@ async def create_admin_user(
             agent_id=str(created["id"]),
         )
 
+    if status_value == "invited":
+        await invite_service.create_invite(
+            agent_id=str(created["id"]),
+            email=str(created.get("email")),
+            role=str(created.get("role")),
+            invited_by=str(current_user.get("id") or "") or None,
+        )
+
     return _to_admin_user(created)
 @router.patch("/users/{user_id}", response_model=AdminUserResponse)
 async def update_admin_user(
@@ -277,6 +302,7 @@ async def update_admin_user(
     payload: AdminUserUpdate,
     current_user: dict = Depends(require_permissions(["admin_users"])),
     repository: UserRepository = Depends(get_user_repository),
+    invite_service: InviteService = Depends(get_invite_service),
 ):
     target_user = await repository.get_by_id(str(user_id))
     _assert_manager_scope_for_target(current_user, target_user)
@@ -308,6 +334,10 @@ async def update_admin_user(
     if "password" in update_data:
         update_data["password_hash"] = hash_password(update_data.pop("password"))
 
+    if update_data.get("status") == "disabled" and str(target_user.get("status")) == "invited":
+        await invite_service.revoke_invited_user(str(user_id), reason="revoked")
+        return _to_admin_user({**target_user, "status": "disabled", "is_active": False})
+
     updated = await repository.update_by_id(str(user_id), update_data)
     return _to_admin_user(updated)
 
@@ -317,10 +347,108 @@ async def delete_admin_user(
     user_id: UUID,
     current_user: dict = Depends(require_permissions(["admin_users"])),
     repository: UserRepository = Depends(get_user_repository),
+    invite_service: InviteService = Depends(get_invite_service),
 ):
     target_user = await repository.get_by_id(str(user_id))
     _assert_manager_scope_for_target(current_user, target_user)
+    if str(target_user.get("status")) == "invited":
+        await invite_service.revoke_invited_user(str(user_id), reason="revoked")
+        return None
     await repository.update_by_id(str(user_id), {"is_active": False, "status": "disabled"})
+    return None
+
+
+@router.post("/invites/{user_id}/revoke", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_invite(
+    user_id: UUID,
+    current_user: dict = Depends(require_permissions(["admin_users"])),
+    repository: UserRepository = Depends(get_user_repository),
+    invite_service: InviteService = Depends(get_invite_service),
+):
+    target_user = await repository.get_by_id(str(user_id))
+    _assert_manager_scope_for_target(current_user, target_user)
+    if str(target_user.get("status")) != "invited":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is not invited")
+    await invite_service.revoke_invited_user(str(user_id), reason="revoked")
+    return None
+
+
+@router.get("/failed-invites", response_model=list[FailedInviteResponse])
+async def list_failed_invites(
+    current_user: dict = Depends(require_permissions(["admin_users"])),
+    db: PostgresClient = Depends(get_db),
+):
+    is_admin = _is_admin(current_user)
+    requester_id = str(current_user.get("id") or "")
+
+    def _query():
+        with db.engine.connect() as conn:
+            if is_admin:
+                rows = conn.execute(
+                    text("SELECT * FROM failed_invites ORDER BY failed_at DESC")
+                ).mappings().all()
+            else:
+                rows = conn.execute(
+                    text(
+                        "SELECT * FROM failed_invites "
+                        "WHERE invited_by = :invited_by ORDER BY failed_at DESC"
+                    ),
+                    {"invited_by": requester_id},
+                ).mappings().all()
+            return [dict(row) for row in rows]
+
+    return await run_db_operation(_query)
+
+
+@router.post("/failed-invites/{failed_id}/reinvite", response_model=AdminUserResponse)
+async def reinvite_failed_invite(
+    failed_id: UUID,
+    current_user: dict = Depends(require_permissions(["admin_users"])),
+    db: PostgresClient = Depends(get_db),
+    invite_service: InviteService = Depends(get_invite_service),
+):
+    failed = await invite_service.get_failed_invite(str(failed_id))
+    if not failed:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Failed invite not found")
+
+    role_value = _normalize_role_value(str(failed.get("role")))
+    if not _is_admin(current_user) and role_value != "sales_rep":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Managers can reinvite sales reps only")
+
+    fallback_team_id = None
+    if role_value == "sales_rep" and not failed.get("team_id"):
+        def _find_manager_team():
+            with db.engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT id FROM teams WHERE manager_id = :mid"),
+                    {"mid": str(current_user.get("id"))},
+                ).first()
+                return row
+        team_row = await run_db_operation(_find_manager_team)
+        if team_row:
+            fallback_team_id = str(team_row[0])
+
+    recreated = await invite_service.reinvite_failed_invite(
+        str(failed_id),
+        inviter_id=str(current_user.get("id") or "") or None,
+        require_team_for_rep=_is_admin(current_user),
+        fallback_team_id=fallback_team_id,
+    )
+    return _to_admin_user(recreated)
+
+
+@router.delete("/failed-invites/{failed_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_failed_invite(
+    failed_id: UUID,
+    current_user: dict = Depends(require_permissions(["admin_users"])),
+    invite_service: InviteService = Depends(get_invite_service),
+):
+    failed = await invite_service.get_failed_invite(str(failed_id))
+    if not failed:
+        return None
+    if not _is_admin(current_user) and str(failed.get("invited_by")) != str(current_user.get("id")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    await invite_service.delete_failed_invite(str(failed_id))
     return None
 
 
