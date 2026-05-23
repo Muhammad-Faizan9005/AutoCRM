@@ -4,18 +4,28 @@ from typing import List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import text
 from supabase import Client
 
 from app.auth.dependencies import require_admin, require_auth
-from app.database import get_db
+from app.database import get_db, run_db_operation
 from app.repositories.task_repository import TaskRepository
 from app.schemas.task import TaskCreate, TaskResponse, TaskUpdate
+from app.services.notification_service import NotificationService
+from app.services.email_service import MailjetEmailService
 
 router = APIRouter()
 
 
 def get_task_repository(db: Client = Depends(get_db)) -> TaskRepository:
     return TaskRepository(db)
+
+def get_notification_service(db: Client = Depends(get_db)) -> NotificationService:
+    return NotificationService(db)
+
+
+def get_email_service(db: Client = Depends(get_db)) -> MailjetEmailService:
+    return MailjetEmailService(db)
 
 
 def _ensure_assignment_permissions(current_user: dict, assigned_to: UUID | None) -> None:
@@ -33,6 +43,28 @@ def _ensure_assignment_permissions(current_user: dict, assigned_to: UUID | None)
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions to assign task")
 
 
+def _can_manage_all_tasks(current_user: dict) -> bool:
+    role = str(current_user.get("role") or "").strip().lower()
+    return role in {"admin", "sales_manager", "manager"}
+
+
+async def _is_lead_owner(db: Client, current_user: dict, lead_id: str) -> bool:
+    user_id = str(current_user.get("id") or "")
+    if not user_id:
+        return False
+
+    def _query():
+        with db.engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT owner_id FROM leads WHERE id = :lead_id"),
+                {"lead_id": lead_id},
+            ).mappings().first()
+            return str(row.get("owner_id")) if row and row.get("owner_id") else None
+
+    owner_id = await run_db_operation(_query)
+    return bool(owner_id and owner_id == user_id)
+
+
 @router.get("/", response_model=List[TaskResponse])
 async def get_tasks(
     skip: int = 0,
@@ -42,10 +74,30 @@ async def get_tasks(
     entity_type: str | None = None,
     entity_id: UUID | None = None,
     priority: str | None = None,
+    db: Client = Depends(get_db),
     current_user: dict = Depends(require_auth),
     repository: TaskRepository = Depends(get_task_repository),
 ):
     """Get tasks with optional filtering."""
+    requester_id = str(current_user.get("id") or "")
+    if not _can_manage_all_tasks(current_user):
+        if (entity_type or "").strip().lower() == "lead" and entity_id:
+            is_owner = await _is_lead_owner(db, current_user, str(entity_id))
+            if not is_owner:
+                if assigned_to is not None and str(assigned_to) != requester_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Insufficient permissions to view these tasks",
+                    )
+                assigned_to = UUID(requester_id) if requester_id else None
+        else:
+            if assigned_to is not None and str(assigned_to) != requester_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Insufficient permissions to view these tasks",
+                )
+            assigned_to = UUID(requester_id) if requester_id else None
+
     return await repository.list_tasks(
         skip=skip,
         limit=limit,
@@ -60,11 +112,25 @@ async def get_tasks(
 @router.get("/{task_id}", response_model=TaskResponse)
 async def get_task(
     task_id: UUID,
+    db: Client = Depends(get_db),
     current_user: dict = Depends(require_auth),
     repository: TaskRepository = Depends(get_task_repository),
 ):
     """Get a task by ID."""
-    return await repository.get_by_id(task_id)
+    task = await repository.get_by_id(task_id)
+    if not _can_manage_all_tasks(current_user):
+        requester_id = str(current_user.get("id") or "")
+        task_assigned_to = str(task.get("assigned_to") or "")
+        if (task.get("entity_type") or "").strip().lower() == "lead":
+            is_owner = await _is_lead_owner(db, current_user, str(task.get("entity_id")))
+            if is_owner:
+                return task
+        if not requester_id or task_assigned_to != requester_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions to view this task",
+            )
+    return task
 
 
 @router.post("/", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
@@ -72,6 +138,8 @@ async def create_task(
     payload: TaskCreate,
     current_user: dict = Depends(require_auth),
     repository: TaskRepository = Depends(get_task_repository),
+    notification_service: NotificationService = Depends(get_notification_service),
+    email_service: MailjetEmailService = Depends(get_email_service),
 ):
     """Create a new task."""
     task_data = payload.model_dump()
@@ -82,7 +150,32 @@ async def create_task(
 
     task_data["entity_id"] = str(task_data["entity_id"])
 
-    return await repository.create(task_data)
+    created = await repository.create(task_data)
+    assigned_to = str(created.get("assigned_to") or "")
+    actor_id = str(current_user.get("id") or "")
+    if assigned_to and assigned_to != actor_id:
+        actor_name = await notification_service.get_agent_name(actor_id)
+        await notification_service.create_notification(
+            recipient_id=assigned_to,
+            actor_id=actor_id,
+            type="task_assigned",
+            title="New task assigned",
+            message=f"{actor_name or 'Manager'} assigned task \"{created.get('title') or 'Untitled Task'}\" to you.",
+            entity_type="task",
+            entity_id=str(created.get("id")),
+        )
+        try:
+            recipient_email = await email_service.get_recipient_email(assigned_to)
+            if recipient_email:
+                await email_service.send_task_assigned_email(
+                    recipient_id=assigned_to,
+                    recipient_email=recipient_email,
+                    actor_name=actor_name or "Manager",
+                    task_title=created.get("title") or "Untitled Task",
+                )
+        except Exception:
+            pass
+    return created
 
 
 @router.patch("/{task_id}", response_model=TaskResponse)
@@ -91,8 +184,20 @@ async def update_task(
     payload: TaskUpdate,
     current_user: dict = Depends(require_auth),
     repository: TaskRepository = Depends(get_task_repository),
+    notification_service: NotificationService = Depends(get_notification_service),
+    email_service: MailjetEmailService = Depends(get_email_service),
 ):
     """Update a task."""
+    existing_task = await repository.get_by_id(task_id)
+    if not _can_manage_all_tasks(current_user):
+        requester_id = str(current_user.get("id") or "")
+        task_assigned_to = str(existing_task.get("assigned_to") or "")
+        if not requester_id or task_assigned_to != requester_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions to update this task",
+            )
+
     update_data = payload.model_dump(exclude_unset=True)
 
     if not update_data:
@@ -106,15 +211,57 @@ async def update_task(
     if "entity_id" in update_data and update_data["entity_id"] is not None:
         update_data["entity_id"] = str(update_data["entity_id"])
 
-    return await repository.update_by_id(task_id, update_data)
+    updated = await repository.update_by_id(task_id, update_data)
+    old_assignee = str(existing_task.get("assigned_to") or "")
+    new_assignee = str(updated.get("assigned_to") or "")
+    actor_id = str(current_user.get("id") or "")
+    if new_assignee and new_assignee != old_assignee and new_assignee != actor_id:
+        actor_name = await notification_service.get_agent_name(actor_id)
+        await notification_service.create_notification(
+            recipient_id=new_assignee,
+            actor_id=actor_id,
+            type="task_assigned",
+            title="Task assigned to you",
+            message=f"{actor_name or 'Manager'} assigned task \"{updated.get('title') or 'Untitled Task'}\" to you.",
+            entity_type="task",
+            entity_id=str(updated.get("id")),
+        )
+        try:
+            recipient_email = await email_service.get_recipient_email(new_assignee)
+            if recipient_email:
+                await email_service.send_task_assigned_email(
+                    recipient_id=new_assignee,
+                    recipient_email=recipient_email,
+                    actor_name=actor_name or "Manager",
+                    task_title=updated.get("title") or "Untitled Task",
+                )
+        except Exception:
+            pass
+    return updated
 
 
 @router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_task(
     task_id: UUID,
-    current_user: dict = Depends(require_admin()),
+    db: Client = Depends(get_db),
+    current_user: dict = Depends(require_auth),
     repository: TaskRepository = Depends(get_task_repository),
 ):
     """Delete a task."""
+    existing_task = await repository.get_by_id(task_id)
+    if not _can_manage_all_tasks(current_user):
+        requester_id = str(current_user.get("id") or "")
+        task_assigned_to = str(existing_task.get("assigned_to") or "")
+        if (existing_task.get("entity_type") or "").strip().lower() == "lead":
+            is_owner = await _is_lead_owner(db, current_user, str(existing_task.get("entity_id")))
+            if is_owner:
+                await repository.delete_by_id(task_id)
+                return None
+        if not requester_id or task_assigned_to != requester_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions to delete this task",
+            )
+
     await repository.delete_by_id(task_id)
     return None

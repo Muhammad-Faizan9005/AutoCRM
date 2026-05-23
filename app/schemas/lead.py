@@ -116,3 +116,12 @@ class LeadConvertRequest(BaseModel):
         cleaned = sanitize_text(value)
         validate_no_dangerous_sql_tokens(cleaned)
         return cleaned
+
+
+class LeadAssignmentItem(BaseModel):
+    lead_id: UUID
+    owner_id: Optional[UUID] = None
+
+
+class LeadBulkAssignRequest(BaseModel):
+    assignments: list[LeadAssignmentItem]

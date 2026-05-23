@@ -259,6 +259,34 @@ async def get_team(
     }
 
 
+@router.delete("/{team_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_team(
+    team_id: UUID,
+    current_user: dict = Depends(require_permissions(["admin_users"])),
+    db: PostgresClient = Depends(get_db),
+):
+    team = await _get_team_by_id(db, str(team_id))
+    _assert_team_access(current_user, team)
+
+    def _delete():
+        with db.engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM team_members WHERE team_id = :tid"),
+                {"tid": str(team_id)},
+            )
+            conn.execute(
+                text("UPDATE agents SET team_id = NULL WHERE team_id = :tid"),
+                {"tid": str(team_id)},
+            )
+            conn.execute(
+                text("DELETE FROM teams WHERE id = :tid"),
+                {"tid": str(team_id)},
+            )
+
+    await run_db_operation(_delete)
+    return None
+
+
 @router.patch("/{team_id}", response_model=TeamResponse)
 async def update_team(
     team_id: UUID,

@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.database import get_db, run_db_operation
 from app.middleware.error_handler import error_handler_middleware, setup_exception_handlers
 from app.middleware.logging_middleware import logging_middleware
 from app.middleware.rate_limiter import rate_limit_middleware
@@ -42,6 +43,15 @@ app.middleware("http")(error_handler_middleware)
 # Setup exception handlers
 setup_exception_handlers(app)
 
+
+@app.on_event("startup")
+async def warmup_database_metadata() -> None:
+    # Preload metadata used during auth flows so first login is not penalized.
+    db = get_db()
+    await run_db_operation(
+        lambda: db.warmup_tables(["agents", "agent_permissions", "revoked_tokens"])
+    )
+
 @app.get("/")
 async def root():
     return {"message": "Welcome to AutoCRM an Agentic AI Enabled CRM System", "status": "running"}
@@ -52,7 +62,7 @@ async def health_check():
 
 
 # Include routers
-from app.routers import auth, customers, deals, imports, leads, notes, organizations, tasks, tickets, users, dashboard, admin, teams
+from app.routers import auth, customers, deals, imports, leads, notes, organizations, tasks, tickets, users, dashboard, admin, teams, notifications, invites
 
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(users.router, prefix="/api/users", tags=["Users"])
@@ -64,6 +74,8 @@ app.include_router(deals.router, prefix="/api/deals", tags=["Deals"])
 app.include_router(organizations.router, prefix="/api/organizations", tags=["Organizations"])
 app.include_router(tasks.router, prefix="/api/tasks", tags=["Tasks"])
 app.include_router(notes.router, prefix="/api/notes", tags=["Notes"])
+app.include_router(notifications.router, prefix="/api/notifications", tags=["Notifications"])
+app.include_router(invites.router, prefix="/api/invites", tags=["Invites"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
 app.include_router(admin.router, prefix="/api/admin", tags=["Admin"])
 app.include_router(teams.router, prefix="/api/admin/teams", tags=["Teams"])
