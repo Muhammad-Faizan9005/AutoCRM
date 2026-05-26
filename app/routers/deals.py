@@ -4,15 +4,18 @@ from typing import List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import text
 from supabase import Client
 
 from app.auth.dependencies import require_admin, require_auth
-from app.database import get_db
+from app.database import get_db, run_db_operation
 from app.exceptions.custom_exceptions import ResourceNotFoundError
 from app.repositories.deal_repository import DealRepository
 from app.schemas.customer import CustomerResponse
 from app.schemas.deal import DealCreate, DealResponse, DealUpdate
 from app.services.conversion_service import ConversionService
+from app.services.status_change_log_service import StatusChangeLogService
+from app.utils.statuses import DEAL_STATUSES, normalize_status
 
 router = APIRouter()
 
@@ -23,6 +26,53 @@ def get_deal_repository(db: Client = Depends(get_db)) -> DealRepository:
 
 def get_conversion_service(db: Client = Depends(get_db)) -> ConversionService:
     return ConversionService(db)
+
+
+def get_status_log_service(db: Client = Depends(get_db)) -> StatusChangeLogService:
+    return StatusChangeLogService(db)
+
+
+async def _can_manager_assign_to_rep(db: Client, manager_id: str, rep_id: str) -> bool:
+    def _query():
+        with db.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT 1 FROM team_members tm "
+                    "JOIN teams t ON t.id = tm.team_id "
+                    "WHERE t.manager_id = :mid AND tm.agent_id = :rid LIMIT 1"
+                ),
+                {"mid": manager_id, "rid": rep_id},
+            ).first()
+            return bool(row)
+
+    return await run_db_operation(_query)
+
+
+async def _assert_deal_assignment_permissions(
+    db: Client,
+    current_user: dict,
+    owner_id: str | None,
+) -> None:
+    if owner_id is None:
+        return
+
+    user_id = str(current_user.get("id") or "")
+    role = str(current_user.get("role") or "").strip().lower()
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+
+    if role == "admin":
+        return
+    if role in {"sales_manager", "manager"}:
+        if await _can_manager_assign_to_rep(db, user_id, owner_id):
+            return
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can assign deals only to your team reps",
+        )
+    if owner_id == user_id:
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions to assign deal")
 
 
 @router.get("/", response_model=List[DealResponse])
@@ -61,20 +111,42 @@ async def get_deal(
 async def create_deal(
     payload: DealCreate,
     current_user: dict = Depends(require_auth),
+    db: Client = Depends(get_db),
     repository: DealRepository = Depends(get_deal_repository),
+    status_log_service: StatusChangeLogService = Depends(get_status_log_service),
 ):
     """Create a new deal."""
     deal_data = payload.model_dump()
 
+    if "status" in deal_data and deal_data["status"] is not None:
+        try:
+            deal_data["status"] = normalize_status(deal_data["status"], DEAL_STATUSES)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        if deal_data["status"] == "lost" and not deal_data.get("lost_reason"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Lost reason is required when status is lost",
+            )
+
     owner_id = deal_data.get("owner_id") or current_user.get("id")
     if owner_id:
         deal_data["owner_id"] = str(owner_id)
+        await _assert_deal_assignment_permissions(db, current_user, deal_data["owner_id"])
 
     for key in ("lead_id", "organization_id"):
         if deal_data.get(key):
             deal_data[key] = str(deal_data[key])
 
-    return await repository.create(deal_data)
+    created = await repository.create(deal_data)
+    await status_log_service.log_change(
+        entity_type="deal",
+        entity_id=str(created.get("id")),
+        old_status=None,
+        new_status=created.get("status") or deal_data.get("status") or "qualified",
+        changed_by=str(current_user.get("id") or "") or None,
+    )
+    return created
 
 
 @router.patch("/{deal_id}", response_model=DealResponse)
@@ -82,6 +154,7 @@ async def update_deal(
     deal_id: UUID,
     payload: DealUpdate,
     current_user: dict = Depends(require_auth),
+    db: Client = Depends(get_db),
     repository: DealRepository = Depends(get_deal_repository),
     service: ConversionService = Depends(get_conversion_service),
 ):
@@ -93,6 +166,9 @@ async def update_deal(
     - Sets closed_at timestamp for terminal statuses (won, lost)
     """
     update_data = payload.model_dump(exclude_unset=True)
+    existing = await repository.get_by_id(deal_id)
+    if not existing:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
 
     if not update_data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
@@ -100,11 +176,28 @@ async def update_deal(
     for key in ("lead_id", "owner_id", "organization_id", "customer_id"):
         if key in update_data and update_data[key] is not None:
             update_data[key] = str(update_data[key])
+    if "owner_id" in update_data and update_data["owner_id"] is not None:
+        await _assert_deal_assignment_permissions(db, current_user, update_data["owner_id"])
 
     # If status is being updated, use the conversion service to handle status transitions
     if "status" in update_data:
         try:
-            return await service.update_deal_status(deal_id=str(deal_id), new_status=update_data["status"])
+            try:
+                update_data["status"] = normalize_status(update_data["status"], DEAL_STATUSES)
+            except ValueError as exc:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+            if update_data["status"] == "lost":
+                lost_reason = update_data.get("lost_reason") or existing.get("lost_reason")
+                if not lost_reason:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Lost reason is required when status is lost",
+                    )
+            return await service.update_deal_status(
+                deal_id=str(deal_id),
+                new_status=update_data["status"],
+                actor_id=str(current_user.get("id") or "") or None,
+            )
         except ResourceNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc.detail))
         except Exception as exc:

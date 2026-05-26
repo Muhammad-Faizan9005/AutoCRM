@@ -13,6 +13,7 @@ from app.repositories.task_repository import TaskRepository
 from app.schemas.task import TaskCreate, TaskResponse, TaskUpdate
 from app.services.notification_service import NotificationService
 from app.services.email_service import MailjetEmailService
+from app.utils.statuses import TASK_STATUSES, normalize_status
 
 router = APIRouter()
 
@@ -143,6 +144,10 @@ async def create_task(
 ):
     """Create a new task."""
     task_data = payload.model_dump()
+    try:
+        task_data["status"] = normalize_status(task_data.get("status") or "open", TASK_STATUSES)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     _ensure_assignment_permissions(current_user, task_data.get("assigned_to"))
 
     if task_data.get("assigned_to") is not None:
@@ -203,6 +208,12 @@ async def update_task(
     if not update_data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
 
+    if "status" in update_data and update_data["status"] is not None:
+        try:
+            update_data["status"] = normalize_status(update_data["status"], TASK_STATUSES)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
     if "assigned_to" in update_data:
         _ensure_assignment_permissions(current_user, update_data.get("assigned_to"))
         if update_data["assigned_to"] is not None:
@@ -215,6 +226,17 @@ async def update_task(
     old_assignee = str(existing_task.get("assigned_to") or "")
     new_assignee = str(updated.get("assigned_to") or "")
     actor_id = str(current_user.get("id") or "")
+    if old_assignee and old_assignee != new_assignee and old_assignee != actor_id:
+        actor_name = await notification_service.get_agent_name(actor_id)
+        await notification_service.create_notification(
+            recipient_id=old_assignee,
+            actor_id=actor_id,
+            type="task_unassigned",
+            title="Task unassigned",
+            message=f"{actor_name or 'Manager'} unassigned task \"{updated.get('title') or 'Untitled Task'}\" from you.",
+            entity_type="task",
+            entity_id=str(updated.get("id")),
+        )
     if new_assignee and new_assignee != old_assignee and new_assignee != actor_id:
         actor_name = await notification_service.get_agent_name(actor_id)
         await notification_service.create_notification(

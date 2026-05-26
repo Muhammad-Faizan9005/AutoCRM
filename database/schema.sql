@@ -158,6 +158,8 @@ CREATE TABLE leads (
     status VARCHAR(50) DEFAULT 'new',
     score INTEGER,
     score_reason TEXT,
+    lost_reason TEXT,
+    lost_notes TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -210,6 +212,19 @@ CREATE TABLE notes (
 );
 
 -- =============================================
+-- STATUS CHANGE LOGS
+-- =============================================
+CREATE TABLE status_change_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    entity_type VARCHAR(50) NOT NULL,
+    entity_id UUID NOT NULL,
+    old_status VARCHAR(50),
+    new_status VARCHAR(50) NOT NULL,
+    changed_by UUID REFERENCES agents(id) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- =============================================
 -- INDEXES FOR PERFORMANCE
 -- =============================================
 CREATE INDEX idx_customers_email ON customers(email);
@@ -239,6 +254,8 @@ CREATE INDEX idx_notes_entity_type ON notes(entity_type);
 CREATE INDEX idx_notes_entity_id ON notes(entity_id);
 CREATE INDEX idx_notes_author_id ON notes(author_id);
 CREATE INDEX idx_notes_created_at ON notes(created_at DESC);
+CREATE INDEX idx_status_change_logs_entity ON status_change_logs(entity_type, entity_id);
+CREATE INDEX idx_status_change_logs_created_at ON status_change_logs(created_at DESC);
 CREATE INDEX idx_teams_manager_id ON teams(manager_id);
 CREATE INDEX idx_team_members_team_id ON team_members(team_id);
 CREATE INDEX idx_team_members_agent_id ON team_members(agent_id);

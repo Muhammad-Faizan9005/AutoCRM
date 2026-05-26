@@ -218,6 +218,48 @@ We need disabled users to lose access quickly. These are the options:
   - Disable action blacklists active tokens and uses shorter access token TTLs.
   - User is blocked on the next API request, without polling.
   - Lowest steady-state load, but not instant unless requests are frequent.
+
+## 12) Day 8 CRM Porting Priorities
+
+### Must-haves (implement now)
+
+1) Lead/Deal default status rules
+  - Reason: prevents inconsistent states and matches CRM expectations on creation.
+
+2) Lost reason enforcement for Lead/Deal
+  - Reason: ensures pipeline analytics are meaningful and prevents silent loss states.
+
+3) Status change logging for Lead/Deal
+  - Reason: auditability and visibility into lifecycle transitions.
+
+4) Owner assignment rules and permission checks
+  - Reason: avoids unauthorized reassignment and mirrors manager/admin scope.
+
+5) Task reassignment unassigns previous assignee
+  - Reason: prevents duplicate responsibility and matches CRM assignment behavior.
+
+6) Canonical status taxonomy across API/UI
+  - Reason: avoids mismatched values, broken filters, and reporting drift.
+
+### Later pipeline (documented for follow-up)
+
+1) SLA lifecycle (first response/rolling response, breach tracking)
+  - Reason: valuable for support ops, but not required for core CRM CRUD.
+
+2) Lead -> Contact/Organization auto-creation
+  - Reason: helpful for CRM completeness, but can be manual without breaking flows.
+
+3) Deal forecasting rules (probability, expected close/value requirements)
+  - Reason: analytics-driven; safe to add once basic lifecycle is stable.
+
+4) Exchange rate/multi-currency handling
+  - Reason: needed for global sales, not a blocker for initial deployments.
+
+5) Lead enrichment (gravatar/image)
+  - Reason: UI polish only; no impact on business logic.
+
+6) Task kanban metadata defaults
+  - Reason: UI-specific configuration; can be added after core task CRUD.
 - Middleware: pre/post request processing layer.
 - Dependency: reusable logic injected into route handlers.
 - Repository: abstraction over DB operations.
