@@ -27,10 +27,21 @@ ADMIN_ROLE_ALIASES = {"admin", "administrator", "system_manager", "superuser"}
 TEMPLATE_FILE_NAME = "permission.json"
 
 
+ROLE_ALIASES = {
+    "manager": "sales_manager",
+    "sales-manager": "sales_manager",
+    "sales manager": "sales_manager",
+    "agent": "sales_rep",
+    "sales-rep": "sales_rep",
+    "sales rep": "sales_rep",
+}
+
+
 def _normalize_role(role: str | None) -> str:
     if not role:
         return ""
-    return role.strip().lower().replace("-", "_").replace(" ", "_")
+    normalized = role.strip().lower().replace("-", "_").replace(" ", "_")
+    return ROLE_ALIASES.get(normalized, normalized)
 
 
 def is_admin_user(user: dict[str, Any]) -> bool:

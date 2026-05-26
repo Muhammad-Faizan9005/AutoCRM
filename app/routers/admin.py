@@ -27,6 +27,7 @@ from app.services.email_service import MailjetEmailService
 from app.services.invite_service import InviteService
 from app.services.permission_service import PermissionService, sanitize_permissions_map
 from app.services.registration_service import normalize_role_input, register_user_account
+from app.utils.cache import invalidate_user_cache
 
 router = APIRouter()
 
@@ -336,9 +337,11 @@ async def update_admin_user(
 
     if update_data.get("status") == "disabled" and str(target_user.get("status")) == "invited":
         await invite_service.revoke_invited_user(str(user_id), reason="revoked")
+        invalidate_user_cache(str(user_id))
         return _to_admin_user({**target_user, "status": "disabled", "is_active": False})
 
     updated = await repository.update_by_id(str(user_id), update_data)
+    invalidate_user_cache(str(user_id))
     return _to_admin_user(updated)
 
 
@@ -355,6 +358,7 @@ async def delete_admin_user(
         await invite_service.revoke_invited_user(str(user_id), reason="revoked")
         return None
     await repository.update_by_id(str(user_id), {"is_active": False, "status": "disabled"})
+    invalidate_user_cache(str(user_id))
     return None
 
 
