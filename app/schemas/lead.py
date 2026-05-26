@@ -19,6 +19,8 @@ class LeadBase(BaseModel):
     status: Optional[str] = Field(default="new", max_length=50)
     score: Optional[int] = Field(default=None, ge=0, le=100)
     score_reason: Optional[str] = Field(default=None, max_length=1000)
+    lost_reason: Optional[str] = Field(default=None, max_length=255)
+    lost_notes: Optional[str] = Field(default=None, max_length=2000)
     converted: Optional[bool] = Field(default=False)
     owner_id: Optional[UUID] = None
     organization_id: Optional[UUID] = None
@@ -38,7 +40,7 @@ class LeadBase(BaseModel):
         cleaned = sanitize_text(value)
         return validate_phone(cleaned)
 
-    @field_validator("company", "source", "status", "score_reason")
+    @field_validator("company", "source", "status", "score_reason", "lost_reason", "lost_notes")
     @classmethod
     def validate_text_fields(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -61,6 +63,8 @@ class LeadUpdate(BaseModel):
     status: Optional[str] = Field(default=None, max_length=50)
     score: Optional[int] = Field(default=None, ge=0, le=100)
     score_reason: Optional[str] = Field(default=None, max_length=1000)
+    lost_reason: Optional[str] = Field(default=None, max_length=255)
+    lost_notes: Optional[str] = Field(default=None, max_length=2000)
     converted: Optional[bool] = None
     owner_id: Optional[UUID] = None
     organization_id: Optional[UUID] = None
@@ -82,7 +86,7 @@ class LeadUpdate(BaseModel):
         cleaned = sanitize_text(value)
         return validate_phone(cleaned)
 
-    @field_validator("company", "source", "status", "score_reason")
+    @field_validator("company", "source", "status", "score_reason", "lost_reason", "lost_notes")
     @classmethod
     def validate_text_fields(cls, value: Optional[str]) -> Optional[str]:
         if value is None:

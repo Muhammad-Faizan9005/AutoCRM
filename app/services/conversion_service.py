@@ -18,6 +18,7 @@ from app.exceptions.custom_exceptions import DatabaseError, ResourceNotFoundErro
 from app.repositories.customer_repository import CustomerRepository
 from app.repositories.deal_repository import DealRepository
 from app.repositories.lead_repository import LeadRepository
+from app.services.status_change_log_service import StatusChangeLogService
 
 
 class ConversionService:
@@ -28,6 +29,7 @@ class ConversionService:
         self.lead_repository = LeadRepository(db)
         self.deal_repository = DealRepository(db)
         self.customer_repository = CustomerRepository(db)
+        self.status_log_service = StatusChangeLogService(db)
 
     async def convert_lead_to_deal(
         self,
@@ -39,6 +41,7 @@ class ConversionService:
         expected_close_at: datetime | None = None,
         owner_id: str | None = None,
         organization_id: str | None = None,
+        actor_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Convert a lead to a deal.
@@ -69,6 +72,8 @@ class ConversionService:
         if not lead:
             raise ResourceNotFoundError(resource="Lead", resource_id=lead_id)
 
+        old_status = lead.get("status")
+
         # Create deal
         deal_data = {
             "lead_id": str(lead_id),
@@ -81,7 +86,14 @@ class ConversionService:
             "organization_id": organization_id or lead.get("organization_id"),
         }
 
-        created_deal = await self.deal_repository.create(deal_data)
+        deal = await self.deal_repository.create(deal_data)
+        await self.status_log_service.log_change(
+            entity_type="deal",
+            entity_id=str(deal.get("id")),
+            old_status=None,
+            new_status=deal.get("status") or "qualified",
+            changed_by=actor_id,
+        )
 
         # Mark lead as converted and update status to "qualified"
         await self.lead_repository.update_by_id(
@@ -92,7 +104,16 @@ class ConversionService:
             },
         )
 
-        return created_deal
+        if old_status != "qualified":
+            await self.status_log_service.log_change(
+                entity_type="lead",
+                entity_id=str(lead_id),
+                old_status=old_status,
+                new_status="qualified",
+                changed_by=actor_id,
+            )
+
+        return deal
 
     async def convert_deal_to_customer(
         self,
@@ -173,6 +194,7 @@ class ConversionService:
         *,
         deal_id: str,
         new_status: str,
+        actor_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Update deal status and trigger conversion if status becomes "Won".
@@ -188,6 +210,10 @@ class ConversionService:
             NotFoundError: If deal not found
             DatabaseError: If database operation fails
         """
+        existing = await self.deal_repository.get_by_id(deal_id)
+        if not existing:
+            raise ResourceNotFoundError(resource="Deal", resource_id=deal_id)
+
         # Update deal status
         update_data = {"status": new_status.lower()}
 
@@ -196,6 +222,16 @@ class ConversionService:
             update_data["closed_at"] = datetime.utcnow()
 
         updated_deal = await self.deal_repository.update_by_id(deal_id, update_data)
+        old_status = existing.get("status")
+        new_value = updated_deal.get("status")
+        if new_value and new_value != old_status:
+            await self.status_log_service.log_change(
+                entity_type="deal",
+                entity_id=str(deal_id),
+                old_status=old_status,
+                new_status=new_value,
+                changed_by=actor_id,
+            )
 
         # If status changed to "won", convert to customer
         if new_status.lower() == "won":

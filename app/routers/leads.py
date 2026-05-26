@@ -20,6 +20,8 @@ from app.services.conversion_service import ConversionService
 from app.services.import_service import ImportService
 from app.services.notification_service import NotificationService
 from app.services.email_service import MailjetEmailService
+from app.services.status_change_log_service import StatusChangeLogService
+from app.utils.statuses import LEAD_STATUSES, normalize_status
 
 router = APIRouter()
 
@@ -46,6 +48,10 @@ def get_notification_service(db: Client = Depends(get_db)) -> NotificationServic
 
 def get_email_service(db: Client = Depends(get_db)) -> MailjetEmailService:
     return MailjetEmailService(db)
+
+
+def get_status_log_service(db: Client = Depends(get_db)) -> StatusChangeLogService:
+    return StatusChangeLogService(db)
 
 
 def _can_manage_leads(current_user: dict) -> bool:
@@ -208,9 +214,21 @@ async def create_lead(
     repository: LeadRepository = Depends(get_lead_repository),
     notification_service: NotificationService = Depends(get_notification_service),
     email_service: MailjetEmailService = Depends(get_email_service),
+    status_log_service: StatusChangeLogService = Depends(get_status_log_service),
 ):
     """Create a new lead."""
     lead_data = payload.model_dump()
+
+    try:
+        lead_data["status"] = normalize_status(lead_data.get("status") or "new", LEAD_STATUSES)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
+    if lead_data.get("status") == "lost" and not lead_data.get("lost_reason"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Lost reason is required when status is lost",
+        )
 
     owner_id = lead_data.get("owner_id") or current_user.get("id")
     if owner_id:
@@ -222,6 +240,13 @@ async def create_lead(
         lead_data["organization_id"] = str(organization_id)
 
     created = await repository.create(lead_data)
+    await status_log_service.log_change(
+        entity_type="lead",
+        entity_id=str(created.get("id")),
+        old_status=None,
+        new_status=created.get("status") or "new",
+        changed_by=str(current_user.get("id") or "") or None,
+    )
     actor_id = str(current_user.get("id") or "")
     if created.get("owner_id") and str(created.get("owner_id")) != actor_id:
         actor_name = await notification_service.get_agent_name(actor_id)
@@ -258,10 +283,23 @@ async def update_lead(
     repository: LeadRepository = Depends(get_lead_repository),
     notification_service: NotificationService = Depends(get_notification_service),
     email_service: MailjetEmailService = Depends(get_email_service),
+    status_log_service: StatusChangeLogService = Depends(get_status_log_service),
 ):
     """Update a lead."""
     existing = await repository.get_by_id(lead_id)
     update_data = payload.model_dump(exclude_unset=True)
+    if "status" in update_data and update_data["status"] is not None:
+        try:
+            update_data["status"] = normalize_status(update_data["status"], LEAD_STATUSES)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        if update_data["status"] == "lost":
+            lost_reason = update_data.get("lost_reason") or existing.get("lost_reason")
+            if not lost_reason:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Lost reason is required when status is lost",
+                )
 
     if not update_data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
@@ -274,6 +312,16 @@ async def update_lead(
         update_data["organization_id"] = str(update_data["organization_id"])
 
     updated = await repository.update_by_id(lead_id, update_data)
+    old_status = existing.get("status")
+    new_status = updated.get("status")
+    if new_status and new_status != old_status:
+        await status_log_service.log_change(
+            entity_type="lead",
+            entity_id=str(updated.get("id")),
+            old_status=old_status,
+            new_status=new_status,
+            changed_by=str(current_user.get("id") or "") or None,
+        )
     previous_owner_id = str(existing.get("owner_id")) if existing.get("owner_id") else None
     next_owner_id = str(updated.get("owner_id")) if updated.get("owner_id") else None
     actor_id = str(current_user.get("id") or "")
@@ -384,6 +432,7 @@ async def convert_lead_to_deal(
             expected_close_at=payload.expected_close_at,
             owner_id=str(payload.owner_id) if payload.owner_id else None,
             organization_id=str(payload.organization_id) if payload.organization_id else None,
+            actor_id=str(current_user.get("id") or "") or None,
         )
     except ResourceNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc.detail))
@@ -418,7 +467,11 @@ async def discard_lead_deal(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No deal found for lead")
 
     try:
-        return await service.update_deal_status(deal_id=deal_id, new_status="lost")
+        return await service.update_deal_status(
+            deal_id=deal_id,
+            new_status="lost",
+            actor_id=str(current_user.get("id") or "") or None,
+        )
     except ResourceNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc.detail))
     except Exception as exc:
