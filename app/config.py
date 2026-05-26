@@ -66,6 +66,7 @@ class Settings(BaseSettings):
     MAILJET_SENDER_NAME: str = "AutoCRM"
     FRONTEND_BASE_URL: str = "http://localhost:5173"
     INVITE_TOKEN_TTL_HOURS: int = 72
+    RESET_TOKEN_TTL_MINUTES: int = 30
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 

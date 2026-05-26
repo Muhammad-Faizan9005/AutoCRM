@@ -64,6 +64,17 @@ class LogoutRequest(BaseModel):
     refresh_token: str | None = None
 
 
+class ForgotPasswordRequest(BaseModel):
+    """Forgot password request schema"""
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    """Reset password request schema"""
+    token: str = Field(..., min_length=10)
+    password: str = Field(..., min_length=6)
+
+
 class UserResponse(BaseModel):
     """User profile response"""
     id: UUID

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -14,6 +15,8 @@ from app.services.registration_service import normalize_role_input
 
 MAILJET_SEND_URL = "https://api.mailjet.com/v3.1/send"
 MAILJET_USER_URL = "https://api.mailjet.com/v3/REST/user"
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_ROLE_PREFERENCES = {
     "admin": {
@@ -196,7 +199,7 @@ class MailjetEmailService:
             role = str(recipient.get("role") or "sales_rep")
             if not await self._can_send_event(
                 recipient_id=recipient_id,
-                role=role,
+                role=role,                  
                 event_type=event_type,
                 priority=priority,
             ):
@@ -228,7 +231,32 @@ class MailjetEmailService:
                     to_info = first.get("To") or []
                     if to_info:
                         provider_message_id = to_info[0].get("MessageID")
+                logger.info(
+                    "mailjet_send_ok recipient=%s sender=%s message_id=%s",
+                    recipient_email,
+                    sender_email,
+                    provider_message_id,
+                    extra={
+                        "event_type": event_type,
+                        "recipient_email": recipient_email,
+                        "sender_email": sender_email,
+                        "message_id": provider_message_id,
+                    },
+                )
             else:
+                logger.warning(
+                    "mailjet_send_failed recipient=%s sender=%s status=%s",
+                    recipient_email,
+                    sender_email,
+                    response.status_code,
+                    extra={
+                        "event_type": event_type,
+                        "recipient_email": recipient_email,
+                        "sender_email": sender_email,
+                        "status_code": response.status_code,
+                        "response_text": response.text[:800],
+                    },
+                )
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     detail=f"Mailjet send failed (HTTP {response.status_code})",
@@ -264,6 +292,28 @@ class MailjetEmailService:
             subject=subject,
             text_body=text_body,
             priority="normal",
+        )
+
+    async def send_password_reset_email(
+        self,
+        *,
+        recipient_email: str,
+        reset_link: str,
+        ttl_minutes: int,
+    ) -> None:
+        subject = "Reset your AutoCRM password"
+        text_body = (
+            "We received a request to reset your AutoCRM password.\n\n"
+            f"Reset link (valid for {ttl_minutes} minutes): {reset_link}\n\n"
+            "If you did not request this, you can ignore this email."
+        )
+        await self.send_email(
+            event_type="password_reset",
+            recipient_id=None,
+            recipient_email=recipient_email,
+            subject=subject,
+            text_body=text_body,
+            priority="high",
         )
 
     async def send_lead_assigned_email(

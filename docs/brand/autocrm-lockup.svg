@@ -1,0 +1,27 @@
+<svg width="520" height="160" viewBox="0 0 520 160" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="ring" x1="20" y1="20" x2="140" y2="140" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5B8DEF" />
+      <stop offset="1" stop-color="#3A5FA8" />
+    </linearGradient>
+  </defs>
+
+  <g transform="translate(83,10)">
+    <circle cx="70" cy="70" r="56" stroke="url(#ring)" stroke-width="10" />
+    <circle cx="70" cy="70" r="38" stroke="#2A2D38" stroke-width="2" />
+
+    <path d="M70 38 L70 70" stroke="#5B8DEF" stroke-width="3" stroke-linecap="round" />
+    <path d="M38 96 L70 70" stroke="#4A9E7F" stroke-width="3" stroke-linecap="round" />
+    <path d="M102 96 L70 70" stroke="#B8924A" stroke-width="3" stroke-linecap="round" />
+
+    <circle cx="70" cy="38" r="6" fill="#5B8DEF" />
+    <circle cx="38" cy="96" r="6" fill="#4A9E7F" />
+    <circle cx="102" cy="96" r="6" fill="#B8924A" />
+
+    <rect x="56" y="56" width="28" height="28" rx="5" fill="#E8EAF0" stroke="#5B8DEF" stroke-width="2" transform="rotate(45 70 70)" />
+  </g>
+
+  <g transform="translate(243,48)">
+    <text x="0" y="40" font-family="Sora, DM Sans, sans-serif" font-size="44" font-weight="600" fill="#E8EAF0" letter-spacing="-0.5">AutoCRM</text>
+  </g>
+</svg>

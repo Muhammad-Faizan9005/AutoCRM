@@ -198,6 +198,26 @@ Relationship summary:
 - TTL: how long a token/resource remains valid.
 - Idempotent: same request repeated gives same effect (for suitable operations).
 - Pagination: returning data in chunks (`skip`, `limit`).
+
+## 11) Disabled User Detection (frontend behavior)
+
+We need disabled users to lose access quickly. These are the options:
+
+1) Server-push (SSE or WebSocket)
+  - Backend publishes a "user_disabled" event to the specific user.
+  - Frontend reacts instantly and clears the session.
+  - Best long-term scalability, requires persistent connections and auth on the channel.
+
+2) Short-interval polling (current)
+  - Frontend polls `GET /api/auth/me` every ~6 seconds while logged in.
+  - If the backend returns `403 Inactive user`, the client clears the session
+    and shows the inactive modal.
+  - Simple and reliable; load scales with concurrent active users.
+
+3) Token revocation + short-lived access tokens
+  - Disable action blacklists active tokens and uses shorter access token TTLs.
+  - User is blocked on the next API request, without polling.
+  - Lowest steady-state load, but not instant unless requests are frequent.
 - Middleware: pre/post request processing layer.
 - Dependency: reusable logic injected into route handlers.
 - Repository: abstraction over DB operations.
