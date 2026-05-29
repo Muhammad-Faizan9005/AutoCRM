@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     MAX_REQUEST_SIZE_BYTES: int = 1_048_576
     SECURITY_HEADERS_ENABLED: bool = True
 
+
     # Permissions storage (local JSON files)
     PERMISSIONS_STORAGE_DIR: str = "storage/permissions"
 
@@ -67,6 +68,11 @@ class Settings(BaseSettings):
     FRONTEND_BASE_URL: str = "http://localhost:5173"
     INVITE_TOKEN_TTL_HOURS: int = 72
     RESET_TOKEN_TTL_MINUTES: int = 30
+
+    # Call module settings
+    CALL_ROOM_TOKEN_TTL_MINUTES: int = 15
+    CALL_RECORDINGS_DIR: str = "storage/recordings"
+    CALL_RECORDINGS_URL_BASE: str = "/static/recordings"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 

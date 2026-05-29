@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import Any, List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -14,6 +14,7 @@ from app.schemas.task import TaskCreate, TaskResponse, TaskUpdate
 from app.services.notification_service import NotificationService
 from app.services.email_service import MailjetEmailService
 from app.utils.statuses import TASK_STATUSES, normalize_status
+from app.utils.team_access import can_access_lead, can_access_rep
 
 router = APIRouter()
 
@@ -46,24 +47,11 @@ def _ensure_assignment_permissions(current_user: dict, assigned_to: UUID | None)
 
 def _can_manage_all_tasks(current_user: dict) -> bool:
     role = str(current_user.get("role") or "").strip().lower()
-    return role in {"admin", "sales_manager", "manager"}
+    return role == "admin"
 
 
-async def _is_lead_owner(db: Client, current_user: dict, lead_id: str) -> bool:
-    user_id = str(current_user.get("id") or "")
-    if not user_id:
-        return False
-
-    def _query():
-        with db.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT owner_id FROM leads WHERE id = :lead_id"),
-                {"lead_id": lead_id},
-            ).mappings().first()
-            return str(row.get("owner_id")) if row and row.get("owner_id") else None
-
-    owner_id = await run_db_operation(_query)
-    return bool(owner_id and owner_id == user_id)
+async def _can_access_lead(db: Client, current_user: dict, lead_id: str) -> bool:
+    return await can_access_lead(db, current_user, lead_id)
 
 
 @router.get("/", response_model=List[TaskResponse])
@@ -83,21 +71,52 @@ async def get_tasks(
     requester_id = str(current_user.get("id") or "")
     if not _can_manage_all_tasks(current_user):
         if (entity_type or "").strip().lower() == "lead" and entity_id:
-            is_owner = await _is_lead_owner(db, current_user, str(entity_id))
-            if not is_owner:
-                if assigned_to is not None and str(assigned_to) != requester_id:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Insufficient permissions to view these tasks",
-                    )
-                assigned_to = UUID(requester_id) if requester_id else None
-        else:
-            if assigned_to is not None and str(assigned_to) != requester_id:
+            can_access = await _can_access_lead(db, current_user, str(entity_id))
+            if not can_access:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Insufficient permissions to view these tasks",
                 )
-            assigned_to = UUID(requester_id) if requester_id else None
+        else:
+            role = str(current_user.get("role") or "").strip().lower()
+            if role in {"manager", "sales_manager"} and assigned_to is None:
+                def _query_team_tasks():
+                    with db.engine.connect() as conn:
+                        sql = (
+                            "SELECT t.* FROM tasks t "
+                            "JOIN team_members tm ON tm.agent_id = t.assigned_to "
+                            "JOIN teams t2 ON t2.id = tm.team_id "
+                            "WHERE t2.manager_id = :mid "
+                        )
+                        params: dict[str, Any] = {"mid": requester_id}
+                        if status:
+                            sql += "AND t.status = :status "
+                            params["status"] = status
+                        if entity_type:
+                            sql += "AND t.entity_type = :entity_type "
+                            params["entity_type"] = entity_type
+                        if entity_id:
+                            sql += "AND t.entity_id = :entity_id "
+                            params["entity_id"] = str(entity_id)
+                        if priority:
+                            sql += "AND t.priority = :priority "
+                            params["priority"] = priority
+                        sql += "ORDER BY t.due_at ASC OFFSET :skip LIMIT :limit"
+                        params["skip"] = skip
+                        params["limit"] = limit
+                        rows = conn.execute(text(sql), params).mappings().all()
+                        return [dict(row) for row in rows]
+
+                return await run_db_operation(_query_team_tasks)
+
+            if assigned_to is not None:
+                if not await can_access_rep(db, current_user, str(assigned_to)):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Insufficient permissions to view these tasks",
+                    )
+            else:
+                assigned_to = UUID(requester_id) if requester_id else None
 
     return await repository.list_tasks(
         skip=skip,
@@ -123,10 +142,10 @@ async def get_task(
         requester_id = str(current_user.get("id") or "")
         task_assigned_to = str(task.get("assigned_to") or "")
         if (task.get("entity_type") or "").strip().lower() == "lead":
-            is_owner = await _is_lead_owner(db, current_user, str(task.get("entity_id")))
-            if is_owner:
+            can_access = await _can_access_lead(db, current_user, str(task.get("entity_id")))
+            if can_access:
                 return task
-        if not requester_id or task_assigned_to != requester_id:
+        if not requester_id or not await can_access_rep(db, current_user, task_assigned_to):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Insufficient permissions to view this task",
