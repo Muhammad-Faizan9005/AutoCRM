@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import Any, List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -16,6 +16,7 @@ from app.schemas.deal import DealCreate, DealResponse, DealUpdate
 from app.services.conversion_service import ConversionService
 from app.services.status_change_log_service import StatusChangeLogService
 from app.utils.statuses import DEAL_STATUSES, normalize_status
+from app.utils.team_access import can_access_rep
 
 router = APIRouter()
 
@@ -83,10 +84,47 @@ async def get_deals(
     owner_id: UUID | None = None,
     organization_id: UUID | None = None,
     lead_id: UUID | None = None,
+    db: Client = Depends(get_db),
     current_user: dict = Depends(require_auth),
     repository: DealRepository = Depends(get_deal_repository),
 ):
     """Get deals with optional filtering."""
+    role = str(current_user.get("role") or "").strip().lower()
+    requester_id = str(current_user.get("id") or "")
+
+    if role in {"manager", "sales_manager"} and owner_id is None:
+        def _query_team_deals():
+            with db.engine.connect() as conn:
+                sql = (
+                    "SELECT d.* FROM deals d "
+                    "JOIN team_members tm ON tm.agent_id = d.owner_id "
+                    "JOIN teams t ON t.id = tm.team_id "
+                    "WHERE t.manager_id = :mid "
+                )
+                params: dict[str, Any] = {"mid": requester_id}
+                if stage:
+                    sql += "AND d.stage = :stage "
+                    params["stage"] = stage
+                if organization_id:
+                    sql += "AND d.organization_id = :org_id "
+                    params["org_id"] = str(organization_id)
+                if lead_id:
+                    sql += "AND d.lead_id = :lead_id "
+                    params["lead_id"] = str(lead_id)
+                sql += "ORDER BY d.created_at DESC OFFSET :skip LIMIT :limit"
+                params["skip"] = skip
+                params["limit"] = limit
+                rows = conn.execute(text(sql), params).mappings().all()
+                return [dict(row) for row in rows]
+
+        return await run_db_operation(_query_team_deals)
+
+    if owner_id is not None and not await can_access_rep(db, current_user, str(owner_id)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+
+    if role not in {"admin", "manager", "sales_manager"}:
+        owner_id = UUID(requester_id) if requester_id else owner_id
+
     return await repository.list_deals(
         skip=skip,
         limit=limit,
@@ -101,10 +139,16 @@ async def get_deals(
 async def get_deal(
     deal_id: UUID,
     current_user: dict = Depends(require_auth),
+    db: Client = Depends(get_db),
     repository: DealRepository = Depends(get_deal_repository),
 ):
     """Get a deal by ID."""
-    return await repository.get_by_id(deal_id)
+    deal = await repository.get_by_id(deal_id)
+    if not deal:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
+    if not await can_access_rep(db, current_user, str(deal.get("owner_id") or "")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    return deal
 
 
 @router.post("/", response_model=DealResponse, status_code=status.HTTP_201_CREATED)
@@ -169,6 +213,8 @@ async def update_deal(
     existing = await repository.get_by_id(deal_id)
     if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
+    if not await can_access_rep(db, current_user, str(existing.get("owner_id") or "")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
     if not update_data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")

@@ -271,6 +271,30 @@ class MailjetEmailService:
                 payload={"subject": subject, "priority": priority},
             )
 
+    async def send_call_invite_email(
+        self,
+        *,
+        recipient_email: str,
+        lead_name: str,
+        agent_name: str,
+        invite_url: str,
+    ) -> None:
+        subject = f"AutoCRM call invite from {agent_name}"
+        text_body = (
+            f"Hi {lead_name},\n\n"
+            f"{agent_name} is inviting you to an AutoCRM call.\n"
+            f"Join here: {invite_url}\n\n"
+            "If you did not expect this invite, you can ignore this email."
+        )
+        await self.send_email(
+            event_type="call_invite",
+            recipient_id=None,
+            recipient_email=recipient_email,
+            subject=subject,
+            text_body=text_body,
+            priority="high",
+        )
+
     async def send_invite_email(
         self,
         *,

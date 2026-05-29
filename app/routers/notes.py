@@ -12,6 +12,7 @@ from app.database import get_db, run_db_operation
 from app.repositories.note_repository import NoteRepository
 from app.schemas.note import NoteCreate, NoteResponse, NoteUpdate
 from app.services.notification_service import NotificationService
+from app.utils.team_access import can_access_lead
 
 router = APIRouter()
 
@@ -29,24 +30,11 @@ def _is_lead_note(entity_type: str | None) -> bool:
 
 def _can_manage_lead_notes(current_user: dict[str, Any]) -> bool:
     role = str(current_user.get("role") or "").strip().lower()
-    return role in {"admin", "sales_manager", "manager"}
+    return role == "admin"
 
 
-async def _is_lead_owner(db: Client, current_user: dict[str, Any], lead_id: str) -> bool:
-    user_id = str(current_user.get("id") or "")
-    if not user_id:
-        return False
-
-    def _check():
-        with db.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT owner_id FROM leads WHERE id = :lead_id"),
-                {"lead_id": lead_id},
-            ).mappings().first()
-            return str(row.get("owner_id")) if row and row.get("owner_id") else None
-
-    owner_id = await run_db_operation(_check)
-    return bool(owner_id and owner_id == user_id)
+async def _can_access_lead(db: Client, current_user: dict[str, Any], lead_id: str) -> bool:
+    return await can_access_lead(db, current_user, lead_id)
 
 
 async def _get_lead_owner_and_name(db: Client, lead_id: str) -> tuple[str | None, str | None]:
@@ -87,18 +75,27 @@ async def get_notes(
                 author_id=str(author_id) if author_id else None,
             )
 
-        user_id = str(current_user.get("id") or "")
-        if not user_id:
-            return []
-
         def _query_lead_notes():
             with db.engine.connect() as conn:
+                role = str(current_user.get("role") or "").strip().lower()
                 sql = (
                     "SELECT n.* FROM notes n "
                     "JOIN leads l ON l.id = n.entity_id "
-                    "WHERE n.entity_type = 'lead' AND l.owner_id = :uid "
                 )
-                params: dict[str, Any] = {"uid": user_id}
+                params: dict[str, Any] = {}
+
+                if role in {"manager", "sales_manager"}:
+                    sql += (
+                        "JOIN team_members tm ON tm.agent_id = l.owner_id "
+                        "JOIN teams t ON t.id = tm.team_id "
+                        "WHERE t.manager_id = :mid "
+                    )
+                    params["mid"] = str(current_user.get("id") or "")
+                else:
+                    sql += "WHERE l.owner_id = :uid "
+                    params["uid"] = str(current_user.get("id") or "")
+
+                sql += "AND n.entity_type = 'lead' "
                 if entity_id:
                     sql += "AND n.entity_id = :entity_id "
                     params["entity_id"] = str(entity_id)
@@ -134,7 +131,7 @@ async def get_note(
     if _is_lead_note(note.get("entity_type")):
         if _can_manage_lead_notes(current_user):
             return note
-        can_access = await _is_lead_owner(db, current_user, str(note.get("entity_id")))
+        can_access = await _can_access_lead(db, current_user, str(note.get("entity_id")))
         if not can_access:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
     return note
@@ -152,7 +149,7 @@ async def create_note(
     note_data = payload.model_dump()
     if _is_lead_note(note_data.get("entity_type")):
         if not _can_manage_lead_notes(current_user):
-            can_create = await _is_lead_owner(db, current_user, str(note_data["entity_id"]))
+            can_create = await _can_access_lead(db, current_user, str(note_data["entity_id"]))
             if not can_create:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -194,7 +191,7 @@ async def update_note(
     existing_note = await repository.get_by_id(note_id)
     if _is_lead_note(existing_note.get("entity_type")):
         if not _can_manage_lead_notes(current_user):
-            can_access = await _is_lead_owner(db, current_user, str(existing_note.get("entity_id")))
+            can_access = await _can_access_lead(db, current_user, str(existing_note.get("entity_id")))
             if not can_access:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
@@ -223,7 +220,7 @@ async def delete_note(
     existing_note = await repository.get_by_id(note_id)
     if _is_lead_note(existing_note.get("entity_type")):
         if not _can_manage_lead_notes(current_user):
-            can_access = await _is_lead_owner(db, current_user, str(existing_note.get("entity_id")))
+            can_access = await _can_access_lead(db, current_user, str(existing_note.get("entity_id")))
             if not can_access:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 

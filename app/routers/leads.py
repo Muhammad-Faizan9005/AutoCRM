@@ -13,8 +13,10 @@ from app.auth.dependencies import require_admin, require_auth
 from app.database import get_db, run_db_operation
 from app.exceptions.custom_exceptions import ResourceNotFoundError
 from app.repositories.deal_repository import DealRepository
+from app.repositories.call_repository import CallRepository
 from app.repositories.lead_repository import LeadRepository
 from app.schemas.deal import DealResponse
+from app.schemas.call import CallSessionResponse
 from app.schemas.lead import LeadBulkAssignRequest, LeadConvertRequest, LeadCreate, LeadResponse, LeadUpdate
 from app.services.conversion_service import ConversionService
 from app.services.import_service import ImportService
@@ -22,6 +24,7 @@ from app.services.notification_service import NotificationService
 from app.services.email_service import MailjetEmailService
 from app.services.status_change_log_service import StatusChangeLogService
 from app.utils.statuses import LEAD_STATUSES, normalize_status
+from app.utils.team_access import can_access_lead, is_manager_of_rep
 
 router = APIRouter()
 
@@ -32,6 +35,10 @@ def get_lead_repository(db: Client = Depends(get_db)) -> LeadRepository:
 
 def get_deal_repository(db: Client = Depends(get_db)) -> DealRepository:
     return DealRepository(db)
+
+
+def get_call_repository(db: Client = Depends(get_db)) -> CallRepository:
+    return CallRepository(db)
 
 
 def get_import_service(db: Client = Depends(get_db)) -> ImportService:
@@ -56,7 +63,7 @@ def get_status_log_service(db: Client = Depends(get_db)) -> StatusChangeLogServi
 
 def _can_manage_leads(current_user: dict) -> bool:
     role = str(current_user.get("role") or "").strip().lower()
-    return role in {"admin", "sales_manager", "manager"}
+    return role == "admin"
 
 
 async def _get_lead_profile(db: Client, lead_id: str) -> dict[str, str | None]:
@@ -78,31 +85,13 @@ async def _get_lead_profile(db: Client, lead_id: str) -> dict[str, str | None]:
 
 
 async def _assert_can_view_lead(db: Client, current_user: dict, lead_id: str) -> None:
-    if _can_manage_leads(current_user):
+    if await can_access_lead(db, current_user, lead_id):
         return
-    requester_id = str(current_user.get("id") or "")
-    if not requester_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
-    profile = await _get_lead_profile(db, lead_id)
-    owner_id = profile.get("owner_id")
-    if not owner_id or owner_id != requester_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
 
 async def _can_manager_assign_to_rep(db: Client, manager_id: str, rep_id: str) -> bool:
-    def _query():
-        with db.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT 1 FROM team_members tm "
-                    "JOIN teams t ON t.id = tm.team_id "
-                    "WHERE t.manager_id = :mid AND tm.agent_id = :rid LIMIT 1"
-                ),
-                {"mid": manager_id, "rid": rep_id},
-            ).first()
-            return bool(row)
-
-    return await run_db_operation(_query)
+    return await is_manager_of_rep(db, manager_id, rep_id)
 
 
 async def _assert_lead_assignment_permissions(
@@ -138,14 +127,47 @@ async def get_leads(
     organization_id: UUID | None = None,
     source: str | None = None,
     search: str | None = None,
+    db: Client = Depends(get_db),
     current_user: dict = Depends(require_auth),
     repository: LeadRepository = Depends(get_lead_repository),
 ):
     """Get leads with optional filtering."""
+    role = str(current_user.get("role") or "").strip().lower()
+    requester_id = str(current_user.get("id") or "")
+    if not requester_id:
+        return []
+
+    if role in {"manager", "sales_manager"}:
+        def _query_team_leads():
+            with db.engine.connect() as conn:
+                sql = (
+                    "SELECT l.* FROM leads l "
+                    "JOIN team_members tm ON tm.agent_id = l.owner_id "
+                    "JOIN teams t ON t.id = tm.team_id "
+                    "WHERE t.manager_id = :mid "
+                )
+                params: dict[str, Any] = {"mid": requester_id}
+                if status:
+                    sql += "AND l.status = :status "
+                    params["status"] = status
+                if organization_id:
+                    sql += "AND l.organization_id = :org_id "
+                    params["org_id"] = str(organization_id)
+                if source:
+                    sql += "AND l.source = :source "
+                    params["source"] = source
+                if search:
+                    sql += "AND l.name ILIKE :search "
+                    params["search"] = f"%{search}%"
+                sql += "ORDER BY l.created_at DESC OFFSET :skip LIMIT :limit"
+                params["skip"] = skip
+                params["limit"] = limit
+                rows = conn.execute(text(sql), params).mappings().all()
+                return [dict(row) for row in rows]
+
+        return await run_db_operation(_query_team_leads)
+
     if not _can_manage_leads(current_user):
-        requester_id = str(current_user.get("id") or "")
-        if not requester_id:
-            return []
         owner_id = UUID(requester_id)
 
     return await repository.list_leads(
@@ -165,7 +187,8 @@ async def get_assignment_reps(
     current_user: dict = Depends(require_auth),
 ):
     """List reps available for lead assignment."""
-    if not _can_manage_leads(current_user):
+    role = str(current_user.get("role") or "").strip().lower()
+    if role not in {"admin", "manager", "sales_manager"}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
     def _query():
@@ -200,9 +223,11 @@ async def get_assignment_reps(
 async def get_lead(
     lead_id: UUID,
     current_user: dict = Depends(require_auth),
+    db: Client = Depends(get_db),
     repository: LeadRepository = Depends(get_lead_repository),
 ):
     """Get a lead by ID."""
+    await _assert_can_view_lead(db, current_user, str(lead_id))
     return await repository.get_by_id(lead_id)
 
 
@@ -522,30 +547,13 @@ async def get_lead_emails(
     ]
 
 
-@router.get("/{lead_id}/calls")
+@router.get("/{lead_id}/calls", response_model=List[CallSessionResponse])
 async def get_lead_calls(
     lead_id: UUID,
     db: Client = Depends(get_db),
     current_user: dict = Depends(require_auth),
+    repository: CallRepository = Depends(get_call_repository),
 ):
-    """Mock call timeline for a lead."""
+    """Call timeline for a lead."""
     await _assert_can_view_lead(db, current_user, str(lead_id))
-    now = datetime.now(timezone.utc)
-    return [
-        {
-            "id": f"call-{lead_id}-1",
-            "direction": "outbound",
-            "duration_seconds": 420,
-            "started_at": (now - timedelta(days=5, hours=1)).isoformat(),
-            "outcome": "Connected",
-            "note": "Discussed onboarding timeline and next steps.",
-        },
-        {
-            "id": f"call-{lead_id}-2",
-            "direction": "inbound",
-            "duration_seconds": 180,
-            "started_at": (now - timedelta(days=1, hours=6)).isoformat(),
-            "outcome": "Left voicemail",
-            "note": "Follow up needed on pricing questions.",
-        },
-    ]
+    return await repository.list_calls_by_lead(lead_id=str(lead_id), skip=0, limit=50)

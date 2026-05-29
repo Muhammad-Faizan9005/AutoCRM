@@ -1,5 +1,8 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import get_db, run_db_operation
@@ -12,11 +15,15 @@ from app.utils.logger import configure_logging
 
 configure_logging(settings.DEBUG)
 
+os.makedirs(settings.CALL_RECORDINGS_DIR, exist_ok=True)
+
 app = FastAPI(
     title="AutoCRM API",
     description="AI-Powered Customer Relationship Management System",
     version="1.0.0"
 )
+
+app.mount("/static", StaticFiles(directory="storage"), name="static")
 
 # CORS middleware for frontend integration — register early so preflight
 # requests receive CORS headers before any custom middleware intercepts them.
@@ -62,7 +69,7 @@ async def health_check():
 
 
 # Include routers
-from app.routers import auth, customers, deals, imports, leads, notes, organizations, tasks, tickets, users, dashboard, admin, teams, notifications, invites
+from app.routers import auth, customers, deals, imports, leads, notes, organizations, tasks, tickets, users, dashboard, admin, teams, notifications, invites, calls
 
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(users.router, prefix="/api/users", tags=["Users"])
@@ -79,3 +86,4 @@ app.include_router(invites.router, prefix="/api/invites", tags=["Invites"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
 app.include_router(admin.router, prefix="/api/admin", tags=["Admin"])
 app.include_router(teams.router, prefix="/api/admin/teams", tags=["Teams"])
+app.include_router(calls.router, prefix="/api/calls", tags=["Calls"])

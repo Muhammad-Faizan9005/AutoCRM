@@ -225,6 +225,41 @@ CREATE TABLE status_change_logs (
 );
 
 -- =============================================
+-- CALL SESSIONS (Browser-to-browser audio)
+-- =============================================
+CREATE TABLE call_sessions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    lead_id UUID REFERENCES leads(id) ON DELETE SET NULL,
+    initiated_by UUID REFERENCES agents(id) ON DELETE SET NULL,
+    room_id VARCHAR(64) UNIQUE NOT NULL,
+    direction VARCHAR(20) DEFAULT 'outbound' CHECK (direction IN ('outbound', 'inbound')),
+    status VARCHAR(20) DEFAULT 'created' CHECK (status IN ('created', 'active', 'ended', 'failed')),
+    outcome VARCHAR(100),
+    started_at TIMESTAMP WITH TIME ZONE,
+    ended_at TIMESTAMP WITH TIME ZONE,
+    duration_seconds INTEGER,
+    recording_path TEXT,
+    recording_mime VARCHAR(100),
+    recording_size INTEGER,
+    transcript TEXT,
+    processing_status VARCHAR(20) DEFAULT 'pending' CHECK (processing_status IN ('pending', 'processing', 'completed', 'failed')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- =============================================
+-- CALL ROOM TOKENS (short-lived)
+-- =============================================
+CREATE TABLE call_room_tokens (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    call_id UUID NOT NULL REFERENCES call_sessions(id) ON DELETE CASCADE,
+    issued_to VARCHAR(20) NOT NULL CHECK (issued_to IN ('agent', 'lead')),
+    token_hash VARCHAR(64) UNIQUE NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- =============================================
 -- INDEXES FOR PERFORMANCE
 -- =============================================
 CREATE INDEX idx_customers_email ON customers(email);
@@ -258,6 +293,11 @@ CREATE INDEX idx_status_change_logs_entity ON status_change_logs(entity_type, en
 CREATE INDEX idx_status_change_logs_created_at ON status_change_logs(created_at DESC);
 CREATE INDEX idx_teams_manager_id ON teams(manager_id);
 CREATE INDEX idx_team_members_team_id ON team_members(team_id);
+CREATE INDEX idx_call_sessions_lead_id ON call_sessions(lead_id);
+CREATE INDEX idx_call_sessions_started_at ON call_sessions(started_at DESC);
+CREATE INDEX idx_call_sessions_initiated_by ON call_sessions(initiated_by);
+CREATE INDEX idx_call_room_tokens_call_id ON call_room_tokens(call_id);
+CREATE INDEX idx_call_room_tokens_expires_at ON call_room_tokens(expires_at);
 CREATE INDEX idx_team_members_agent_id ON team_members(agent_id);
 CREATE INDEX idx_agents_team_id ON agents(team_id);
 
