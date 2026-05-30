@@ -80,6 +80,24 @@ CREATE TABLE agent_permissions (
 );
 
 -- =============================================
+-- DELETED USERS AUDIT TABLE
+-- =============================================
+CREATE TABLE deleted_users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    agent_id UUID UNIQUE,
+    email VARCHAR(255) NOT NULL,
+    full_name VARCHAR(255) NOT NULL,
+    role VARCHAR(50) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    team_id UUID,
+    permissions JSONB DEFAULT '{}'::jsonb,
+    permission_file VARCHAR(255),
+    deleted_by UUID REFERENCES agents(id) ON DELETE SET NULL,
+    deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'::jsonb
+);
+
+-- =============================================
 -- TEAMS TABLE (one team per sales manager)
 -- =============================================
 CREATE TABLE teams (
@@ -98,7 +116,8 @@ CREATE TABLE team_members (
     team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
     agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    PRIMARY KEY (team_id, agent_id)
+    PRIMARY KEY (team_id, agent_id),
+    CONSTRAINT unique_team_member_agent UNIQUE (agent_id)
 );
 
 -- Add FK from agents.team_id -> teams.id
@@ -272,6 +291,8 @@ CREATE INDEX idx_ticket_messages_ticket_id ON ticket_messages(ticket_id);
 CREATE INDEX idx_ai_interactions_ticket_id ON ai_interactions(ticket_id);
 CREATE INDEX idx_revoked_tokens_expires_at ON revoked_tokens(expires_at);
 CREATE INDEX idx_agent_permissions_user_id ON agent_permissions(user_id);
+CREATE INDEX idx_deleted_users_agent_id ON deleted_users(agent_id);
+CREATE INDEX idx_deleted_users_deleted_at ON deleted_users(deleted_at);
 CREATE INDEX idx_organizations_name ON organizations(name);
 CREATE INDEX idx_organizations_industry ON organizations(industry);
 CREATE INDEX idx_leads_status ON leads(status);
@@ -370,6 +391,7 @@ ALTER TABLE tickets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ticket_messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_permissions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE deleted_users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ai_interactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE revoked_tokens ENABLE ROW LEVEL SECURITY;
 ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
@@ -449,6 +471,11 @@ CREATE POLICY "agents_self_update"
 -- Revocation table is intended for backend service usage.
 CREATE POLICY "service_role_revoked_tokens_access"
     ON revoked_tokens FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY "service_role_deleted_users_access"
+    ON deleted_users FOR ALL TO service_role
     USING (true)
     WITH CHECK (true);
 

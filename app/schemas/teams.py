@@ -23,6 +23,7 @@ class TeamCreate(BaseModel):
 
 class TeamUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=2, max_length=255)
+    manager_id: Optional[UUID] = None
 
 
 class TeamList(BaseModel):

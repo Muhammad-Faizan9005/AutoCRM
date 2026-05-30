@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS team_members (
     team_id     UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
     agent_id    UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     joined_at   TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    PRIMARY KEY (team_id, agent_id)
+    PRIMARY KEY (team_id, agent_id),
+    CONSTRAINT unique_team_member_agent UNIQUE (agent_id)
 );
 
 -- =============================================

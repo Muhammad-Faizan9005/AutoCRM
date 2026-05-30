@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
 from supabase import Client
 
-from app.auth.dependencies import require_admin, require_auth
+from app.auth.dependencies import require_auth
 from app.database import get_db, run_db_operation
 from app.repositories.task_repository import TaskRepository
 from app.schemas.task import TaskCreate, TaskResponse, TaskUpdate
@@ -17,6 +17,8 @@ from app.utils.statuses import TASK_STATUSES, normalize_status
 from app.utils.team_access import can_access_lead, can_access_rep
 
 router = APIRouter()
+
+REP_TASK_STATUSES = {"in_progress", "done"}
 
 
 def get_task_repository(db: Client = Depends(get_db)) -> TaskRepository:
@@ -30,16 +32,20 @@ def get_email_service(db: Client = Depends(get_db)) -> MailjetEmailService:
     return MailjetEmailService(db)
 
 
-def _ensure_assignment_permissions(current_user: dict, assigned_to: UUID | None) -> None:
+def _has_task_write_role(current_user: dict) -> bool:
+    role = str(current_user.get("role") or "").strip().lower()
+    return role in {"admin", "manager", "sales_manager"}
+
+
+async def _ensure_assignment_permissions(db: Client, current_user: dict, assigned_to: UUID | None) -> None:
     if assigned_to is None:
         return
 
-    role = current_user.get("role")
-    requester_id = current_user.get("id")
-    if role in {"admin", "sales_manager"}:
+    role = str(current_user.get("role") or "").strip().lower()
+    if role == "admin":
         return
 
-    if requester_id and str(assigned_to) == str(requester_id):
+    if role in {"manager", "sales_manager"} and await can_access_rep(db, current_user, str(assigned_to)):
         return
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions to assign task")
@@ -48,6 +54,36 @@ def _ensure_assignment_permissions(current_user: dict, assigned_to: UUID | None)
 def _can_manage_all_tasks(current_user: dict) -> bool:
     role = str(current_user.get("role") or "").strip().lower()
     return role == "admin"
+
+
+async def _assert_can_write_existing_task(db: Client, current_user: dict, task: dict) -> None:
+    if not _has_task_write_role(current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions to manage tasks")
+
+    if _can_manage_all_tasks(current_user):
+        return
+
+    assigned_to = str(task.get("assigned_to") or "")
+    if assigned_to and await can_access_rep(db, current_user, assigned_to):
+        return
+
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions to manage this task")
+
+
+def _assert_can_update_own_task_status(current_user: dict, task: dict, update_data: dict[str, Any]) -> None:
+    if set(update_data.keys()) != {"status"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sales reps can only update task status")
+
+    if update_data.get("status") not in REP_TASK_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Sales reps can only set task status to in progress or done",
+        )
+
+    requester_id = str(current_user.get("id") or "")
+    assigned_to = str(task.get("assigned_to") or "")
+    if not requester_id or requester_id != assigned_to:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions to update this task")
 
 
 async def _can_access_lead(db: Client, current_user: dict, lead_id: str) -> bool:
@@ -156,18 +192,22 @@ async def get_task(
 @router.post("/", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 async def create_task(
     payload: TaskCreate,
+    db: Client = Depends(get_db),
     current_user: dict = Depends(require_auth),
     repository: TaskRepository = Depends(get_task_repository),
     notification_service: NotificationService = Depends(get_notification_service),
     email_service: MailjetEmailService = Depends(get_email_service),
 ):
     """Create a new task."""
+    if not _has_task_write_role(current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions to create tasks")
+
     task_data = payload.model_dump()
     try:
-        task_data["status"] = normalize_status(task_data.get("status") or "open", TASK_STATUSES)
+        task_data["status"] = normalize_status(task_data.get("status") or "backlog", TASK_STATUSES)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-    _ensure_assignment_permissions(current_user, task_data.get("assigned_to"))
+    await _ensure_assignment_permissions(db, current_user, task_data.get("assigned_to"))
 
     if task_data.get("assigned_to") is not None:
         task_data["assigned_to"] = str(task_data["assigned_to"])
@@ -206,6 +246,7 @@ async def create_task(
 async def update_task(
     task_id: UUID,
     payload: TaskUpdate,
+    db: Client = Depends(get_db),
     current_user: dict = Depends(require_auth),
     repository: TaskRepository = Depends(get_task_repository),
     notification_service: NotificationService = Depends(get_notification_service),
@@ -213,15 +254,6 @@ async def update_task(
 ):
     """Update a task."""
     existing_task = await repository.get_by_id(task_id)
-    if not _can_manage_all_tasks(current_user):
-        requester_id = str(current_user.get("id") or "")
-        task_assigned_to = str(existing_task.get("assigned_to") or "")
-        if not requester_id or task_assigned_to != requester_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Insufficient permissions to update this task",
-            )
-
     update_data = payload.model_dump(exclude_unset=True)
 
     if not update_data:
@@ -233,8 +265,13 @@ async def update_task(
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
+    if _has_task_write_role(current_user):
+        await _assert_can_write_existing_task(db, current_user, existing_task)
+    else:
+        _assert_can_update_own_task_status(current_user, existing_task, update_data)
+
     if "assigned_to" in update_data:
-        _ensure_assignment_permissions(current_user, update_data.get("assigned_to"))
+        await _ensure_assignment_permissions(db, current_user, update_data.get("assigned_to"))
         if update_data["assigned_to"] is not None:
             update_data["assigned_to"] = str(update_data["assigned_to"])
 
@@ -290,19 +327,7 @@ async def delete_task(
 ):
     """Delete a task."""
     existing_task = await repository.get_by_id(task_id)
-    if not _can_manage_all_tasks(current_user):
-        requester_id = str(current_user.get("id") or "")
-        task_assigned_to = str(existing_task.get("assigned_to") or "")
-        if (existing_task.get("entity_type") or "").strip().lower() == "lead":
-            is_owner = await _is_lead_owner(db, current_user, str(existing_task.get("entity_id")))
-            if is_owner:
-                await repository.delete_by_id(task_id)
-                return None
-        if not requester_id or task_assigned_to != requester_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Insufficient permissions to delete this task",
-            )
+    await _assert_can_write_existing_task(db, current_user, existing_task)
 
     await repository.delete_by_id(task_id)
     return None

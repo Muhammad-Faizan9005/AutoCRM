@@ -37,6 +37,7 @@ def upgrade() -> None:
                   sa.ForeignKey('agents.id', ondelete='CASCADE'), nullable=False),
         sa.Column('joined_at', sa.TIMESTAMP(timezone=True), server_default=sa.text('NOW()')),
         sa.PrimaryKeyConstraint('team_id', 'agent_id'),
+        sa.UniqueConstraint('agent_id', name='unique_team_member_agent'),
     )
 
     # 3. team_id column on agents

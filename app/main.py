@@ -19,7 +19,7 @@ os.makedirs(settings.CALL_RECORDINGS_DIR, exist_ok=True)
 
 app = FastAPI(
     title="AutoCRM API",
-    description="AI-Powered Customer Relationship Management System",
+    description="AI-Enabled Customer Relationship Management System",
     version="1.0.0"
 )
 
@@ -33,7 +33,10 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:3000",
         "https://auto-crm-frontend-pink.vercel.app",
-        "https://auto-crm-frontend-henna.vercel.app"
+        "https://auto-crm-frontend-henna.vercel.app",
+        "http://192.168.100.17:5173",
+        "http://172.21.32.1:5173",
+        "https://subsensuously-unhumored-ngoc.ngrok-free.dev"
     ],  # only allow known frontend origins
     allow_credentials=True,
     allow_methods=["*"],

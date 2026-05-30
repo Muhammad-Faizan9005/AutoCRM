@@ -16,7 +16,7 @@ class TaskBase(BaseModel):
     title: str = Field(..., min_length=2, max_length=255)
     description: Optional[str] = Field(default=None, max_length=5000)
     assigned_to: Optional[UUID] = None
-    status: Optional[str] = Field(default="open", max_length=50)
+    status: Optional[str] = Field(default="backlog", max_length=50)
     priority: Optional[str] = Field(default="medium", max_length=20)
     due_at: Optional[datetime] = None
 

@@ -21,6 +21,12 @@ from app.utils.team_access import can_access_rep
 router = APIRouter()
 
 
+def _normalize_deal_status(value: str | None) -> str | None:
+    if value is not None and str(value).strip().lower() == "qualified":
+        value = "qualification"
+    return normalize_status(value, DEAL_STATUSES)
+
+
 def get_deal_repository(db: Client = Depends(get_db)) -> DealRepository:
     return DealRepository(db)
 
@@ -164,14 +170,9 @@ async def create_deal(
 
     if "status" in deal_data and deal_data["status"] is not None:
         try:
-            deal_data["status"] = normalize_status(deal_data["status"], DEAL_STATUSES)
+            deal_data["status"] = _normalize_deal_status(deal_data["status"])
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-        if deal_data["status"] == "lost" and not deal_data.get("lost_reason"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Lost reason is required when status is lost",
-            )
 
     owner_id = deal_data.get("owner_id") or current_user.get("id")
     if owner_id:
@@ -187,7 +188,7 @@ async def create_deal(
         entity_type="deal",
         entity_id=str(created.get("id")),
         old_status=None,
-        new_status=created.get("status") or deal_data.get("status") or "qualified",
+        new_status=created.get("status") or deal_data.get("status") or "qualification",
         changed_by=str(current_user.get("id") or "") or None,
     )
     return created
@@ -207,7 +208,7 @@ async def update_deal(
     
     Special handling for status updates:
     - When status changes to "won", automatically converts deal to customer
-    - Sets closed_at timestamp for terminal statuses (won, lost)
+    - Sets closed_at timestamp for terminal statuses (won)
     """
     update_data = payload.model_dump(exclude_unset=True)
     existing = await repository.get_by_id(deal_id)
@@ -229,16 +230,9 @@ async def update_deal(
     if "status" in update_data:
         try:
             try:
-                update_data["status"] = normalize_status(update_data["status"], DEAL_STATUSES)
+                update_data["status"] = _normalize_deal_status(update_data["status"])
             except ValueError as exc:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-            if update_data["status"] == "lost":
-                lost_reason = update_data.get("lost_reason") or existing.get("lost_reason")
-                if not lost_reason:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Lost reason is required when status is lost",
-                    )
             return await service.update_deal_status(
                 deal_id=str(deal_id),
                 new_status=update_data["status"],
