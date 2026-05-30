@@ -35,7 +35,7 @@ class ConversionService:
         self,
         *,
         lead_id: str,
-        stage: str = "qualified",
+        stage: str = "qualification",
         value: float | None = None,
         currency: str = "USD",
         expected_close_at: datetime | None = None,
@@ -53,7 +53,7 @@ class ConversionService:
 
         Args:
             lead_id: UUID of the lead to convert
-            stage: Deal stage (default: "qualified")
+            stage: Deal stage (default: "qualification")
             value: Deal value
             currency: Currency (default: "USD")
             expected_close_at: Expected close date
@@ -78,7 +78,7 @@ class ConversionService:
         deal_data = {
             "lead_id": str(lead_id),
             "stage": stage,
-            "status": "qualified",  # Always set to qualified when converting
+            "status": "qualification",
             "value": value,
             "currency": currency,
             "expected_close_at": expected_close_at,
@@ -91,7 +91,7 @@ class ConversionService:
             entity_type="deal",
             entity_id=str(deal.get("id")),
             old_status=None,
-            new_status=deal.get("status") or "qualified",
+            new_status=deal.get("status") or "qualification",
             changed_by=actor_id,
         )
 
@@ -201,7 +201,7 @@ class ConversionService:
 
         Args:
             deal_id: UUID of the deal
-            new_status: New status value (e.g., "won", "lost", "qualified")
+            new_status: New status value (e.g., "won", "ready_to_close", "qualification")
 
         Returns:
             Updated deal dict
@@ -218,7 +218,7 @@ class ConversionService:
         update_data = {"status": new_status.lower()}
 
         # Auto-set closed_at for terminal statuses
-        if new_status.lower() in ("won", "lost"):
+        if new_status.lower() == "won":
             update_data["closed_at"] = datetime.utcnow()
 
         updated_deal = await self.deal_repository.update_by_id(deal_id, update_data)

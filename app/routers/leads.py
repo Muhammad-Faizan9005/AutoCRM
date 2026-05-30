@@ -249,12 +249,6 @@ async def create_lead(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
-    if lead_data.get("status") == "lost" and not lead_data.get("lost_reason"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Lost reason is required when status is lost",
-        )
-
     owner_id = lead_data.get("owner_id") or current_user.get("id")
     if owner_id:
         lead_data["owner_id"] = str(owner_id)
@@ -318,14 +312,6 @@ async def update_lead(
             update_data["status"] = normalize_status(update_data["status"], LEAD_STATUSES)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-        if update_data["status"] == "lost":
-            lost_reason = update_data.get("lost_reason") or existing.get("lost_reason")
-            if not lost_reason:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Lost reason is required when status is lost",
-                )
-
     if not update_data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
 
@@ -451,7 +437,7 @@ async def convert_lead_to_deal(
     try:
         return await service.convert_lead_to_deal(
             lead_id=str(lead_id),
-            stage=payload.stage or "qualified",
+            stage=payload.stage or "qualification",
             value=payload.value,
             currency=payload.currency or "USD",
             expected_close_at=payload.expected_close_at,
@@ -472,7 +458,7 @@ async def discard_lead_deal(
     db: Client = Depends(get_db),
     service: ConversionService = Depends(get_conversion_service),
 ):
-    """Mark the latest deal for a lead as lost (manager/admin only)."""
+    """Mark the latest deal for a lead as unqualified (manager/admin only)."""
     if not _can_manage_leads(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
@@ -494,7 +480,7 @@ async def discard_lead_deal(
     try:
         return await service.update_deal_status(
             deal_id=deal_id,
-            new_status="lost",
+            new_status="qualification",
             actor_id=str(current_user.get("id") or "") or None,
         )
     except ResourceNotFoundError as exc:

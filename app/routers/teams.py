@@ -102,6 +102,26 @@ async def _get_team_members_with_stats(
     return await run_db_operation(_query)
 
 
+async def _get_agent_team_membership(db: PostgresClient, agent_id: str) -> dict[str, Any] | None:
+    def _query():
+        with db.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT tm.team_id, t.name AS team_name
+                    FROM team_members tm
+                    JOIN teams t ON t.id = tm.team_id
+                    WHERE tm.agent_id = :aid
+                    LIMIT 1
+                    """
+                ),
+                {"aid": agent_id},
+            ).mappings().first()
+        return dict(row) if row else None
+
+    return await run_db_operation(_query)
+
+
 def _build_team_response(team: dict[str, Any], member_count: int = 0) -> dict[str, Any]:
     return {
         "id": team["id"],
@@ -294,22 +314,64 @@ async def update_team(
     current_user: dict = Depends(require_permissions(["admin_users"])),
     db: PostgresClient = Depends(get_db),
 ):
-    """Rename a team."""
+    """Rename a team and, for admins, change its manager."""
     team = await _get_team_by_id(db, str(team_id))
     _assert_team_access(current_user, team)
 
-    if not payload.name:
+    if payload.name is None and payload.manager_id is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
+
+    new_manager_id = str(payload.manager_id) if payload.manager_id else None
+    if new_manager_id:
+        if not _is_admin(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only admins can change a team manager",
+            )
+
+        def _validate_manager():
+            with db.engine.connect() as conn:
+                manager = conn.execute(
+                    text("SELECT id, role, full_name, email FROM agents WHERE id = :mid AND status != 'disabled'"),
+                    {"mid": new_manager_id},
+                ).mappings().first()
+                existing_team = conn.execute(
+                    text("SELECT id FROM teams WHERE manager_id = :mid AND id != :tid"),
+                    {"mid": new_manager_id, "tid": str(team_id)},
+                ).first()
+            return (dict(manager) if manager else None), existing_team
+
+        manager, existing_team = await run_db_operation(_validate_manager)
+        if not manager:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Manager not found")
+
+        manager_role = str(manager.get("role") or "").strip().lower()
+        if manager_role not in {"sales_manager", "manager", "admin"}:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Team manager must be a manager or admin",
+            )
+
+        if existing_team:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This manager already has another team",
+            )
 
     def _update():
         with db.engine.begin() as conn:
-            conn.execute(
-                text("UPDATE teams SET name = :name WHERE id = :tid"),
-                {"name": payload.name, "tid": str(team_id)},
-            )
+            updates: list[str] = []
+            params: dict[str, Any] = {"tid": str(team_id)}
+            if payload.name is not None:
+                updates.append("name = :name")
+                params["name"] = payload.name
+            if new_manager_id:
+                updates.append("manager_id = :manager_id")
+                params["manager_id"] = new_manager_id
+            conn.execute(text(f"UPDATE teams SET {', '.join(updates)} WHERE id = :tid"), params)
 
     await run_db_operation(_update)
-    team["name"] = payload.name
+    team = await _get_team_by_id(db, str(team_id))
 
     def _count():
         with db.engine.connect() as conn:
@@ -354,9 +416,15 @@ async def add_team_member(
             detail="Only sales reps can be added to a team",
         )
 
+    existing_membership = await _get_agent_team_membership(db, str(payload.agent_id))
+    if existing_membership and str(existing_membership.get("team_id")) != str(team_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"This sales rep already belongs to {existing_membership.get('team_name') or 'another team'}",
+        )
+
     def _insert_member():
         with db.engine.begin() as conn:
-            # Upsert to avoid duplicate key errors
             conn.execute(
                 text(
                     "INSERT INTO team_members (team_id, agent_id) "

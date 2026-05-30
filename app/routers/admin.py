@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import secrets
 from typing import Any
 from uuid import UUID
@@ -18,6 +19,7 @@ from app.schemas.admin import (
     AdminUserList,
     AdminUserResponse,
     AdminUserUpdate,
+    DeletedUserList,
 )
 from app.schemas.failed_invite import FailedInviteResponse
 from app.schemas.permissions import PermissionSet, PermissionUpdate
@@ -36,6 +38,15 @@ async def _auto_assign_to_team(db: PostgresClient, team_id: str, agent_id: str) 
     """Add the agent to the given team (team_members + agents.team_id)."""
     def _exec():
         with db.engine.begin() as conn:
+            existing = conn.execute(
+                text("SELECT team_id FROM team_members WHERE agent_id = :aid AND team_id != :tid LIMIT 1"),
+                {"tid": team_id, "aid": agent_id},
+            ).first()
+            if existing:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This sales rep already belongs to another team",
+                )
             conn.execute(
                 text(
                     "INSERT INTO team_members (team_id, agent_id) "
@@ -47,6 +58,165 @@ async def _auto_assign_to_team(db: PostgresClient, team_id: str, agent_id: str) 
                 text("UPDATE agents SET team_id = :tid WHERE id = :aid"),
                 {"tid": team_id, "aid": agent_id},
             )
+    await run_db_operation(_exec)
+
+
+async def _ensure_deleted_users_table(db: PostgresClient) -> None:
+    def _exec():
+        with db.engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS deleted_users (
+                        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                        agent_id UUID UNIQUE,
+                        email VARCHAR(255) NOT NULL,
+                        full_name VARCHAR(255) NOT NULL,
+                        role VARCHAR(50) NOT NULL,
+                        status VARCHAR(20) NOT NULL,
+                        team_id UUID,
+                        permissions JSONB DEFAULT '{}'::jsonb,
+                        permission_file VARCHAR(255),
+                        deleted_by UUID REFERENCES agents(id) ON DELETE SET NULL,
+                        deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        metadata JSONB DEFAULT '{}'::jsonb
+                    )
+                    """
+                )
+            )
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deleted_users_agent_id ON deleted_users(agent_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deleted_users_deleted_at ON deleted_users(deleted_at)"))
+            conn.execute(text("ALTER TABLE deleted_users ENABLE ROW LEVEL SECURITY"))
+            conn.execute(text("DROP POLICY IF EXISTS service_role_deleted_users_access ON deleted_users"))
+            conn.execute(
+                text(
+                    """
+                    CREATE POLICY service_role_deleted_users_access
+                        ON deleted_users FOR ALL TO service_role
+                        USING (true)
+                        WITH CHECK (true)
+                    """
+                )
+            )
+
+    await run_db_operation(_exec)
+
+
+async def _get_permission_file(db: PostgresClient, user_id: str) -> str | None:
+    def _query():
+        with db.engine.connect() as conn:
+            if not conn.execute(text("SELECT to_regclass('public.agent_permissions')")).scalar():
+                return None
+            row = conn.execute(
+                text("SELECT permission_file FROM agent_permissions WHERE user_id = :user_id"),
+                {"user_id": user_id},
+            ).mappings().first()
+            return str(row.get("permission_file")) if row and row.get("permission_file") else None
+
+    return await run_db_operation(_query)
+
+
+async def _archive_and_unassign_deleted_user(
+    db: PostgresClient,
+    *,
+    target_user: dict[str, Any],
+    deleted_by: str | None,
+    permissions: dict[str, Any],
+    permission_file: str | None,
+) -> None:
+    await _ensure_deleted_users_table(db)
+
+    agent_id = str(target_user.get("id"))
+    permissions_json = json.dumps(permissions or {})
+
+    def _exec():
+        metadata: dict[str, int] = {}
+        with db.engine.begin() as conn:
+            def table_exists(table_name: str) -> bool:
+                return bool(conn.execute(text("SELECT to_regclass(:table_name)"), {"table_name": f"public.{table_name}"}).scalar())
+
+            result = conn.execute(text("UPDATE leads SET owner_id = NULL WHERE owner_id = :agent_id"), {"agent_id": agent_id})
+            metadata["unassigned_leads"] = int(result.rowcount or 0)
+
+            result = conn.execute(text("UPDATE deals SET owner_id = NULL WHERE owner_id = :agent_id"), {"agent_id": agent_id})
+            metadata["unassigned_deals"] = int(result.rowcount or 0)
+
+            result = conn.execute(text("UPDATE tasks SET assigned_to = NULL WHERE assigned_to = :agent_id"), {"agent_id": agent_id})
+            metadata["unassigned_tasks"] = int(result.rowcount or 0)
+
+            if table_exists("tickets"):
+                result = conn.execute(text("UPDATE tickets SET assigned_to = NULL WHERE assigned_to = :agent_id"), {"agent_id": agent_id})
+                metadata["unassigned_tickets"] = int(result.rowcount or 0)
+
+            if table_exists("notes"):
+                result = conn.execute(text("UPDATE notes SET author_id = NULL WHERE author_id = :agent_id"), {"agent_id": agent_id})
+                metadata["unassigned_notes"] = int(result.rowcount or 0)
+
+            if table_exists("call_sessions"):
+                result = conn.execute(text("UPDATE call_sessions SET initiated_by = NULL WHERE initiated_by = :agent_id"), {"agent_id": agent_id})
+                metadata["unassigned_calls"] = int(result.rowcount or 0)
+
+            if table_exists("status_change_logs"):
+                result = conn.execute(text("UPDATE status_change_logs SET changed_by = NULL WHERE changed_by = :agent_id"), {"agent_id": agent_id})
+                metadata["unassigned_status_logs"] = int(result.rowcount or 0)
+
+            if table_exists("notifications"):
+                result = conn.execute(text("DELETE FROM notifications WHERE recipient_id = :agent_id"), {"agent_id": agent_id})
+                metadata["deleted_notifications"] = int(result.rowcount or 0)
+                conn.execute(text("UPDATE notifications SET actor_id = NULL WHERE actor_id = :agent_id"), {"agent_id": agent_id})
+
+            if table_exists("email_logs"):
+                result = conn.execute(text("UPDATE email_logs SET recipient_id = NULL WHERE recipient_id = :agent_id"), {"agent_id": agent_id})
+                metadata["unassigned_email_logs"] = int(result.rowcount or 0)
+
+            if table_exists("email_preferences"):
+                conn.execute(text("DELETE FROM email_preferences WHERE user_id = :agent_id"), {"agent_id": agent_id})
+
+            if table_exists("team_members"):
+                conn.execute(text("DELETE FROM team_members WHERE agent_id = :agent_id"), {"agent_id": agent_id})
+            if table_exists("agent_invites"):
+                conn.execute(text("DELETE FROM agent_invites WHERE agent_id = :agent_id"), {"agent_id": agent_id})
+            if table_exists("agent_permissions"):
+                conn.execute(text("DELETE FROM agent_permissions WHERE user_id = :agent_id"), {"agent_id": agent_id})
+            conn.execute(text("DELETE FROM agents WHERE id = :agent_id"), {"agent_id": agent_id})
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO deleted_users (
+                        agent_id, email, full_name, role, status, team_id,
+                        permissions, permission_file, deleted_by, metadata
+                    )
+                    VALUES (
+                        :agent_id, :email, :full_name, :role, :status, :team_id,
+                        CAST(:permissions AS JSONB), :permission_file, :deleted_by, CAST(:metadata AS JSONB)
+                    )
+                    ON CONFLICT (agent_id) DO UPDATE SET
+                        email = EXCLUDED.email,
+                        full_name = EXCLUDED.full_name,
+                        role = EXCLUDED.role,
+                        status = EXCLUDED.status,
+                        team_id = EXCLUDED.team_id,
+                        permissions = EXCLUDED.permissions,
+                        permission_file = EXCLUDED.permission_file,
+                        deleted_by = EXCLUDED.deleted_by,
+                        deleted_at = NOW(),
+                        metadata = EXCLUDED.metadata
+                    """
+                ),
+                {
+                    "agent_id": agent_id,
+                    "email": str(target_user.get("email") or ""),
+                    "full_name": str(target_user.get("full_name") or target_user.get("email") or "Deleted user"),
+                    "role": str(target_user.get("role") or "agent"),
+                    "status": str(target_user.get("status") or "disabled"),
+                    "team_id": str(target_user.get("team_id")) if target_user.get("team_id") else None,
+                    "permissions": permissions_json,
+                    "permission_file": permission_file,
+                    "deleted_by": deleted_by,
+                    "metadata": json.dumps(metadata),
+                },
+            )
+
     await run_db_operation(_exec)
 
 
@@ -128,6 +298,7 @@ def _to_admin_user(user: dict[str, Any]) -> dict[str, Any]:
         "email": user.get("email"),
         "role": _map_role_output(user.get("role")),
         "status": _resolve_status(user),
+        "team_id": user.get("team_id"),
     }
 
 
@@ -149,6 +320,7 @@ async def list_admin_users(
     invite_service: InviteService = Depends(get_invite_service),
 ):
     await invite_service.cleanup_expired_invites()
+    await _ensure_deleted_users_table(db)
     requester_is_admin = _is_admin(current_user)
     safe_page = max(page, 1)
     safe_page_size = max(1, min(page_size, 200))
@@ -157,6 +329,12 @@ async def list_admin_users(
     def _query() -> tuple[list[dict[str, Any]], int]:
         clauses: list[str] = []
         params: dict[str, Any] = {}
+        clauses.append(
+            "id NOT IN ("
+            "  SELECT agent_id FROM deleted_users "
+            "  WHERE to_regclass('public.deleted_users') IS NOT NULL AND agent_id IS NOT NULL"
+            ")"
+        )
         if search:
             clauses.append("(email ILIKE :term OR full_name ILIKE :term OR role ILIKE :term)")
             params["term"] = f"%{search}%"
@@ -195,6 +373,38 @@ async def list_admin_users(
         "items": [_to_admin_user(user) for user in users],
         "total": total,
     }
+
+
+@router.get("/deleted-users", response_model=DeletedUserList)
+async def list_deleted_users(
+    page: int = 1,
+    page_size: int = 50,
+    current_user: dict = Depends(require_permissions(["admin_users"])),
+    db: PostgresClient = Depends(get_db),
+):
+    await _ensure_deleted_users_table(db)
+    safe_page = max(page, 1)
+    safe_page_size = max(1, min(page_size, 200))
+    offset = (safe_page - 1) * safe_page_size
+
+    def _query() -> tuple[list[dict[str, Any]], int]:
+        with db.engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT *
+                    FROM deleted_users
+                    ORDER BY deleted_at DESC
+                    OFFSET :offset LIMIT :limit
+                    """
+                ),
+                {"offset": offset, "limit": safe_page_size},
+            ).mappings().all()
+            total = conn.execute(text("SELECT COUNT(*) FROM deleted_users")).scalar()
+        return [dict(row) for row in rows], int(total or 0)
+
+    rows, total = await run_db_operation(_query)
+    return {"items": rows, "total": total}
 
 
 @router.post("/users", response_model=AdminUserResponse, status_code=status.HTTP_201_CREATED)
@@ -288,6 +498,11 @@ async def create_admin_user(
             agent_id=str(created["id"]),
         )
 
+    created = await repository.update_by_id(
+        str(created["id"]),
+        {"is_active": is_active, "status": status_value},
+    )
+
     if status_value == "invited":
         await invite_service.create_invite(
             agent_id=str(created["id"]),
@@ -350,14 +565,22 @@ async def delete_admin_user(
     user_id: UUID,
     current_user: dict = Depends(require_permissions(["admin_users"])),
     repository: UserRepository = Depends(get_user_repository),
-    invite_service: InviteService = Depends(get_invite_service),
+    permission_service: PermissionService = Depends(get_permission_service),
 ):
     target_user = await repository.get_by_id(str(user_id))
     _assert_manager_scope_for_target(current_user, target_user)
-    if str(target_user.get("status")) == "invited":
-        await invite_service.revoke_invited_user(str(user_id), reason="revoked")
-        return None
-    await repository.update_by_id(str(user_id), {"is_active": False, "status": "disabled"})
+    if str(current_user.get("id") or "") == str(user_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot delete your own account")
+
+    permissions = await permission_service.get_effective_permissions(target_user)
+    permission_file = await _get_permission_file(repository.db, str(user_id))
+    await _archive_and_unassign_deleted_user(
+        repository.db,
+        target_user=target_user,
+        deleted_by=str(current_user.get("id")) if current_user.get("id") else None,
+        permissions=permissions,
+        permission_file=permission_file,
+    )
     invalidate_user_cache(str(user_id))
     return None
 

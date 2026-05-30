@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
@@ -16,10 +16,30 @@ class AdminUserResponse(BaseModel):
     email: EmailStr
     role: str
     status: AdminStatus
+    team_id: Optional[UUID] = None
 
 
 class AdminUserList(BaseModel):
     items: List[AdminUserResponse]
+    total: int
+
+
+class DeletedUserResponse(BaseModel):
+    id: UUID
+    agent_id: Optional[UUID] = None
+    full_name: str
+    email: EmailStr
+    role: str
+    status: str
+    permissions: dict[str, Any] = Field(default_factory=dict)
+    permission_file: Optional[str] = None
+    deleted_by: Optional[UUID] = None
+    deleted_at: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DeletedUserList(BaseModel):
+    items: List[DeletedUserResponse]
     total: int
 
 
