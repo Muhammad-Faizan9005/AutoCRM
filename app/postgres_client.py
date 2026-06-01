@@ -245,8 +245,8 @@ class PostgresQueryBuilder:
 class PostgresClient:
     def __init__(self, database_url: str):
         # Configure connection pool for stability:
-        # - pool_size: Number of connections to keep in pool (20 for moderate load)
-        # - max_overflow: Additional connections beyond pool_size (30 for spikes)
+        # - pool_size: Number of connections to keep in pool (small for Supabase pooler)
+        # - max_overflow: Additional connections beyond pool_size
         # - pool_timeout: Seconds to wait for a free connection from pool (30s max)
         # - pool_recycle: Recycle connections after 3600 seconds (1 hour) to prevent stale connections
         # - pool_pre_ping: Verify connection health before using it (prevents "connection closed" errors)
@@ -254,8 +254,8 @@ class PostgresClient:
             database_url,
             future=True,
             poolclass=QueuePool,
-            pool_size=20,
-            max_overflow=30,
+            pool_size=5,
+            max_overflow=5,
             pool_timeout=30,
             pool_recycle=3600,
             pool_pre_ping=True,
