@@ -15,29 +15,48 @@ def _is_manager_role(role: str | None) -> bool:
 
 
 async def is_manager_of_rep(db: Client, manager_id: str, rep_id: str) -> bool:
+    if not manager_id or not rep_id:
+        return False
+
     def _query():
-        with db.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT 1 FROM team_members tm "
-                    "JOIN teams t ON t.id = tm.team_id "
-                    "WHERE t.manager_id = :mid AND tm.agent_id = :rid LIMIT 1"
-                ),
-                {"mid": manager_id, "rid": rep_id},
-            ).first()
-            return bool(row)
+        engine = getattr(db, "engine", None)
+        if engine is not None:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT 1 FROM team_members tm "
+                        "JOIN teams t ON t.id = tm.team_id "
+                        "WHERE t.manager_id = :mid AND tm.agent_id = :rid LIMIT 1"
+                    ),
+                    {"mid": manager_id, "rid": rep_id},
+                ).first()
+                return bool(row)
+
+        teams = db.table("teams").select("*").eq("manager_id", manager_id).execute().data or []
+        team_ids = {str(team.get("id")) for team in teams}
+        if not team_ids:
+            return False
+
+        memberships = db.table("team_members").select("*").eq("agent_id", rep_id).execute().data or []
+        return any(str(member.get("team_id")) in team_ids for member in memberships)
 
     return await run_db_operation(_query)
 
 
 async def get_lead_owner_id(db: Client, lead_id: str) -> str | None:
     def _query():
-        with db.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT owner_id FROM leads WHERE id = :lead_id"),
-                {"lead_id": lead_id},
-            ).mappings().first()
-            return str(row.get("owner_id")) if row and row.get("owner_id") else None
+        engine = getattr(db, "engine", None)
+        if engine is not None:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT owner_id FROM leads WHERE id = :lead_id"),
+                    {"lead_id": lead_id},
+                ).mappings().first()
+                return str(row.get("owner_id")) if row and row.get("owner_id") else None
+
+        rows = db.table("leads").select("*").eq("id", lead_id).limit(1).execute().data or []
+        row = rows[0] if rows else None
+        return str(row.get("owner_id")) if row and row.get("owner_id") else None
 
     return await run_db_operation(_query)
 
@@ -69,6 +88,9 @@ async def can_access_rep(db: Client, current_user: dict, rep_id: str) -> bool:
 
     if _is_admin_role(current_user.get("role")):
         return True
+
+    if not rep_id:
+        return _is_manager_role(current_user.get("role"))
 
     if user_id == rep_id:
         return True

@@ -16,7 +16,7 @@ class DealBase(BaseModel):
     organization_id: Optional[UUID] = None
     customer_id: Optional[UUID] = None
     stage: Optional[str] = Field(default="prospecting", max_length=50)
-    status: Optional[str] = Field(default="qualification", max_length=50)
+    status: Optional[str] = Field(default="qualified", max_length=50)
     value: Optional[float] = Field(default=None, ge=0)
     currency: Optional[str] = Field(default="USD", max_length=10)
     expected_close_at: Optional[datetime] = None

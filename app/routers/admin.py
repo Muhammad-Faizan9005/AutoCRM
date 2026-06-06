@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 from typing import Any
@@ -33,6 +34,9 @@ from app.utils.cache import invalidate_user_cache
 
 router = APIRouter()
 
+_deleted_users_table_ready = False
+_deleted_users_table_lock = asyncio.Lock()
+
 
 async def _auto_assign_to_team(db: PostgresClient, team_id: str, agent_id: str) -> None:
     """Add the agent to the given team (team_members + agents.team_id)."""
@@ -62,44 +66,87 @@ async def _auto_assign_to_team(db: PostgresClient, team_id: str, agent_id: str) 
 
 
 async def _ensure_deleted_users_table(db: PostgresClient) -> None:
-    def _exec():
-        with db.engine.begin() as conn:
-            conn.execute(
-                text(
-                    """
-                    CREATE TABLE IF NOT EXISTS deleted_users (
-                        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-                        agent_id UUID UNIQUE,
-                        email VARCHAR(255) NOT NULL,
-                        full_name VARCHAR(255) NOT NULL,
-                        role VARCHAR(50) NOT NULL,
-                        status VARCHAR(20) NOT NULL,
-                        team_id UUID,
-                        permissions JSONB DEFAULT '{}'::jsonb,
-                        permission_file VARCHAR(255),
-                        deleted_by UUID REFERENCES agents(id) ON DELETE SET NULL,
-                        deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                        metadata JSONB DEFAULT '{}'::jsonb
-                    )
-                    """
-                )
-            )
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deleted_users_agent_id ON deleted_users(agent_id)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deleted_users_deleted_at ON deleted_users(deleted_at)"))
-            conn.execute(text("ALTER TABLE deleted_users ENABLE ROW LEVEL SECURITY"))
-            conn.execute(text("DROP POLICY IF EXISTS service_role_deleted_users_access ON deleted_users"))
-            conn.execute(
-                text(
-                    """
-                    CREATE POLICY service_role_deleted_users_access
-                        ON deleted_users FOR ALL TO service_role
-                        USING (true)
-                        WITH CHECK (true)
-                    """
-                )
-            )
+    global _deleted_users_table_ready
+    if _deleted_users_table_ready:
+        return
 
-    await run_db_operation(_exec)
+    async with _deleted_users_table_lock:
+        if _deleted_users_table_ready:
+            return
+
+        def _is_ready():
+            with db.engine.connect() as conn:
+                table_exists = conn.execute(text("SELECT to_regclass('public.deleted_users')")).scalar()
+                if not table_exists:
+                    return False
+                policy_exists = conn.execute(
+                    text(
+                        """
+                        SELECT 1
+                        FROM pg_policies
+                        WHERE schemaname = 'public'
+                          AND tablename = 'deleted_users'
+                          AND policyname = 'service_role_deleted_users_access'
+                        LIMIT 1
+                        """
+                    )
+                ).scalar()
+                return bool(policy_exists)
+
+        if await run_db_operation(_is_ready):
+            _deleted_users_table_ready = True
+            return
+
+        def _exec():
+            with db.engine.begin() as conn:
+                conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('autocrm_deleted_users_schema'))"))
+                conn.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS deleted_users (
+                            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                            agent_id UUID UNIQUE,
+                            email VARCHAR(255) NOT NULL,
+                            full_name VARCHAR(255) NOT NULL,
+                            role VARCHAR(50) NOT NULL,
+                            status VARCHAR(20) NOT NULL,
+                            team_id UUID,
+                            permissions JSONB DEFAULT '{}'::jsonb,
+                            permission_file VARCHAR(255),
+                            deleted_by UUID REFERENCES agents(id) ON DELETE SET NULL,
+                            deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                            metadata JSONB DEFAULT '{}'::jsonb
+                        )
+                        """
+                    )
+                )
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deleted_users_agent_id ON deleted_users(agent_id)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deleted_users_deleted_at ON deleted_users(deleted_at)"))
+                conn.execute(text("ALTER TABLE deleted_users ENABLE ROW LEVEL SECURITY"))
+                conn.execute(
+                    text(
+                        """
+                        DO $policy$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1
+                                FROM pg_policies
+                                WHERE schemaname = 'public'
+                                  AND tablename = 'deleted_users'
+                                  AND policyname = 'service_role_deleted_users_access'
+                            ) THEN
+                                CREATE POLICY service_role_deleted_users_access
+                                    ON deleted_users FOR ALL TO service_role
+                                    USING (true)
+                                    WITH CHECK (true);
+                            END IF;
+                        END $policy$;
+                        """
+                    )
+                )
+
+        await run_db_operation(_exec)
+        _deleted_users_table_ready = True
 
 
 async def _get_permission_file(db: PostgresClient, user_id: str) -> str | None:

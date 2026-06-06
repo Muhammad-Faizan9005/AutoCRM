@@ -484,6 +484,119 @@ CREATE POLICY "service_role_agent_permissions_access"
     USING (true)
     WITH CHECK (true);
 
+-- AI agent control plane tables
+CREATE TABLE IF NOT EXISTS ai_agent_runs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    external_run_id UUID UNIQUE,
+    trigger_type VARCHAR(100) NOT NULL,
+    entity_id UUID NOT NULL,
+    entity_type VARCHAR(50) NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'running',
+    event_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    context_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    plan_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    summary TEXT,
+    failure_cause VARCHAR(100),
+    failure_detail TEXT,
+    started_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    finished_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TABLE IF NOT EXISTS ai_agent_run_traces (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    run_id UUID REFERENCES ai_agent_runs(id) ON DELETE CASCADE,
+    external_run_id UUID,
+    step VARCHAR(100) NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'completed',
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ai_agent_actions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    run_id UUID REFERENCES ai_agent_runs(id) ON DELETE SET NULL,
+    external_run_id UUID,
+    action_type VARCHAR(50) NOT NULL,
+    entity_type VARCHAR(50) NOT NULL,
+    entity_id UUID NOT NULL,
+    reason TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    idempotency_key VARCHAR(128) UNIQUE,
+    approval_status VARCHAR(50) NOT NULL DEFAULT 'auto_approved',
+    dispatch_status VARCHAR(50) NOT NULL DEFAULT 'not_dispatched',
+    created_by UUID REFERENCES agents(id) ON DELETE SET NULL,
+    crm_record_type VARCHAR(50),
+    crm_record_id UUID,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    executed_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TABLE IF NOT EXISTS ai_agent_approval_requests (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    action_id UUID NOT NULL REFERENCES ai_agent_actions(id) ON DELETE CASCADE,
+    state VARCHAR(50) NOT NULL DEFAULT 'pending',
+    requested_by UUID REFERENCES agents(id) ON DELETE SET NULL,
+    approver_id UUID REFERENCES agents(id) ON DELETE SET NULL,
+    reason TEXT,
+    approver_note TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    decided_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_agent_runs_entity ON ai_agent_runs(entity_id, entity_type);
+CREATE INDEX IF NOT EXISTS idx_ai_agent_runs_status ON ai_agent_runs(status);
+CREATE INDEX IF NOT EXISTS idx_ai_agent_run_traces_run ON ai_agent_run_traces(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_ai_agent_actions_entity ON ai_agent_actions(entity_id, entity_type);
+CREATE INDEX IF NOT EXISTS idx_ai_agent_actions_approval ON ai_agent_actions(approval_status);
+CREATE INDEX IF NOT EXISTS idx_ai_agent_approvals_state ON ai_agent_approval_requests(state);
+
+ALTER TABLE ai_agent_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai_agent_run_traces ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai_agent_actions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai_agent_approval_requests ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "ai_agent_runs_service_role_access"
+    ON ai_agent_runs FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY "ai_agent_run_traces_service_role_access"
+    ON ai_agent_run_traces FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY "ai_agent_actions_service_role_access"
+    ON ai_agent_actions FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY "ai_agent_approval_requests_service_role_access"
+    ON ai_agent_approval_requests FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE TABLE IF NOT EXISTS ai_agent_settings (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    agent_type VARCHAR(100) NOT NULL UNIQUE,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    updated_by UUID REFERENCES agents(id) ON DELETE SET NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+INSERT INTO ai_agent_settings (agent_type, enabled)
+VALUES
+    ('lead_assistant', true),
+    ('deal_risk_watcher', true),
+    ('daily_summary_assistant', true)
+ON CONFLICT (agent_type) DO NOTHING;
+
+ALTER TABLE ai_agent_settings ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "ai_agent_settings_service_role_access"
+    ON ai_agent_settings FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);
+
 CREATE POLICY "service_role_teams_access"
     ON teams FOR ALL TO service_role
     USING (true)

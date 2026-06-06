@@ -78,7 +78,7 @@ class ConversionService:
         deal_data = {
             "lead_id": str(lead_id),
             "stage": stage,
-            "status": "qualification",
+            "status": "qualified",
             "value": value,
             "currency": currency,
             "expected_close_at": expected_close_at,
@@ -91,7 +91,7 @@ class ConversionService:
             entity_type="deal",
             entity_id=str(deal.get("id")),
             old_status=None,
-            new_status=deal.get("status") or "qualification",
+            new_status=deal.get("status") or "qualified",
             changed_by=actor_id,
         )
 
