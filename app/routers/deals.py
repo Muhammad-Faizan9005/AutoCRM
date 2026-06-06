@@ -22,8 +22,6 @@ router = APIRouter()
 
 
 def _normalize_deal_status(value: str | None) -> str | None:
-    if value is not None and str(value).strip().lower() == "qualified":
-        value = "qualification"
     return normalize_status(value, DEAL_STATUSES)
 
 
@@ -188,7 +186,7 @@ async def create_deal(
         entity_type="deal",
         entity_id=str(created.get("id")),
         old_status=None,
-        new_status=created.get("status") or deal_data.get("status") or "qualification",
+        new_status=created.get("status") or deal_data.get("status") or "qualified",
         changed_by=str(current_user.get("id") or "") or None,
     )
     return created

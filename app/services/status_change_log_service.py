@@ -40,17 +40,26 @@ class StatusChangeLogService:
         }
 
         def _exec():
-            with self.db.engine.begin() as conn:
-                conn.execute(
-                    text(
-                        """
-                        INSERT INTO status_change_logs
-                            (entity_type, entity_id, old_status, new_status, changed_by)
-                        VALUES
-                            (:entity_type, :entity_id, :old_status, :new_status, :changed_by)
-                        """
-                    ),
-                    payload,
-                )
+            # The production PostgresClient exposes an SQLAlchemy engine. Tests and
+            # some lightweight integrations provide only a Supabase-like table API,
+            # so support both instead of making status logging break core CRM flows.
+            engine = getattr(self.db, "engine", None)
+            if engine is not None:
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO status_change_logs
+                                (entity_type, entity_id, old_status, new_status, changed_by)
+                            VALUES
+                                (:entity_type, :entity_id, :old_status, :new_status, :changed_by)
+                            """
+                        ),
+                        payload,
+                    )
+                return None
+
+            self.db.table("status_change_logs").insert(payload).execute()
+            return None
 
         await run_db_operation(_exec)

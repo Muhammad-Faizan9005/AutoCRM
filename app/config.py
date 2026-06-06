@@ -1,6 +1,6 @@
 from typing import Optional
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -74,7 +74,19 @@ class Settings(BaseSettings):
     CALL_RECORDINGS_DIR: str = "storage/recordings"
     CALL_RECORDINGS_URL_BASE: str = "/static/recordings"
 
+    # AI service transcription notification
+    AI_SERVICE_BASE_URL: str = "http://localhost:8001"
+    AI_TRANSCRIPTION_NOTIFY_ENABLED: bool = True
+    AI_SERVICE_NOTIFY_TIMEOUT_SECONDS: int = 10
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def parse_debug_flag(cls, value):
+        if isinstance(value, str) and value.strip().lower() in {"release", "prod", "production"}:
+            return False
+        return value
 
     @property
     def jwt_secret_key(self) -> str:

@@ -1,9 +1,13 @@
-from fastapi import Depends, HTTPException, status
+﻿import hashlib
+import secrets
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import Any, Dict
-from supabase import Client
 
 from app.database import get_db, run_db_operation
+from app.postgres_client import PostgresClient as Client
 from app.auth.utils import verify_token
 from app.auth.token_store import is_token_blacklisted
 from app.utils.cache import get_cached_user, cache_user
@@ -183,3 +187,89 @@ def require_permissions(required_permissions: list[str]):
         return current_user
 
     return permissions_checker
+
+
+# ---------------------------------------------------------------------------
+# AI Service Authentication  (for AI workers, not human users)
+# ---------------------------------------------------------------------------
+
+def generate_ai_service_token() -> tuple[str, str, str]:
+    """Generate a raw service token, return (raw_token, key_prefix, token_hash)."""
+    raw_token = secrets.token_urlsafe(48)
+    key_prefix = raw_token[:8]
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    return raw_token, key_prefix, token_hash
+
+
+async def require_ai_agent_auth(
+    x_ai_agent_key: Optional[str] = Header(default=None, alias="X-AI-Agent-Key"),
+    x_ai_service_token: Optional[str] = Header(default=None, alias="X-AI-Service-Token"),
+    db=Depends(get_db),
+) -> dict:
+    """
+    Authenticate incoming requests from AI services.
+
+    Expected headers:
+        X-AI-Agent-Key:     e.g. writer_agent
+        X-AI-Service-Token: raw service token issued via the admin credential API
+
+    Validates:
+        - ai_agents.agent_key exists, enabled=true, status=active
+        - ai_agent_credentials row with matching SHA-256 hash, is_active=true
+        - credential not expired
+    Returns merged AI agent dict with a 'credential_scopes' key.
+    """
+    if not x_ai_agent_key or not x_ai_service_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="X-AI-Agent-Key and X-AI-Service-Token headers are required",
+        )
+
+    # 1. Look up the AI agent
+    agent_rows = await run_db_operation(
+        lambda: db.table("ai_agents").select("*").eq("agent_key", x_ai_agent_key).limit(1).execute()
+    )
+    rows = agent_rows.data or []
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unknown AI agent key")
+    agent = rows[0]
+
+    if not agent.get("enabled") or str(agent.get("status") or "").lower() != "active":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="AI agent is disabled or inactive")
+
+    # 2. Verify the token hash
+    token_hash = hashlib.sha256(x_ai_service_token.encode()).hexdigest()
+    cred_rows = await run_db_operation(
+        lambda: db.table("ai_agent_credentials")
+            .select("*")
+            .eq("ai_agent_id", str(agent["id"]))
+            .eq("token_hash", token_hash)
+            .eq("is_active", True)
+            .limit(5)
+            .execute()
+    )
+    credentials = cred_rows.data or []
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    valid_cred = None
+    for cred in credentials:
+        expires = cred.get("expires_at")
+        if expires is None or str(expires) > now_iso:
+            valid_cred = cred
+            break
+
+    if not valid_cred:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired service token")
+
+    # 3. Fire-and-forget last_seen / last_used timestamps
+    try:
+        await run_db_operation(
+            lambda: db.table("ai_agents").update({"last_seen_at": now_iso}).eq("id", str(agent["id"])).execute()
+        )
+        await run_db_operation(
+            lambda: db.table("ai_agent_credentials").update({"last_used_at": now_iso}).eq("id", str(valid_cred["id"])).execute()
+        )
+    except Exception:
+        pass
+
+    return {**agent, "credential_scopes": valid_cred.get("scopes") or []}

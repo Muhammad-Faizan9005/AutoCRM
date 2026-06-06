@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect, status
 from supabase import Client
 
 from app.auth.dependencies import require_auth
@@ -16,6 +16,7 @@ from app.config import settings
 from app.database import get_db, run_db_operation
 from app.repositories.call_repository import CallRepository
 from app.schemas.call import CallRecordingResponse, CallSessionResponse, CallStartRequest, CallStartResponse
+from app.services.ai_transcription_client import AITranscriptionClient
 from app.services.email_service import MailjetEmailService
 from sqlalchemy import text
 from app.utils.team_access import can_access_lead
@@ -285,6 +286,7 @@ async def end_call_session(
 @router.post("/{call_id}/recording", response_model=CallRecordingResponse)
 async def upload_call_recording(
     call_id: UUID,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Client = Depends(get_db),
     current_user: dict = Depends(require_auth),
@@ -311,8 +313,25 @@ async def upload_call_recording(
         "recording_path": storage_path.replace("\\", "/"),
         "recording_mime": file.content_type,
         "recording_size": len(contents),
+        "processing_status": "pending",
     }
     updated = await repository.update_by_id(call_id, update)
+
+    background_tasks.add_task(
+        AITranscriptionClient().notify_recording_ready,
+        recording_id=call_id,
+        meeting_id=call_id,
+        entity_id=UUID(str(lead_id)) if lead_id else None,
+        entity_type="lead" if lead_id else "call_session",
+        recording_path=updated.get("recording_path") or storage_path,
+        actor_id=str(current_user.get("id") or "") or None,
+        metadata={
+            "call_id": str(call_id),
+            "lead_id": str(lead_id) if lead_id else None,
+            "recording_mime": file.content_type,
+            "recording_size": len(contents),
+        },
+    )
 
     return CallRecordingResponse(
         call_id=call_id,

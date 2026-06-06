@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 LEAD_STATUSES = {"new", "contacted", "nurture", "qualified", "unqualified", "junk"}
-DEAL_STATUSES = {"qualification", "demo_making", "proposal_quotation", "negotiation", "ready_to_close", "won"}
+DEAL_STATUSES = {"qualified", "qualification", "demo_making", "proposal_quotation", "negotiation", "ready_to_close", "won"}
 TASK_STATUSES = {"backlog", "todo", "in_progress", "done", "canceled"}
 
 STATUS_ALIASES = {
