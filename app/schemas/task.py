@@ -19,15 +19,20 @@ class TaskBase(BaseModel):
     status: Optional[str] = Field(default="backlog", max_length=50)
     priority: Optional[str] = Field(default="medium", max_length=20)
     due_at: Optional[datetime] = None
+    source: Optional[str] = Field(default="manual", max_length=50)
+    ai_reason: Optional[str] = Field(default=None, max_length=5000)
+    ai_action_id: Optional[UUID] = None
 
-    @field_validator("entity_type", "title", "status", "priority")
+    @field_validator("entity_type", "title", "status", "priority", "source")
     @classmethod
-    def validate_text_fields(cls, value: str) -> str:
+    def validate_text_fields(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
         cleaned = sanitize_text(value)
         validate_no_dangerous_sql_tokens(cleaned)
         return cleaned
 
-    @field_validator("description")
+    @field_validator("description", "ai_reason")
     @classmethod
     def validate_description(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -48,10 +53,16 @@ class TaskUpdate(BaseModel):
     status: Optional[str] = Field(default=None, max_length=50)
     priority: Optional[str] = Field(default=None, max_length=20)
     due_at: Optional[datetime] = None
+    source: Optional[str] = Field(default="manual", max_length=50)
+    ai_reason: Optional[str] = Field(default=None, max_length=5000)
+    ai_action_id: Optional[UUID] = None
     entity_type: Optional[str] = Field(default=None, min_length=1, max_length=50)
     entity_id: Optional[UUID] = None
+    source: Optional[str] = Field(default=None, max_length=50)
+    ai_reason: Optional[str] = Field(default=None, max_length=5000)
+    ai_action_id: Optional[UUID] = None
 
-    @field_validator("title", "status", "priority", "entity_type")
+    @field_validator("title", "status", "priority", "entity_type", "source")
     @classmethod
     def validate_text_fields(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -60,7 +71,7 @@ class TaskUpdate(BaseModel):
         validate_no_dangerous_sql_tokens(cleaned)
         return cleaned
 
-    @field_validator("description")
+    @field_validator("description", "ai_reason")
     @classmethod
     def validate_description(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -72,6 +83,8 @@ class TaskUpdate(BaseModel):
 
 class TaskResponse(TaskBase):
     id: UUID
+    lead_name: Optional[str] = None
+    assignee_name: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

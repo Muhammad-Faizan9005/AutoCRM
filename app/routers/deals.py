@@ -16,9 +16,22 @@ from app.schemas.deal import DealCreate, DealResponse, DealUpdate
 from app.services.conversion_service import ConversionService
 from app.services.status_change_log_service import StatusChangeLogService
 from app.utils.statuses import DEAL_STATUSES, normalize_status
-from app.utils.team_access import can_access_rep
+from app.utils.team_access import can_access_lead, can_access_rep
 
 router = APIRouter()
+
+DEAL_TYPES = {"new_business", "upsell", "renewal", "cross_sell"}
+
+
+def _normalize_deal_type(value: str | None) -> str:
+    normalized = (value or "new_business").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"new", "new_sale", "new_business_sale"}:
+        normalized = "new_business"
+    if normalized in {"crosssell", "cross_selling"}:
+        normalized = "cross_sell"
+    if normalized not in DEAL_TYPES:
+        raise ValueError("Invalid deal_type. Use new_business, upsell, renewal, or cross_sell")
+    return normalized
 
 
 def _normalize_deal_status(value: str | None) -> str | None:
@@ -80,6 +93,30 @@ async def _assert_deal_assignment_permissions(
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions to assign deal")
 
 
+async def _get_lead_owner_for_deal(db: Client, lead_id: str | None) -> str | None:
+    if not lead_id:
+        return None
+
+    def _query():
+        with db.engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT owner_id FROM leads WHERE id = :lead_id"),
+                {"lead_id": lead_id},
+            ).mappings().first()
+            return str(row.get("owner_id")) if row and row.get("owner_id") else None
+
+    return await run_db_operation(_query)
+
+
+async def _can_access_deal(db: Client, current_user: dict, deal: dict) -> bool:
+    if await can_access_rep(db, current_user, str(deal.get("owner_id") or "")):
+        return True
+    lead_id = str(deal.get("lead_id") or "")
+    if lead_id and await can_access_lead(db, current_user, lead_id):
+        return True
+    return False
+
+
 @router.get("/", response_model=List[DealResponse])
 async def get_deals(
     skip: int = 0,
@@ -100,10 +137,13 @@ async def get_deals(
         def _query_team_deals():
             with db.engine.connect() as conn:
                 sql = (
-                    "SELECT d.* FROM deals d "
-                    "JOIN team_members tm ON tm.agent_id = d.owner_id "
-                    "JOIN teams t ON t.id = tm.team_id "
-                    "WHERE t.manager_id = :mid "
+                    "SELECT DISTINCT d.* FROM deals d "
+                    "LEFT JOIN leads l ON l.id = d.lead_id "
+                    "LEFT JOIN team_members tm_deal ON tm_deal.agent_id = d.owner_id "
+                    "LEFT JOIN teams team_deal ON team_deal.id = tm_deal.team_id "
+                    "LEFT JOIN team_members tm_lead ON tm_lead.agent_id = l.owner_id "
+                    "LEFT JOIN teams team_lead ON team_lead.id = tm_lead.team_id "
+                    "WHERE (team_deal.manager_id = :mid OR team_lead.manager_id = :mid) "
                 )
                 params: dict[str, Any] = {"mid": requester_id}
                 if stage:
@@ -125,6 +165,32 @@ async def get_deals(
 
     if owner_id is not None and not await can_access_rep(db, current_user, str(owner_id)):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+
+    if role not in {"admin", "manager", "sales_manager"} and owner_id is None:
+        def _query_rep_deals():
+            with db.engine.connect() as conn:
+                sql = (
+                    "SELECT DISTINCT d.* FROM deals d "
+                    "LEFT JOIN leads l ON l.id = d.lead_id "
+                    "WHERE (d.owner_id = :uid OR l.owner_id = :uid) "
+                )
+                params: dict[str, Any] = {"uid": requester_id}
+                if stage:
+                    sql += "AND d.stage = :stage "
+                    params["stage"] = stage
+                if organization_id:
+                    sql += "AND d.organization_id = :org_id "
+                    params["org_id"] = str(organization_id)
+                if lead_id:
+                    sql += "AND d.lead_id = :lead_id "
+                    params["lead_id"] = str(lead_id)
+                sql += "ORDER BY d.created_at DESC OFFSET :skip LIMIT :limit"
+                params["skip"] = skip
+                params["limit"] = limit
+                rows = conn.execute(text(sql), params).mappings().all()
+                return [dict(row) for row in rows]
+
+        return await run_db_operation(_query_rep_deals)
 
     if role not in {"admin", "manager", "sales_manager"}:
         owner_id = UUID(requester_id) if requester_id else owner_id
@@ -150,7 +216,7 @@ async def get_deal(
     deal = await repository.get_by_id(deal_id)
     if not deal:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
-    if not await can_access_rep(db, current_user, str(deal.get("owner_id") or "")):
+    if not await _can_access_deal(db, current_user, deal):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
     return deal
 
@@ -171,8 +237,15 @@ async def create_deal(
             deal_data["status"] = _normalize_deal_status(deal_data["status"])
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    try:
+        deal_data["deal_type"] = _normalize_deal_type(deal_data.get("deal_type"))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
-    owner_id = deal_data.get("owner_id") or current_user.get("id")
+    owner_id = deal_data.get("owner_id")
+    if not owner_id and deal_data.get("lead_id"):
+        owner_id = await _get_lead_owner_for_deal(db, str(deal_data.get("lead_id")))
+    owner_id = owner_id or current_user.get("id")
     if owner_id:
         deal_data["owner_id"] = str(owner_id)
         await _assert_deal_assignment_permissions(db, current_user, deal_data["owner_id"])
@@ -212,7 +285,7 @@ async def update_deal(
     existing = await repository.get_by_id(deal_id)
     if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
-    if not await can_access_rep(db, current_user, str(existing.get("owner_id") or "")):
+    if not await _can_access_deal(db, current_user, existing):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
     if not update_data:
@@ -223,6 +296,11 @@ async def update_deal(
             update_data[key] = str(update_data[key])
     if "owner_id" in update_data and update_data["owner_id"] is not None:
         await _assert_deal_assignment_permissions(db, current_user, update_data["owner_id"])
+    if "deal_type" in update_data and update_data["deal_type"] is not None:
+        try:
+            update_data["deal_type"] = _normalize_deal_type(update_data["deal_type"])
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
     # If status is being updated, use the conversion service to handle status transitions
     if "status" in update_data:
