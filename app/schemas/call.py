@@ -58,6 +58,7 @@ class CallSessionResponse(CallSessionBase):
     recording_mime: Optional[str] = None
     recording_size: Optional[int] = None
     transcript: Optional[str] = None
+    meeting_summary: Optional[str] = None
     processing_status: Optional[str] = None
     created_at: datetime
     updated_at: datetime

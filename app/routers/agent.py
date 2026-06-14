@@ -377,6 +377,7 @@ async def dispatch_agent_action(
 
     created = await _dispatch_payload_action(
         payload,
+        agent_action_id=str(action["id"]),
         current_user=current_user,
         task_repository=task_repository,
         note_repository=note_repository,
@@ -454,6 +455,7 @@ def _requires_approval(payload: AgentActionIn) -> bool:
 async def _dispatch_payload_action(
     payload: AgentActionIn,
     *,
+    agent_action_id: str | None = None,
     current_user: dict,
     task_repository: TaskRepository,
     note_repository: NoteRepository,
@@ -469,6 +471,7 @@ async def _dispatch_payload_action(
         task_repository=task_repository,
         note_repository=note_repository,
         notification_service=notification_service,
+        agent_action_id=agent_action_id,
     )
 
 
@@ -490,6 +493,7 @@ async def _dispatch_stored_action(
         task_repository=task_repository,
         note_repository=note_repository,
         notification_service=notification_service,
+        agent_action_id=str(action.get("id")) if action.get("id") else None,
     )
 
 
@@ -504,6 +508,7 @@ async def _dispatch_action_data(
     task_repository: TaskRepository,
     note_repository: NoteRepository,
     notification_service: NotificationService,
+    agent_action_id: str | None = None,
 ) -> dict[str, str | None]:
     action_type = action_type.strip().lower()
     if action_type == "create_task":
@@ -516,6 +521,9 @@ async def _dispatch_action_data(
             status=data.get("status") or "backlog",
             priority=data.get("priority") or "medium",
             due_at=_parse_datetime(data.get("due_at")),
+            source="ai",
+            ai_reason=reason,
+            ai_action_id=UUID(str(agent_action_id)) if agent_action_id else None,
         )
         created = await task_repository.create(task_payload.model_dump())
         return {"record_type": "task", "id": str(created.get("id")) if created.get("id") else None}
@@ -526,6 +534,9 @@ async def _dispatch_action_data(
             entity_id=entity_id,
             content=str(data.get("content") or data.get("title") or reason),
             author_id=UUID(str(current_user.get("id"))) if current_user.get("id") else None,
+            source="ai",
+            ai_reason=reason,
+            ai_action_id=UUID(str(agent_action_id)) if agent_action_id else None,
         )
         created = await note_repository.create(note_payload.model_dump())
         return {"record_type": "note", "id": str(created.get("id")) if created.get("id") else None}

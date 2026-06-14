@@ -94,6 +94,89 @@ async def _can_manager_assign_to_rep(db: Client, manager_id: str, rep_id: str) -
     return await is_manager_of_rep(db, manager_id, rep_id)
 
 
+
+
+async def _find_or_create_organization_for_company(db: Client, company: str | None) -> str | None:
+    company_name = (company or "").strip()
+    if not company_name:
+        return None
+
+    def _query():
+        with db.engine.begin() as conn:
+            existing = conn.execute(
+                text("SELECT id FROM organizations WHERE lower(name) = lower(:name) LIMIT 1"),
+                {"name": company_name},
+            ).mappings().first()
+            if existing:
+                return str(existing["id"])
+            created = conn.execute(
+                text(
+                    "INSERT INTO organizations (name) VALUES (:name) "
+                    "RETURNING id"
+                ),
+                {"name": company_name},
+            ).mappings().first()
+            return str(created["id"]) if created else None
+
+    return await run_db_operation(_query)
+
+
+async def _calculate_lead_score(db: Client, lead_id: str) -> dict[str, Any] | None:
+    def _query():
+        with db.engine.begin() as conn:
+            lead = conn.execute(text("SELECT * FROM leads WHERE id = :lead_id"), {"lead_id": lead_id}).mappings().first()
+            if not lead:
+                return None
+            tasks = conn.execute(text("SELECT status, due_at FROM tasks WHERE entity_type='lead' AND entity_id=:lead_id"), {"lead_id": lead_id}).mappings().all()
+            deals = conn.execute(text("SELECT status, value FROM deals WHERE lead_id=:lead_id"), {"lead_id": lead_id}).mappings().all()
+            calls = conn.execute(text("SELECT transcript, processing_status FROM call_sessions WHERE lead_id=:lead_id"), {"lead_id": lead_id}).mappings().all()
+            notes_count = conn.execute(text("SELECT COUNT(*) FROM notes WHERE entity_type='lead' AND entity_id=:lead_id"), {"lead_id": lead_id}).scalar() or 0
+
+            score = 35
+            reasons: list[str] = []
+            status_value = str(lead.get("status") or "").lower()
+            if status_value in {"qualified", "proposal", "negotiation"}:
+                score += 25; reasons.append("lead is in a high-intent status")
+            elif status_value in {"unqualified", "junk", "lost"}:
+                score -= 35; reasons.append("lead is marked low quality")
+            if lead.get("email") and lead.get("phone"):
+                score += 10; reasons.append("complete contact information is available")
+            elif lead.get("email") or lead.get("phone"):
+                score += 5; reasons.append("partial contact information is available")
+            open_deals = [d for d in deals if str(d.get("status") or "").lower() not in {"won", "lost", "closed_won", "closed_lost"}]
+            if open_deals:
+                score += 20; reasons.append(f"{len(open_deals)} open deal(s) are linked")
+            if any(str(t.get("status") or "").lower() not in {"done", "canceled"} for t in tasks):
+                score += 10; reasons.append("there are active follow-up tasks")
+            if any(c.get("transcript") for c in calls):
+                score += 10; reasons.append("meeting/call transcript is available")
+            if notes_count:
+                score += 5; reasons.append("notes are captured for this lead")
+            score = max(0, min(100, score))
+            priority = "High" if score >= 75 else "Medium" if score >= 45 else "Low"
+            reason = f"{priority} priority because " + (", ".join(reasons[:4]) if reasons else "limited engagement data is available") + "."
+            conn.execute(text("UPDATE leads SET score=:score, score_reason=:reason, updated_at=NOW() WHERE id=:lead_id"), {"score": score, "reason": reason, "lead_id": lead_id})
+            return {"score": score, "priority": priority, "score_reason": reason}
+    return await run_db_operation(_query)
+
+
+async def _get_lead_ai_history(db: Client, lead_id: str) -> list[dict[str, Any]]:
+    def _query():
+        with db.engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT aa.id, aa.action_type, aa.reason, aa.approval_status, aa.dispatch_status, "
+                    "aa.crm_record_type, aa.crm_record_id, aa.created_at, ar.trigger_type, ar.status AS run_status "
+                    "FROM ai_agent_actions aa LEFT JOIN ai_agent_runs ar ON ar.id = aa.run_id "
+                    "WHERE aa.entity_type='lead' AND aa.entity_id=:lead_id "
+                    "ORDER BY aa.created_at DESC LIMIT 50"
+                ),
+                {"lead_id": lead_id},
+            ).mappings().all()
+            return [dict(row) for row in rows]
+    return await run_db_operation(_query)
+
+
 async def _assert_lead_assignment_permissions(
     db: Client,
     current_user: dict,
@@ -219,6 +302,31 @@ async def get_assignment_reps(
     return await run_db_operation(_query)
 
 
+
+
+@router.post("/{lead_id}/score/recalculate")
+async def recalculate_lead_score(
+    lead_id: UUID,
+    db: Client = Depends(get_db),
+    current_user: dict = Depends(require_auth),
+):
+    await _assert_can_view_lead(db, current_user, str(lead_id))
+    result = await _calculate_lead_score(db, str(lead_id))
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lead not found")
+    return result
+
+
+@router.get("/{lead_id}/ai-history")
+async def get_lead_ai_history(
+    lead_id: UUID,
+    db: Client = Depends(get_db),
+    current_user: dict = Depends(require_auth),
+):
+    await _assert_can_view_lead(db, current_user, str(lead_id))
+    return await _get_lead_ai_history(db, str(lead_id))
+
+
 @router.get("/{lead_id}", response_model=LeadResponse)
 async def get_lead(
     lead_id: UUID,
@@ -257,6 +365,8 @@ async def create_lead(
     organization_id = lead_data.get("organization_id")
     if organization_id:
         lead_data["organization_id"] = str(organization_id)
+    elif lead_data.get("company"):
+        lead_data["organization_id"] = await _find_or_create_organization_for_company(db, lead_data.get("company"))
 
     created = await repository.create(lead_data)
     await status_log_service.log_change(

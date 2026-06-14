@@ -17,13 +17,14 @@ class DealBase(BaseModel):
     customer_id: Optional[UUID] = None
     stage: Optional[str] = Field(default="prospecting", max_length=50)
     status: Optional[str] = Field(default="qualified", max_length=50)
+    deal_type: Optional[str] = Field(default="new_business", max_length=50)
     value: Optional[float] = Field(default=None, ge=0)
     currency: Optional[str] = Field(default="USD", max_length=10)
     expected_close_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
     lost_reason: Optional[str] = Field(default=None, max_length=1000)
 
-    @field_validator("stage", "status", "currency", "lost_reason")
+    @field_validator("stage", "status", "deal_type", "currency", "lost_reason")
     @classmethod
     def validate_text_fields(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -44,13 +45,14 @@ class DealUpdate(BaseModel):
     customer_id: Optional[UUID] = None
     stage: Optional[str] = Field(default=None, max_length=50)
     status: Optional[str] = Field(default=None, max_length=50)
+    deal_type: Optional[str] = Field(default=None, max_length=50)
     value: Optional[float] = Field(default=None, ge=0)
     currency: Optional[str] = Field(default=None, max_length=10)
     expected_close_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
     lost_reason: Optional[str] = Field(default=None, max_length=1000)
 
-    @field_validator("stage", "status", "currency", "lost_reason")
+    @field_validator("stage", "status", "deal_type", "currency", "lost_reason")
     @classmethod
     def validate_text_fields(cls, value: Optional[str]) -> Optional[str]:
         if value is None:

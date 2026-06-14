@@ -90,6 +90,40 @@ async def _can_access_lead(db: Client, current_user: dict, lead_id: str) -> bool
     return await can_access_lead(db, current_user, lead_id)
 
 
+async def _enrich_task_rows(db: Client, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+    task_ids = [str(row.get("id")) for row in rows if row.get("id")]
+    if not task_ids:
+        return rows
+
+    def _query():
+        with db.engine.connect() as conn:
+            enriched = conn.execute(
+                text(
+                    "SELECT t.id, l.name AS lead_name, a.full_name AS assignee_name, a.email AS assignee_email "
+                    "FROM tasks t "
+                    "LEFT JOIN leads l ON l.id = t.entity_id AND t.entity_type = 'lead' "
+                    "LEFT JOIN agents a ON a.id = t.assigned_to "
+                    "WHERE t.id = ANY(CAST(:task_ids AS uuid[]))"
+                ),
+                {"task_ids": task_ids},
+            ).mappings().all()
+            return {str(row["id"]): dict(row) for row in enriched}
+
+    lookup = await run_db_operation(_query)
+    output = []
+    for row in rows:
+        next_row = dict(row)
+        info = lookup.get(str(row.get("id")), {})
+        if info.get("lead_name"):
+            next_row["lead_name"] = info["lead_name"]
+        if info.get("assignee_name") or info.get("assignee_email"):
+            next_row["assignee_name"] = info.get("assignee_name") or info.get("assignee_email")
+        output.append(next_row)
+    return output
+
+
 @router.get("/", response_model=List[TaskResponse])
 async def get_tasks(
     skip: int = 0,
@@ -143,7 +177,8 @@ async def get_tasks(
                         rows = conn.execute(text(sql), params).mappings().all()
                         return [dict(row) for row in rows]
 
-                return await run_db_operation(_query_team_tasks)
+                rows = await run_db_operation(_query_team_tasks)
+                return await _enrich_task_rows(db, rows)
 
             if assigned_to is not None:
                 if not await can_access_rep(db, current_user, str(assigned_to)):
@@ -154,7 +189,7 @@ async def get_tasks(
             else:
                 assigned_to = UUID(requester_id) if requester_id else None
 
-    return await repository.list_tasks(
+    rows = await repository.list_tasks(
         skip=skip,
         limit=limit,
         status=status,
@@ -163,6 +198,7 @@ async def get_tasks(
         entity_id=str(entity_id) if entity_id else None,
         priority=priority,
     )
+    return await _enrich_task_rows(db, rows)
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
@@ -180,13 +216,13 @@ async def get_task(
         if (task.get("entity_type") or "").strip().lower() == "lead":
             can_access = await _can_access_lead(db, current_user, str(task.get("entity_id")))
             if can_access:
-                return task
+                return (await _enrich_task_rows(db, [task]))[0]
         if not requester_id or not await can_access_rep(db, current_user, task_assigned_to):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Insufficient permissions to view this task",
             )
-    return task
+    return (await _enrich_task_rows(db, [task]))[0]
 
 
 @router.post("/", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
@@ -239,7 +275,7 @@ async def create_task(
                 )
         except Exception:
             pass
-    return created
+    return (await _enrich_task_rows(db, [created]))[0]
 
 
 @router.patch("/{task_id}", response_model=TaskResponse)

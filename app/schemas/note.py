@@ -15,17 +15,24 @@ class NoteBase(BaseModel):
     entity_id: UUID
     content: str = Field(..., min_length=1, max_length=5000)
     author_id: Optional[UUID] = None
+    source: Optional[str] = Field(default="manual", max_length=50)
+    ai_reason: Optional[str] = Field(default=None, max_length=5000)
+    ai_action_id: Optional[UUID] = None
 
-    @field_validator("entity_type")
+    @field_validator("entity_type", "source")
     @classmethod
-    def validate_entity_type(cls, value: str) -> str:
+    def validate_entity_type(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
         cleaned = sanitize_text(value)
         validate_no_dangerous_sql_tokens(cleaned)
         return cleaned
 
-    @field_validator("content")
+    @field_validator("content", "ai_reason")
     @classmethod
-    def validate_content(cls, value: str) -> str:
+    def validate_content(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
         cleaned = sanitize_text(value)
         validate_no_dangerous_sql_tokens(cleaned)
         return cleaned
@@ -37,8 +44,11 @@ class NoteCreate(NoteBase):
 
 class NoteUpdate(BaseModel):
     content: Optional[str] = Field(default=None, min_length=1, max_length=5000)
+    source: Optional[str] = Field(default=None, max_length=50)
+    ai_reason: Optional[str] = Field(default=None, max_length=5000)
+    ai_action_id: Optional[UUID] = None
 
-    @field_validator("content")
+    @field_validator("content", "ai_reason")
     @classmethod
     def validate_content(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
