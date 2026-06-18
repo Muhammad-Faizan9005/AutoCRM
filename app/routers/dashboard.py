@@ -18,11 +18,12 @@ def get_dashboard_service(db: PostgresClient = Depends(get_db)) -> DashboardServ
 
 @router.get("/summary", response_model=DashboardSummary)
 async def get_dashboard_summary(
+    days: int = 30,
     current_user: dict = Depends(require_auth),
     service: DashboardService = Depends(get_dashboard_service),
 ):
     """Return high-level KPI metrics for the dashboard."""
-    return await service.get_summary()
+    return await service.get_summary(current_user, trend_days=days)
 
 
 @router.get("/activity", response_model=DashboardActivity)
@@ -32,7 +33,7 @@ async def get_dashboard_activity(
     service: DashboardService = Depends(get_dashboard_service),
 ):
     """Return activity counts grouped by day."""
-    return await service.get_activity(days=days)
+    return await service.get_activity(current_user, days=days)
 
 
 @router.get("/ai-summary/latest")

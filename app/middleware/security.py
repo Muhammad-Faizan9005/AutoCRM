@@ -43,6 +43,9 @@ def _timestamp() -> str:
 
 async def security_middleware(request: Request, call_next):
     max_size = settings.MAX_REQUEST_SIZE_BYTES
+    if request.url.path == "/api/auth/avatar":
+        max_size = max(max_size, settings.SUPABASE_MAX_AVATAR_BYTES + 250_000)
+
     content_length = request.headers.get("content-length")
 
     if content_length and content_length.isdigit() and int(content_length) > max_size:
