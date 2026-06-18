@@ -17,6 +17,21 @@ class StatusStat(BaseModel):
     count: int
 
 
+class TrendStat(BaseModel):
+    direction: str
+    value: int
+    current: int
+    previous: int
+
+
+class DashboardTrends(BaseModel):
+    leads: TrendStat
+    deals: TrendStat
+    organizations: TrendStat
+    tasks: TrendStat
+    revenue: TrendStat
+
+
 class DashboardSummary(BaseModel):
     leads_total: int
     deals_total: int
@@ -27,6 +42,7 @@ class DashboardSummary(BaseModel):
     pipeline: list[StageStat]
     leads_by_status: list[StatusStat]
     tasks_by_status: list[StatusStat]
+    trends: DashboardTrends
 
 
 class ActivityPoint(BaseModel):

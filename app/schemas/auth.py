@@ -23,6 +23,7 @@ class UserPublic(BaseModel):
     id: UUID
     email: str
     full_name: str
+    avatar_url: str | None = None
     role: Literal["admin", "sales_manager", "sales_rep"]
     is_active: bool
     created_at: datetime
@@ -75,11 +76,20 @@ class ResetPasswordRequest(BaseModel):
     password: str = Field(..., min_length=6)
 
 
+class ProfileUpdateRequest(BaseModel):
+    """Self-service profile settings update."""
+    full_name: str | None = Field(default=None, min_length=2, max_length=255)
+    avatar_url: str | None = Field(default=None, max_length=4096)
+    current_password: str | None = Field(default=None, min_length=6)
+    new_password: str | None = Field(default=None, min_length=6, max_length=128)
+
+
 class UserResponse(BaseModel):
     """User profile response"""
     id: UUID
     email: str
     full_name: str
+    avatar_url: str | None = None
     role: Literal["admin", "sales_manager", "sales_rep"]
     is_active: bool
     created_at: datetime

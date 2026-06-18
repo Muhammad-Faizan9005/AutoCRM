@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta, timezone
 import hashlib
+from pathlib import Path
 import secrets
 
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, File, HTTPException, status, Depends, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import text
 from supabase import Client
@@ -20,6 +21,7 @@ from app.schemas.auth import (
     LogoutRequest,
     ForgotPasswordRequest,
     ResetPasswordRequest,
+    ProfileUpdateRequest,
 )
 from app.auth.utils import (
     verify_password,
@@ -39,6 +41,13 @@ router = APIRouter()
 security = HTTPBearer()
 optional_security = HTTPBearer(auto_error=False)
 
+ALLOWED_AVATAR_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+
 
 def _hash_reset_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -46,6 +55,62 @@ def _hash_reset_token(token: str) -> str:
 
 def get_email_service(db: Client = Depends(get_db)) -> MailjetEmailService:
     return MailjetEmailService(db)
+
+
+def _avatar_storage_dir() -> Path:
+    return Path(settings.AVATAR_STORAGE_DIR)
+
+
+def _local_avatar_url(user_id: str | None) -> str | None:
+    if not user_id:
+        return None
+
+    avatar_dir = _avatar_storage_dir() / str(user_id)
+    for extension in ALLOWED_AVATAR_TYPES.values():
+        avatar_path = avatar_dir / f"avatar.{extension}"
+        if avatar_path.exists():
+            public_base = settings.AVATAR_PUBLIC_BASE_URL.rstrip("/")
+            version = avatar_path.stat().st_mtime_ns
+            return f"{public_base}/static/avatars/{user_id}/avatar.{extension}?v={version}"
+    return None
+
+
+def _safe_auth_user(user: dict, permissions: dict[str, bool] | None = None) -> dict:
+    safe_user = dict(user)
+    safe_user.pop("password_hash", None)
+    safe_user["avatar_url"] = _local_avatar_url(str(safe_user.get("id") or ""))
+    if permissions is not None:
+        safe_user["permissions"] = permissions
+    safe_user["is_admin"] = is_admin_user(safe_user)
+    safe_user["is_superuser"] = bool(safe_user.get("is_superuser", False))
+    return safe_user
+
+
+async def _ensure_profile_columns(db: Client) -> None:
+    def _exec():
+        with db.engine.begin() as conn:
+            conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS avatar_url TEXT"))
+
+    await run_db_operation(_exec)
+
+
+async def _return_current_user(
+    db: Client,
+    permission_service: PermissionService,
+    user_id: str,
+) -> dict:
+    def _fetch_user():
+        with db.engine.connect() as conn:
+            row = conn.execute(text("SELECT * FROM agents WHERE id = :user_id"), {"user_id": user_id}).mappings().first()
+            return dict(row) if row else None
+
+    user = await run_db_operation(_fetch_user)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    invalidate_user_cache(user_id)
+    permissions = await permission_service.get_effective_permissions(user)
+    return _safe_auth_user(user, permissions)
 
 
 async def _assert_admin_for_role_override(
@@ -122,11 +187,10 @@ async def register(
     access_token = create_access_token(data={"sub": created_user["id"]})
     refresh_token = create_refresh_token(data={"sub": created_user["id"]})
     
-    safe_user = dict(created_user)
-    safe_user.pop("password_hash", None)
-    safe_user["permissions"] = await permission_service.get_effective_permissions(safe_user)
-    safe_user["is_admin"] = is_admin_user(safe_user)
-    safe_user["is_superuser"] = bool(safe_user.get("is_superuser", False))
+    safe_user = _safe_auth_user(
+        created_user,
+        await permission_service.get_effective_permissions(created_user),
+    )
     
     return {
         "access_token": access_token,
@@ -181,11 +245,10 @@ async def login(
     access_token = create_access_token(data={"sub": user["id"]})
     refresh_token = create_refresh_token(data={"sub": user["id"]})
     
-    safe_user = dict(user)
-    safe_user.pop("password_hash", None)
-    safe_user["permissions"] = await permission_service.get_effective_permissions(safe_user)
-    safe_user["is_admin"] = is_admin_user(safe_user)
-    safe_user["is_superuser"] = bool(safe_user.get("is_superuser", False))
+    safe_user = _safe_auth_user(
+        user,
+        await permission_service.get_effective_permissions(user),
+    )
     
     return {
         "access_token": access_token,
@@ -205,12 +268,146 @@ async def get_current_user_profile(
     
     Requires valid JWT token in Authorization header.
     """
-    safe_user = dict(current_user)
-    safe_user.pop("password_hash", None)
-    safe_user["permissions"] = await permission_service.get_effective_permissions(safe_user)
-    safe_user["is_admin"] = is_admin_user(safe_user)
-    safe_user["is_superuser"] = bool(safe_user.get("is_superuser", False))
-    return safe_user
+    return _safe_auth_user(
+        current_user,
+        await permission_service.get_effective_permissions(current_user),
+    )
+
+
+@router.patch("/profile", response_model=UserResponse)
+async def update_current_user_profile(
+    payload: ProfileUpdateRequest,
+    current_user: dict = Depends(require_auth),
+    db: Client = Depends(get_db),
+    permission_service: PermissionService = Depends(get_permission_service),
+):
+    """Update the current user's profile settings."""
+    await _ensure_profile_columns(db)
+
+    update_data = payload.model_dump(exclude_unset=True)
+    if not update_data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
+
+    new_password = update_data.pop("new_password", None)
+    current_password = update_data.pop("current_password", None)
+    allowed_fields = {"full_name"}
+    update_data = {key: value for key, value in update_data.items() if key in allowed_fields}
+
+    user_id = str(current_user.get("id") or "")
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
+
+    def _fetch_user():
+        with db.engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT * FROM agents WHERE id = :user_id"),
+                {"user_id": user_id},
+            ).mappings().first()
+            return dict(row) if row else None
+
+    fresh_user = await run_db_operation(_fetch_user)
+    if not fresh_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if new_password:
+        stored_hash = fresh_user.get("password_hash")
+        if not current_password or not stored_hash or not verify_password(current_password, stored_hash):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
+        update_data["password_hash"] = hash_password(new_password)
+
+    if not update_data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
+
+    set_clauses = []
+    params: dict[str, object] = {"user_id": user_id}
+    for key, value in update_data.items():
+        set_clauses.append(f"{key} = :{key}")
+        params[key] = value
+    set_clauses.append("updated_at = NOW()")
+
+    def _update_user():
+        with db.engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    "UPDATE agents "
+                    f"SET {', '.join(set_clauses)} "
+                    "WHERE id = :user_id "
+                    "RETURNING *"
+                ),
+                params,
+            ).mappings().first()
+            return dict(row) if row else None
+
+    updated_user = await run_db_operation(_update_user)
+    if not updated_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    invalidate_user_cache(user_id)
+    permissions = await permission_service.get_effective_permissions(updated_user)
+    return _safe_auth_user(updated_user, permissions)
+
+
+@router.post("/avatar", response_model=UserResponse)
+async def upload_current_user_avatar(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(require_auth),
+    db: Client = Depends(get_db),
+    permission_service: PermissionService = Depends(get_permission_service),
+):
+    """Upload the current user's avatar to local storage."""
+    await _ensure_profile_columns(db)
+
+    user_id = str(current_user.get("id") or "")
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
+
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    extension = ALLOWED_AVATAR_TYPES.get(content_type)
+    if not extension:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please upload a JPG, PNG, WebP, or GIF image")
+
+    contents = await file.read(settings.SUPABASE_MAX_AVATAR_BYTES + 1)
+    if not contents:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Avatar image is empty")
+    if len(contents) > settings.SUPABASE_MAX_AVATAR_BYTES:
+        max_mb = settings.SUPABASE_MAX_AVATAR_BYTES / 1_000_000
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Avatar image must be under {max_mb:g} MB")
+
+    avatar_dir = _avatar_storage_dir() / user_id
+
+    def _save_avatar() -> None:
+        avatar_dir.mkdir(parents=True, exist_ok=True)
+        for existing_extension in ALLOWED_AVATAR_TYPES.values():
+            existing_path = avatar_dir / f"avatar.{existing_extension}"
+            if existing_path.exists():
+                existing_path.unlink()
+        (avatar_dir / f"avatar.{extension}").write_bytes(contents)
+
+    await run_db_operation(_save_avatar)
+    return await _return_current_user(db, permission_service, user_id)
+
+
+@router.delete("/avatar", response_model=UserResponse)
+async def delete_current_user_avatar(
+    current_user: dict = Depends(require_auth),
+    db: Client = Depends(get_db),
+    permission_service: PermissionService = Depends(get_permission_service),
+):
+    """Delete the current user's locally stored avatar."""
+    user_id = str(current_user.get("id") or "")
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
+
+    avatar_dir = _avatar_storage_dir() / user_id
+
+    def _delete_avatar() -> None:
+        for extension in ALLOWED_AVATAR_TYPES.values():
+            avatar_path = avatar_dir / f"avatar.{extension}"
+            if avatar_path.exists():
+                avatar_path.unlink()
+
+    await run_db_operation(_delete_avatar)
+    return await _return_current_user(db, permission_service, user_id)
 
 
 @router.post("/refresh", response_model=TokenResponse)

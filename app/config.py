@@ -11,6 +11,26 @@ class Settings(BaseSettings):
     
     # Database Settings
     DATABASE_URL: Optional[str] = None
+
+    # Supabase Storage
+    SUPABASE_URL: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("SUPABASE_URL", "PROJECT_URL"),
+    )
+    SUPABASE_SERVICE_ROLE_KEY: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SECRET_KEY", "SECRET_KEY"),
+    )
+    SUPABASE_PUBLISHABLE_KEY: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("SUPABASE_PUBLISHABLE_KEY", "SUPABASE_ANON_KEY", "PUBLISHABLE_KEY"),
+    )
+    SUPABASE_AVATAR_BUCKET: str = "avatars"
+    SUPABASE_MAX_AVATAR_BYTES: int = 2_000_000
+
+    # Local avatar storage
+    AVATAR_STORAGE_DIR: str = "storage/avatars"
+    AVATAR_PUBLIC_BASE_URL: str = "http://localhost:8000"
     
     # LLM Settings (supports any LLM provider)
     LLM_API_KEY: Optional[str] = None
@@ -20,7 +40,7 @@ class Settings(BaseSettings):
     # JWT Settings
     JWT_SECRET_KEY: str = Field(
         default="your-secret-key-change-in-production-min-32-chars",
-        validation_alias=AliasChoices("JWT_SECRET_KEY", "SECRET_KEY", "jwt_secret_key"),
+        validation_alias=AliasChoices("JWT_SECRET_KEY", "jwt_secret_key", "SECRET_KEY"),
     )
     JWT_ALGORITHM: str = Field(
         default="HS256",

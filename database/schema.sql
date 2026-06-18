@@ -61,6 +61,7 @@ CREATE TABLE agents (
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     full_name VARCHAR(255) NOT NULL,
+    avatar_url TEXT,
     role VARCHAR(50) DEFAULT 'sales_rep' CHECK (role IN ('admin', 'sales_manager', 'sales_rep')),
     is_active BOOLEAN DEFAULT true,
     status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'invited', 'disabled')),

@@ -47,6 +47,7 @@ class UserResponse(BaseModel):
     id: UUID
     email: EmailStr
     full_name: str
+    avatar_url: str | None = None
     role: RoleType
     is_active: bool
     created_at: datetime
