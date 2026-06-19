@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import secrets
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect, status
 from supabase import Client
 
 from app.auth.dependencies import require_auth
@@ -45,7 +45,114 @@ def _generate_room_token() -> str:
 
 def _recording_storage_path(call_id: str, extension: str) -> str:
     filename = f"call_{call_id}.{extension}"
-    return os.path.join(settings.CALL_RECORDINGS_DIR, filename)
+    return str(_recordings_dir() / filename)
+
+
+def _recordings_dir() -> Path:
+    return Path(settings.CALL_RECORDINGS_DIR).expanduser().resolve()
+
+
+def _recording_tmp_dir(call_id: str) -> Path:
+    return _recordings_dir() / "tmp" / call_id
+
+
+def _safe_recording_extension(value: str | None) -> str:
+    extension = (value or "webm").strip().lower().lstrip(".")
+    if extension not in {"webm", "ogg", "mp3", "wav", "m4a"}:
+        return "webm"
+    return extension
+
+
+def _recording_db_path(call_id: str, extension: str) -> str:
+    return f"recordings/call_{call_id}.{extension}"
+
+
+def _recording_url(call_id: str, extension: str) -> str:
+    return f"{settings.CALL_RECORDINGS_URL_BASE}/call_{call_id}.{extension}"
+
+
+async def _assert_can_use_call(db: Client, repository: CallRepository, current_user: dict, call_id: UUID) -> dict[str, Any]:
+    existing = await repository.get_by_id(call_id)
+    lead_id = existing.get("lead_id")
+    if lead_id:
+        await _assert_can_view_lead(db, current_user, str(lead_id))
+    return existing
+
+
+async def _finalize_recording_from_chunks(
+    *,
+    call_id: UUID,
+    lead_id: str | None,
+    actor_id: str | None,
+    extension: str,
+    mime_type: str | None,
+    db: Client,
+    repository: CallRepository,
+) -> None:
+    call_key = str(call_id)
+    extension = _safe_recording_extension(extension)
+    tmp_dir = _recording_tmp_dir(call_key)
+    final_path = Path(_recording_storage_path(call_key, extension))
+    db_path = _recording_db_path(call_key, extension)
+
+    try:
+        chunks = sorted(tmp_dir.glob("chunk_*.part"))
+        if not chunks:
+            await repository.update_by_id(call_id, {"processing_status": "failed"})
+            logger.warning("call_recording_finalize_failed call_id=%s reason=no_chunks", call_id)
+            return
+
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        partial_path = final_path.with_suffix(final_path.suffix + ".partial")
+        with partial_path.open("wb") as destination:
+            for chunk in chunks:
+                with chunk.open("rb") as source:
+                    destination.write(source.read())
+        partial_path.replace(final_path)
+
+        size = final_path.stat().st_size
+        updated = await repository.update_by_id(
+            call_id,
+            {
+                "recording_path": db_path,
+                "recording_mime": mime_type or f"audio/{extension}",
+                "recording_size": size,
+                "processing_status": "pending",
+            },
+        )
+
+        for chunk in chunks:
+            try:
+                chunk.unlink()
+            except OSError:
+                pass
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass
+
+        await AITranscriptionClient().notify_recording_ready(
+            recording_id=call_id,
+            meeting_id=call_id,
+            entity_id=UUID(str(lead_id)) if lead_id else None,
+            entity_type="lead" if lead_id else "call_session",
+            recording_path=updated.get("recording_path") or db_path,
+            actor_id=actor_id,
+            metadata={
+                "call_id": call_key,
+                "lead_id": str(lead_id) if lead_id else None,
+                "actor_id": actor_id,
+                "recording_mime": mime_type or f"audio/{extension}",
+                "recording_size": size,
+                "storage": "central_recordings_dir",
+            },
+        )
+    except Exception:
+        logger.exception("call_recording_finalize_failed call_id=%s", call_id)
+        try:
+            await repository.update_by_id(call_id, {"processing_status": "failed"})
+        except Exception:
+            pass
 
 
 def _can_manage_leads(current_user: dict) -> bool:
@@ -283,6 +390,86 @@ async def end_call_session(
     return CallSessionResponse(**updated)
 
 
+@router.post("/{call_id}/recording/start")
+async def start_call_recording_upload(
+    call_id: UUID,
+    extension: str = "webm",
+    db: Client = Depends(get_db),
+    current_user: dict = Depends(require_auth),
+    repository: CallRepository = Depends(get_call_repository),
+):
+    await _assert_can_use_call(db, repository, current_user, call_id)
+    extension = _safe_recording_extension(extension)
+    tmp_dir = _recording_tmp_dir(str(call_id))
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    for existing_chunk in tmp_dir.glob("chunk_*.part"):
+        try:
+            existing_chunk.unlink()
+        except OSError:
+            pass
+    await repository.update_by_id(call_id, {"processing_status": "pending"})
+    return {
+        "status": "ready",
+        "call_id": str(call_id),
+        "extension": extension,
+        "recording_path": _recording_db_path(str(call_id), extension),
+        "recording_url": _recording_url(str(call_id), extension),
+    }
+
+
+@router.post("/{call_id}/recording/chunks")
+async def upload_call_recording_chunk(
+    call_id: UUID,
+    chunk_index: int = Form(...),
+    file: UploadFile = File(...),
+    db: Client = Depends(get_db),
+    current_user: dict = Depends(require_auth),
+    repository: CallRepository = Depends(get_call_repository),
+):
+    await _assert_can_use_call(db, repository, current_user, call_id)
+    if chunk_index < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid recording chunk index")
+
+    tmp_dir = _recording_tmp_dir(str(call_id))
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    chunk_path = tmp_dir / f"chunk_{chunk_index:08d}.part"
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Recording chunk is empty")
+    chunk_path.write_bytes(contents)
+    return {"status": "stored", "call_id": str(call_id), "chunk_index": chunk_index, "size": len(contents)}
+
+
+@router.post("/{call_id}/recording/complete")
+async def complete_call_recording_upload(
+    call_id: UUID,
+    background_tasks: BackgroundTasks,
+    extension: str = "webm",
+    mime_type: str | None = None,
+    db: Client = Depends(get_db),
+    current_user: dict = Depends(require_auth),
+    repository: CallRepository = Depends(get_call_repository),
+):
+    existing = await _assert_can_use_call(db, repository, current_user, call_id)
+    await repository.update_by_id(call_id, {"processing_status": "processing"})
+    background_tasks.add_task(
+        _finalize_recording_from_chunks,
+        call_id=call_id,
+        lead_id=str(existing.get("lead_id")) if existing.get("lead_id") else None,
+        actor_id=str(current_user.get("id") or "") or None,
+        extension=_safe_recording_extension(extension),
+        mime_type=mime_type,
+        db=db,
+        repository=repository,
+    )
+    return {
+        "status": "accepted",
+        "call_id": str(call_id),
+        "recording_path": _recording_db_path(str(call_id), _safe_recording_extension(extension)),
+        "recording_url": _recording_url(str(call_id), _safe_recording_extension(extension)),
+    }
+
+
 @router.post("/{call_id}/recording", response_model=CallRecordingResponse)
 async def upload_call_recording(
     call_id: UUID,
@@ -292,25 +479,23 @@ async def upload_call_recording(
     current_user: dict = Depends(require_auth),
     repository: CallRepository = Depends(get_call_repository),
 ):
-    existing = await repository.get_by_id(call_id)
+    existing = await _assert_can_use_call(db, repository, current_user, call_id)
     lead_id = existing.get("lead_id")
-    if lead_id:
-        await _assert_can_view_lead(db, current_user, str(lead_id))
 
     if not file.filename:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing recording file")
 
-    os.makedirs(settings.CALL_RECORDINGS_DIR, exist_ok=True)
-    extension = (file.filename.split(".")[-1] or "webm").lower()
+    _recordings_dir().mkdir(parents=True, exist_ok=True)
+    extension = _safe_recording_extension(file.filename.split(".")[-1] if "." in file.filename else "webm")
     storage_path = _recording_storage_path(str(call_id), extension)
 
     contents = await file.read()
     with open(storage_path, "wb") as handle:
         handle.write(contents)
 
-    recording_url = f"{settings.CALL_RECORDINGS_URL_BASE}/{os.path.basename(storage_path)}"
+    recording_url = _recording_url(str(call_id), extension)
     update = {
-        "recording_path": storage_path.replace("\\", "/"),
+        "recording_path": _recording_db_path(str(call_id), extension),
         "recording_mime": file.content_type,
         "recording_size": len(contents),
         "processing_status": "pending",
@@ -328,6 +513,7 @@ async def upload_call_recording(
         metadata={
             "call_id": str(call_id),
             "lead_id": str(lead_id) if lead_id else None,
+            "actor_id": str(current_user.get("id") or "") or None,
             "recording_mime": file.content_type,
             "recording_size": len(contents),
         },

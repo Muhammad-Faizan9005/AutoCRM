@@ -243,7 +243,15 @@ class PostgresQueryBuilder:
 
 
 class PostgresClient:
-    def __init__(self, database_url: str):
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        pool_size: int = 5,
+        max_overflow: int = 5,
+        pool_timeout: int = 30,
+        pool_recycle: int = 3600,
+    ):
         # Configure connection pool for stability:
         # - pool_size: Number of connections to keep in pool (small for Supabase pooler)
         # - max_overflow: Additional connections beyond pool_size
@@ -254,10 +262,10 @@ class PostgresClient:
             database_url,
             future=True,
             poolclass=QueuePool,
-            pool_size=5,
-            max_overflow=5,
-            pool_timeout=30,
-            pool_recycle=3600,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_timeout=pool_timeout,
+            pool_recycle=pool_recycle,
             pool_pre_ping=True,
         )
         
@@ -271,7 +279,10 @@ class PostgresClient:
     def warmup_tables(self, table_names: list[str]) -> None:
         """Preload table metadata to avoid first-request reflection latency."""
         for table_name in table_names:
-            self._get_table(table_name)
+            try:
+                self._get_table(table_name)
+            except Exception as exc:
+                logger.warning("Skipping table metadata warmup for %s: %s", table_name, exc)
 
     def _get_table(self, table_name: str) -> Table:
         cached = self._table_cache.get(table_name)

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import text
 from supabase import Client
 
 from app.auth.dependencies import require_auth, require_ai_agent_auth, require_sales_manager_or_admin, generate_ai_service_token
@@ -324,6 +325,7 @@ async def reject_agent_action(
 async def dispatch_agent_action(
     payload: AgentActionIn,
     current_user: dict = Depends(require_auth),
+    db: Client = Depends(get_db),
     run_repository: AgentRunRepository = Depends(get_run_repository),
     action_repository: AgentActionRepository = Depends(get_action_repository),
     approval_repository: AgentApprovalRepository = Depends(get_approval_repository),
@@ -343,6 +345,7 @@ async def dispatch_agent_action(
 
     run_id = await _resolve_run_id(payload, run_repository)
     needs_approval = _requires_approval(payload)
+    human_actor_id = _human_actor_id(payload.data, current_user)
     action = await action_repository.create(
         {
             "run_id": run_id,
@@ -355,7 +358,7 @@ async def dispatch_agent_action(
             "idempotency_key": payload.idempotency_key,
             "approval_status": "pending" if needs_approval else "auto_approved",
             "dispatch_status": "not_dispatched",
-            "created_by": current_user.get("id"),
+            "created_by": human_actor_id,
         }
     )
 
@@ -364,9 +367,16 @@ async def dispatch_agent_action(
             {
                 "action_id": action["id"],
                 "state": "pending",
-                "requested_by": current_user.get("id"),
+                "requested_by": human_actor_id,
                 "reason": payload.reason,
             }
+        )
+        await _notify_approval_recipients(
+            db=db,
+            notification_service=notification_service,
+            action=action,
+            approval_id=str(approval["id"]),
+            actor_id=human_actor_id,
         )
         return AgentActionResponse(
             status="pending_approval",
@@ -452,6 +462,79 @@ def _requires_approval(payload: AgentActionIn) -> bool:
     return action_type in RISKY_ACTIONS
 
 
+def _human_actor_id(data: dict | None, current_user: dict) -> str | None:
+    data = data or {}
+    for key in ("assigned_to", "actor_id", "created_by", "owner_id"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    role = str(current_user.get("role") or "").lower()
+    if role in {"admin", "sales_manager", "manager", "sales_rep"} and current_user.get("id"):
+        return str(current_user.get("id"))
+    return None
+
+
+def _compact_task_description(description: object, note_content: object = None) -> tuple[str | None, str | None]:
+    text = str(description or "").strip()
+    note_text = str(note_content or "").strip()
+    if not text:
+        return None, note_text or None
+
+    is_verbose = len(text) > 260 or "\n" in text or text.count("- ") > 0 or text.count("* ") > 0
+    if not is_verbose:
+        return text, note_text or None
+
+    cleaned_lines = [
+        line.strip().lstrip("-* ").strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+    compact = cleaned_lines[0] if cleaned_lines else text
+    if len(compact) > 180:
+        compact = compact[:177].rstrip() + "..."
+    details = note_text or text
+    return compact, details
+
+
+async def _notify_approval_recipients(
+    *,
+    db: Client,
+    notification_service: NotificationService,
+    action: dict,
+    approval_id: str,
+    actor_id: str | None,
+) -> None:
+    payload = action.get("payload") or {}
+    title = str(payload.get("title") or action.get("action_type") or "AI action")
+    reason = str(action.get("reason") or "An AI workflow requires approval.")
+
+    def _query_recipients():
+        with db.engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM agents
+                    WHERE COALESCE(is_active, true) = true
+                      AND LOWER(COALESCE(role, '')) IN ('admin', 'manager', 'sales_manager')
+                    """
+                )
+            ).mappings().all()
+            return [str(row["id"]) for row in rows if row.get("id")]
+
+    recipient_ids = await run_db_operation(_query_recipients)
+    for recipient_id in recipient_ids:
+        await notification_service.create_notification(
+            recipient_id=recipient_id,
+            actor_id=actor_id,
+            type="agent_approval",
+            title=f"AI approval required: {title}",
+            message=f"{reason} Review approval #{approval_id} in the AI Control Center.",
+            entity_type=str(action.get("entity_type") or ""),
+            entity_id=str(action.get("entity_id") or ""),
+        )
+
+
 async def _dispatch_payload_action(
     payload: AgentActionIn,
     *,
@@ -512,12 +595,14 @@ async def _dispatch_action_data(
 ) -> dict[str, str | None]:
     action_type = action_type.strip().lower()
     if action_type == "create_task":
+        assigned_to = data.get("assigned_to") or data.get("actor_id") or data.get("created_by")
+        description, note_content = _compact_task_description(data.get("description"), data.get("note_content"))
         task_payload = TaskCreate(
             entity_type=entity_type,
             entity_id=entity_id,
             title=str(data.get("title")),
-            description=data.get("description"),
-            assigned_to=data.get("assigned_to"),
+            description=description,
+            assigned_to=assigned_to,
             status=data.get("status") or "backlog",
             priority=data.get("priority") or "medium",
             due_at=_parse_datetime(data.get("due_at")),
@@ -526,14 +611,37 @@ async def _dispatch_action_data(
             ai_action_id=UUID(str(agent_action_id)) if agent_action_id else None,
         )
         created = await task_repository.create(task_payload.model_dump())
-        return {"record_type": "task", "id": str(created.get("id")) if created.get("id") else None}
+        created_id = str(created.get("id")) if created.get("id") else None
+        actor_id = _human_actor_id(data, current_user)
+        if note_content:
+            note_payload = NoteCreate(
+                entity_type=entity_type,
+                entity_id=entity_id,
+                content=note_content,
+                author_id=UUID(str(actor_id)) if actor_id else None,
+                source="ai",
+                ai_reason="Meeting details captured from transcript",
+                ai_action_id=UUID(str(agent_action_id)) if agent_action_id else None,
+            )
+            await note_repository.create(note_payload.model_dump())
+        if assigned_to:
+            await notification_service.create_notification(
+                recipient_id=str(assigned_to),
+                actor_id=actor_id,
+                type="task_assigned",
+                title="AI task assigned to you",
+                message=f"AI created task \"{created.get('title') or data.get('title') or 'Untitled Task'}\" from a meeting.",
+                entity_type="task",
+                entity_id=created_id,
+            )
+        return {"record_type": "task", "id": created_id}
 
     if action_type == "create_note":
         note_payload = NoteCreate(
             entity_type=entity_type,
             entity_id=entity_id,
             content=str(data.get("content") or data.get("title") or reason),
-            author_id=UUID(str(current_user.get("id"))) if current_user.get("id") else None,
+            author_id=UUID(str(_human_actor_id(data, current_user))) if _human_actor_id(data, current_user) else None,
             source="ai",
             ai_reason=reason,
             ai_action_id=UUID(str(agent_action_id)) if agent_action_id else None,
@@ -562,7 +670,7 @@ def _parse_datetime(value: object) -> datetime | None:
     if isinstance(value, datetime):
         return value
     try:
-        return datetime.fromisoformat(str(value))
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
 

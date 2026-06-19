@@ -45,10 +45,12 @@ async def security_middleware(request: Request, call_next):
     max_size = settings.MAX_REQUEST_SIZE_BYTES
     if request.url.path == "/api/auth/avatar":
         max_size = max(max_size, settings.SUPABASE_MAX_AVATAR_BYTES + 250_000)
+    if request.url.path.startswith("/api/calls/") and "/recording" in request.url.path:
+        max_size = None
 
     content_length = request.headers.get("content-length")
 
-    if content_length and content_length.isdigit() and int(content_length) > max_size:
+    if max_size is not None and content_length and content_length.isdigit() and int(content_length) > max_size:
         request_id = getattr(request.state, "request_id", "unknown")
         return JSONResponse(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,

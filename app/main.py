@@ -23,6 +23,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
+app.mount("/static/recordings", StaticFiles(directory=settings.CALL_RECORDINGS_DIR), name="recordings")
 app.mount("/static", StaticFiles(directory="storage"), name="static")
 
 # CORS middleware for frontend integration — register early so preflight
@@ -56,10 +57,36 @@ setup_exception_handlers(app)
 
 @app.on_event("startup")
 async def warmup_database_metadata() -> None:
-    # Preload metadata used during auth flows so first login is not penalized.
+    # Preload metadata used by the main app screens so first page visits are not penalized.
     db = get_db()
     await run_db_operation(
-        lambda: db.warmup_tables(["agents", "agent_permissions", "revoked_tokens"])
+        lambda: db.warmup_tables(
+            [
+                "agents",
+                "agent_permissions",
+                "revoked_tokens",
+                "organizations",
+                "leads",
+                "deals",
+                "tasks",
+                "notes",
+                "notifications",
+                "teams",
+                "team_members",
+                "call_sessions",
+                "call_room_tokens",
+                "ai_interactions",
+                "ai_agent_runs",
+                "ai_agent_run_traces",
+                "ai_agent_actions",
+                "ai_agent_approval_requests",
+                "ai_agent_settings",
+                "customers",
+                "tickets",
+                "ticket_messages",
+                "status_change_logs",
+            ]
+        )
     )
 
 @app.get("/")

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, List
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy import text
 from supabase import Client
 
@@ -124,6 +124,62 @@ async def _enrich_task_rows(db: Client, rows: list[dict[str, Any]]) -> list[dict
     return output
 
 
+async def _notify_task_assigned(
+    *,
+    notification_service: NotificationService,
+    email_service: MailjetEmailService,
+    recipient_id: str,
+    actor_id: str,
+    task_id: str,
+    task_title: str,
+    title: str = "Task assigned to you",
+) -> None:
+    try:
+        actor_name = await notification_service.get_agent_name(actor_id)
+        await notification_service.create_notification(
+            recipient_id=recipient_id,
+            actor_id=actor_id,
+            type="task_assigned",
+            title=title,
+            message=f"{actor_name or 'Manager'} assigned task \"{task_title}\" to you.",
+            entity_type="task",
+            entity_id=task_id,
+        )
+        recipient_email = await email_service.get_recipient_email(recipient_id)
+        if recipient_email:
+            await email_service.send_task_assigned_email(
+                recipient_id=recipient_id,
+                recipient_email=recipient_email,
+                actor_name=actor_name or "Manager",
+                task_title=task_title,
+            )
+    except Exception:
+        return
+
+
+async def _notify_task_unassigned(
+    *,
+    notification_service: NotificationService,
+    recipient_id: str,
+    actor_id: str,
+    task_id: str,
+    task_title: str,
+) -> None:
+    try:
+        actor_name = await notification_service.get_agent_name(actor_id)
+        await notification_service.create_notification(
+            recipient_id=recipient_id,
+            actor_id=actor_id,
+            type="task_unassigned",
+            title="Task unassigned",
+            message=f"{actor_name or 'Manager'} unassigned task \"{task_title}\" from you.",
+            entity_type="task",
+            entity_id=task_id,
+        )
+    except Exception:
+        return
+
+
 @router.get("/", response_model=List[TaskResponse])
 async def get_tasks(
     skip: int = 0,
@@ -228,6 +284,7 @@ async def get_task(
 @router.post("/", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 async def create_task(
     payload: TaskCreate,
+    background_tasks: BackgroundTasks,
     db: Client = Depends(get_db),
     current_user: dict = Depends(require_auth),
     repository: TaskRepository = Depends(get_task_repository),
@@ -254,27 +311,16 @@ async def create_task(
     assigned_to = str(created.get("assigned_to") or "")
     actor_id = str(current_user.get("id") or "")
     if assigned_to and assigned_to != actor_id:
-        actor_name = await notification_service.get_agent_name(actor_id)
-        await notification_service.create_notification(
+        background_tasks.add_task(
+            _notify_task_assigned,
+            notification_service=notification_service,
+            email_service=email_service,
             recipient_id=assigned_to,
             actor_id=actor_id,
-            type="task_assigned",
+            task_id=str(created.get("id")),
+            task_title=created.get("title") or "Untitled Task",
             title="New task assigned",
-            message=f"{actor_name or 'Manager'} assigned task \"{created.get('title') or 'Untitled Task'}\" to you.",
-            entity_type="task",
-            entity_id=str(created.get("id")),
         )
-        try:
-            recipient_email = await email_service.get_recipient_email(assigned_to)
-            if recipient_email:
-                await email_service.send_task_assigned_email(
-                    recipient_id=assigned_to,
-                    recipient_email=recipient_email,
-                    actor_name=actor_name or "Manager",
-                    task_title=created.get("title") or "Untitled Task",
-                )
-        except Exception:
-            pass
     return (await _enrich_task_rows(db, [created]))[0]
 
 
@@ -282,6 +328,7 @@ async def create_task(
 async def update_task(
     task_id: UUID,
     payload: TaskUpdate,
+    background_tasks: BackgroundTasks,
     db: Client = Depends(get_db),
     current_user: dict = Depends(require_auth),
     repository: TaskRepository = Depends(get_task_repository),
@@ -318,39 +365,27 @@ async def update_task(
     old_assignee = str(existing_task.get("assigned_to") or "")
     new_assignee = str(updated.get("assigned_to") or "")
     actor_id = str(current_user.get("id") or "")
+    task_title = updated.get("title") or "Untitled Task"
+    task_id_text = str(updated.get("id"))
     if old_assignee and old_assignee != new_assignee and old_assignee != actor_id:
-        actor_name = await notification_service.get_agent_name(actor_id)
-        await notification_service.create_notification(
+        background_tasks.add_task(
+            _notify_task_unassigned,
+            notification_service=notification_service,
             recipient_id=old_assignee,
             actor_id=actor_id,
-            type="task_unassigned",
-            title="Task unassigned",
-            message=f"{actor_name or 'Manager'} unassigned task \"{updated.get('title') or 'Untitled Task'}\" from you.",
-            entity_type="task",
-            entity_id=str(updated.get("id")),
+            task_id=task_id_text,
+            task_title=task_title,
         )
     if new_assignee and new_assignee != old_assignee and new_assignee != actor_id:
-        actor_name = await notification_service.get_agent_name(actor_id)
-        await notification_service.create_notification(
+        background_tasks.add_task(
+            _notify_task_assigned,
+            notification_service=notification_service,
+            email_service=email_service,
             recipient_id=new_assignee,
             actor_id=actor_id,
-            type="task_assigned",
-            title="Task assigned to you",
-            message=f"{actor_name or 'Manager'} assigned task \"{updated.get('title') or 'Untitled Task'}\" to you.",
-            entity_type="task",
-            entity_id=str(updated.get("id")),
+            task_id=task_id_text,
+            task_title=task_title,
         )
-        try:
-            recipient_email = await email_service.get_recipient_email(new_assignee)
-            if recipient_email:
-                await email_service.send_task_assigned_email(
-                    recipient_id=new_assignee,
-                    recipient_email=recipient_email,
-                    actor_name=actor_name or "Manager",
-                    task_title=updated.get("title") or "Untitled Task",
-                )
-        except Exception:
-            pass
     return updated
 
 
