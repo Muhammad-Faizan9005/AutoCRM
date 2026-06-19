@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     
     # Database Settings
     DATABASE_URL: Optional[str] = None
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 5
+    DB_POOL_TIMEOUT_SECONDS: int = 30
+    DB_POOL_RECYCLE_SECONDS: int = 3600
+    DB_MAX_CONCURRENT_OPERATIONS: int = 5
 
     # Supabase Storage
     SUPABASE_URL: Optional[str] = Field(
@@ -91,7 +96,10 @@ class Settings(BaseSettings):
 
     # Call module settings
     CALL_ROOM_TOKEN_TTL_MINUTES: int = 15
-    CALL_RECORDINGS_DIR: str = "storage/recordings"
+    CALL_RECORDINGS_DIR: str = Field(
+        default="storage/recordings",
+        validation_alias=AliasChoices("CALL_RECORDINGS_DIR", "AUTOCRM_RECORDINGS_DIR", "RECORDINGS_STORAGE_DIR"),
+    )
     CALL_RECORDINGS_URL_BASE: str = "/static/recordings"
 
     # AI service transcription notification
