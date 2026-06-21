@@ -322,6 +322,13 @@ CREATE INDEX idx_call_room_tokens_call_id ON call_room_tokens(call_id);
 CREATE INDEX idx_call_room_tokens_expires_at ON call_room_tokens(expires_at);
 CREATE INDEX idx_team_members_agent_id ON team_members(agent_id);
 CREATE INDEX idx_agents_team_id ON agents(team_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_entity_type_entity_id_due_at ON tasks(entity_type, entity_id, due_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_assigned_to_status_due_at ON tasks(assigned_to, status, due_at);
+CREATE INDEX IF NOT EXISTS idx_notes_entity_type_entity_id_created_at ON notes(entity_type, entity_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_call_sessions_lead_id_started_at ON call_sessions(lead_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deals_owner_id_created_at ON deals(owner_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deals_lead_id_created_at ON deals(lead_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient_id_created_at ON notifications(recipient_id, created_at DESC);
 
 -- =============================================
 -- UPDATE TIMESTAMP TRIGGER

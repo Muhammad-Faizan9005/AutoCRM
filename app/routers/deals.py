@@ -117,6 +117,76 @@ async def _can_access_deal(db: Client, current_user: dict, deal: dict) -> bool:
     return False
 
 
+async def _list_deals_workspace(
+    db: Client,
+    current_user: dict,
+    *,
+    skip: int = 0,
+    limit: int = 100,
+    stage: str | None = None,
+    owner_id: UUID | None = None,
+    organization_id: UUID | None = None,
+    lead_id: UUID | None = None,
+) -> list[dict[str, Any]]:
+    role = str(current_user.get("role") or "").strip().lower()
+    requester_id = str(current_user.get("id") or "")
+
+    if owner_id is not None and not await can_access_rep(db, current_user, str(owner_id)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+
+    def _query():
+        with db.engine.connect() as conn:
+            sql = (
+                "SELECT DISTINCT d.*, "
+                "l.name AS lead_name, l.company AS lead_company, "
+                "o.name AS organization_name, "
+                "a.full_name AS owner_name, a.email AS owner_email "
+                "FROM deals d "
+                "LEFT JOIN leads l ON l.id = d.lead_id "
+                "LEFT JOIN organizations o ON o.id = d.organization_id "
+                "LEFT JOIN agents a ON a.id = d.owner_id "
+            )
+            params: dict[str, Any] = {}
+            where_clauses: list[str] = []
+
+            if role in {"manager", "sales_manager"} and owner_id is None:
+                sql += (
+                    "LEFT JOIN team_members tm_deal ON tm_deal.agent_id = d.owner_id "
+                    "LEFT JOIN teams team_deal ON team_deal.id = tm_deal.team_id "
+                    "LEFT JOIN team_members tm_lead ON tm_lead.agent_id = l.owner_id "
+                    "LEFT JOIN teams team_lead ON team_lead.id = tm_lead.team_id "
+                )
+                where_clauses.append("(team_deal.manager_id = :mid OR team_lead.manager_id = :mid)")
+                params["mid"] = requester_id
+            elif role not in {"admin", "manager", "sales_manager"} and owner_id is None:
+                where_clauses.append("(d.owner_id = :uid OR l.owner_id = :uid)")
+                params["uid"] = requester_id
+            elif owner_id is not None:
+                where_clauses.append("d.owner_id = :owner_id")
+                params["owner_id"] = str(owner_id)
+
+            if stage:
+                where_clauses.append("d.stage = :stage")
+                params["stage"] = stage
+            if organization_id:
+                where_clauses.append("d.organization_id = :org_id")
+                params["org_id"] = str(organization_id)
+            if lead_id:
+                where_clauses.append("d.lead_id = :lead_id")
+                params["lead_id"] = str(lead_id)
+
+            if where_clauses:
+                sql += "WHERE " + " AND ".join(where_clauses) + " "
+
+            sql += "ORDER BY d.created_at DESC OFFSET :skip LIMIT :limit"
+            params["skip"] = skip
+            params["limit"] = limit
+            rows = conn.execute(text(sql), params).mappings().all()
+            return [dict(row) for row in rows]
+
+    return await run_db_operation(_query)
+
+
 @router.get("/", response_model=List[DealResponse])
 async def get_deals(
     skip: int = 0,
@@ -202,6 +272,29 @@ async def get_deals(
         owner_id=str(owner_id) if owner_id else None,
         organization_id=str(organization_id) if organization_id else None,
         lead_id=str(lead_id) if lead_id else None,
+    )
+
+
+@router.get("/workspace")
+async def get_deals_workspace(
+    skip: int = 0,
+    limit: int = 100,
+    stage: str | None = None,
+    owner_id: UUID | None = None,
+    organization_id: UUID | None = None,
+    lead_id: UUID | None = None,
+    db: Client = Depends(get_db),
+    current_user: dict = Depends(require_auth),
+):
+    return await _list_deals_workspace(
+        db,
+        current_user,
+        skip=skip,
+        limit=limit,
+        stage=stage,
+        owner_id=owner_id,
+        organization_id=organization_id,
+        lead_id=lead_id,
     )
 
 

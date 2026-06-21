@@ -177,6 +177,118 @@ async def _get_lead_ai_history(db: Client, lead_id: str) -> list[dict[str, Any]]
     return await run_db_operation(_query)
 
 
+def _build_mock_lead_emails(lead_id: str, lead_name: str | None, lead_email: str | None) -> list[dict[str, Any]]:
+    display_name = lead_name or "Lead"
+    display_email = lead_email or "unknown@example.com"
+    now = datetime.now(timezone.utc)
+    return [
+        {
+            "id": f"email-{lead_id}-1",
+            "direction": "received",
+            "subject": f"Re: {display_name} onboarding",
+            "from": display_email,
+            "to": "sales@autocrm.io",
+            "sent_at": (now - timedelta(days=2, hours=3)).isoformat(),
+            "snippet": "Thanks for the details, can we schedule a quick call?",
+        },
+        {
+            "id": f"email-{lead_id}-2",
+            "direction": "sent",
+            "subject": f"Welcome {display_name}",
+            "from": "sales@autocrm.io",
+            "to": display_email,
+            "sent_at": (now - timedelta(days=1, hours=2)).isoformat(),
+            "snippet": "Sharing next steps and a short overview of the platform.",
+        },
+    ]
+
+
+async def _get_lead_workspace(db: Client, lead_id: str) -> dict[str, Any]:
+    def _query():
+        with db.engine.connect() as conn:
+            lead = conn.execute(
+                text("SELECT * FROM leads WHERE id = :lead_id"),
+                {"lead_id": lead_id},
+            ).mappings().first()
+            if not lead:
+                return None
+
+            owner = conn.execute(
+                text(
+                    "SELECT a.full_name, a.email "
+                    "FROM leads l "
+                    "LEFT JOIN agents a ON a.id = l.owner_id "
+                    "WHERE l.id = :lead_id"
+                ),
+                {"lead_id": lead_id},
+            ).mappings().first()
+
+            calls = conn.execute(
+                text(
+                    "SELECT * FROM call_sessions "
+                    "WHERE lead_id = :lead_id "
+                    "ORDER BY started_at DESC LIMIT 50"
+                ),
+                {"lead_id": lead_id},
+            ).mappings().all()
+
+            tasks = conn.execute(
+                text(
+                    "SELECT t.*, l.name AS lead_name, a.full_name AS assignee_name, a.email AS assignee_email "
+                    "FROM tasks t "
+                    "LEFT JOIN leads l ON l.id = t.entity_id AND t.entity_type = 'lead' "
+                    "LEFT JOIN agents a ON a.id = t.assigned_to "
+                    "WHERE t.entity_type = 'lead' AND t.entity_id = :lead_id "
+                    "ORDER BY t.due_at ASC NULLS LAST, t.created_at DESC LIMIT 50"
+                ),
+                {"lead_id": lead_id},
+            ).mappings().all()
+
+            notes = conn.execute(
+                text(
+                    "SELECT * FROM notes "
+                    "WHERE entity_type = 'lead' AND entity_id = :lead_id "
+                    "ORDER BY created_at DESC LIMIT 50"
+                ),
+                {"lead_id": lead_id},
+            ).mappings().all()
+
+            ai_history = conn.execute(
+                text(
+                    "SELECT aa.id, aa.action_type, aa.reason, aa.approval_status, aa.dispatch_status, "
+                    "aa.crm_record_type, aa.crm_record_id, aa.created_at, ar.trigger_type, ar.status AS run_status "
+                    "FROM ai_agent_actions aa LEFT JOIN ai_agent_runs ar ON ar.id = aa.run_id "
+                    "WHERE aa.entity_type='lead' AND aa.entity_id=:lead_id "
+                    "ORDER BY aa.created_at DESC LIMIT 50"
+                ),
+                {"lead_id": lead_id},
+            ).mappings().all()
+
+            lead_dict = dict(lead)
+            owner_dict = dict(owner) if owner else {}
+            return {
+                "lead": lead_dict,
+                "owner": {
+                    "name": str(owner_dict.get("full_name")) if owner_dict.get("full_name") else None,
+                    "email": str(owner_dict.get("email")) if owner_dict.get("email") else None,
+                },
+                "emails": _build_mock_lead_emails(
+                    lead_id,
+                    str(lead_dict.get("name")) if lead_dict.get("name") else None,
+                    str(lead_dict.get("email")) if lead_dict.get("email") else None,
+                ),
+                "calls": [dict(row) for row in calls],
+                "tasks": [dict(row) for row in tasks],
+                "notes": [dict(row) for row in notes],
+                "ai_history": [dict(row) for row in ai_history],
+            }
+
+    workspace = await run_db_operation(_query)
+    if workspace is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lead not found")
+    return workspace
+
+
 async def _assert_lead_assignment_permissions(
     db: Client,
     current_user: dict,
@@ -325,6 +437,16 @@ async def get_lead_ai_history(
 ):
     await _assert_can_view_lead(db, current_user, str(lead_id))
     return await _get_lead_ai_history(db, str(lead_id))
+
+
+@router.get("/{lead_id}/workspace")
+async def get_lead_workspace(
+    lead_id: UUID,
+    db: Client = Depends(get_db),
+    current_user: dict = Depends(require_auth),
+):
+    await _assert_can_view_lead(db, current_user, str(lead_id))
+    return await _get_lead_workspace(db, str(lead_id))
 
 
 @router.get("/{lead_id}", response_model=LeadResponse)
@@ -618,29 +740,7 @@ async def get_lead_emails(
     """Mock email timeline for a lead."""
     await _assert_can_view_lead(db, current_user, str(lead_id))
     profile = await _get_lead_profile(db, str(lead_id))
-    lead_name = profile.get("name") or "Lead"
-    lead_email = profile.get("email") or "unknown@example.com"
-    now = datetime.now(timezone.utc)
-    return [
-        {
-            "id": f"email-{lead_id}-1",
-            "direction": "received",
-            "subject": f"Re: {lead_name} onboarding",
-            "from": lead_email,
-            "to": "sales@autocrm.io",
-            "sent_at": (now - timedelta(days=2, hours=3)).isoformat(),
-            "snippet": "Thanks for the details, can we schedule a quick call?",
-        },
-        {
-            "id": f"email-{lead_id}-2",
-            "direction": "sent",
-            "subject": f"Welcome {lead_name}",
-            "from": "sales@autocrm.io",
-            "to": lead_email,
-            "sent_at": (now - timedelta(days=1, hours=2)).isoformat(),
-            "snippet": "Sharing next steps and a short overview of the platform.",
-        },
-    ]
+    return _build_mock_lead_emails(str(lead_id), profile.get("name"), profile.get("email"))
 
 
 @router.get("/{lead_id}/calls", response_model=List[CallSessionResponse])
