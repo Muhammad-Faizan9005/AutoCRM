@@ -79,6 +79,7 @@ class ResetPasswordRequest(BaseModel):
 class ProfileUpdateRequest(BaseModel):
     """Self-service profile settings update."""
     full_name: str | None = Field(default=None, min_length=2, max_length=255)
+    email: EmailStr | None = None
     avatar_url: str | None = Field(default=None, max_length=4096)
     current_password: str | None = Field(default=None, min_length=6)
     new_password: str | None = Field(default=None, min_length=6, max_length=128)

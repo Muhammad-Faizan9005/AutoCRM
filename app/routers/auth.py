@@ -290,8 +290,10 @@ async def update_current_user_profile(
 
     new_password = update_data.pop("new_password", None)
     current_password = update_data.pop("current_password", None)
-    allowed_fields = {"full_name"}
+    allowed_fields = {"full_name", "email"}
     update_data = {key: value for key, value in update_data.items() if key in allowed_fields}
+    if "email" in update_data and update_data["email"] is not None:
+        update_data["email"] = str(update_data["email"]).strip().lower()
 
     user_id = str(current_user.get("id") or "")
     if not user_id:
@@ -309,10 +311,34 @@ async def update_current_user_profile(
     if not fresh_user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    if new_password:
+    email_changed = (
+        "email" in update_data
+        and update_data["email"] is not None
+        and str(update_data["email"]).lower() != str(fresh_user.get("email") or "").lower()
+    )
+
+    if new_password or email_changed:
         stored_hash = fresh_user.get("password_hash")
         if not current_password or not stored_hash or not verify_password(current_password, stored_hash):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
+
+    if email_changed:
+        def _email_exists():
+            with db.engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT id FROM agents "
+                        "WHERE lower(email) = lower(:email) AND id != :user_id "
+                        "LIMIT 1"
+                    ),
+                    {"email": update_data["email"], "user_id": user_id},
+                ).mappings().first()
+                return bool(row)
+
+        if await run_db_operation(_email_exists):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email is already in use")
+
+    if new_password:
         update_data["password_hash"] = hash_password(new_password)
 
     if not update_data:

@@ -67,7 +67,6 @@ class Settings(BaseSettings):
             "jwt_refresh_token_expire_days",
         ),
     )
-
     # Security hardening settings
     RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_REQUESTS_PER_MINUTE: int = 100  # Tuned down from 120 to prevent overload
