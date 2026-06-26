@@ -21,6 +21,8 @@ class CustomerBase(BaseModel):
     company: Optional[str] = Field(default=None, min_length=2, max_length=255)
     status: Optional[CustomerStatus] = "active"
     notes: Optional[str] = Field(default=None, max_length=5000)
+    owner_id: Optional[UUID] = None
+    team_id: Optional[UUID] = None
 
     @field_validator("full_name")
     @classmethod
@@ -66,6 +68,8 @@ class CustomerUpdate(BaseModel):
     company: Optional[str] = Field(default=None, min_length=2, max_length=255)
     status: Optional[CustomerStatus] = None
     notes: Optional[str] = Field(default=None, max_length=5000)
+    owner_id: Optional[UUID] = None
+    team_id: Optional[UUID] = None
 
     @field_validator("full_name")
     @classmethod

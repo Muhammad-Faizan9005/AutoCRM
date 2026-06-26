@@ -14,6 +14,7 @@ from app.utils.cache import get_cached_user, cache_user
 from app.services.permission_service import PermissionService
 
 security = HTTPBearer()
+optional_security = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
@@ -128,6 +129,22 @@ async def require_auth(current_user: dict = Depends(get_current_user)) -> dict:
     exposing endpoints by forgetting the auth dependency.
     """
     return current_user
+
+
+async def require_human_or_ai_agent_auth(
+    credentials: HTTPAuthorizationCredentials | None = Depends(optional_security),
+    x_ai_agent_key: Optional[str] = Header(default=None, alias="X-AI-Agent-Key"),
+    x_ai_service_token: Optional[str] = Header(default=None, alias="X-AI-Service-Token"),
+    db: Client = Depends(get_db),
+) -> Dict[str, Any]:
+    if x_ai_agent_key or x_ai_service_token:
+        return await require_ai_agent_auth(x_ai_agent_key, x_ai_service_token, db)
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication credentials are required",
+        )
+    return await get_current_user(credentials, db)
 
 
 def require_role(allowed_roles: list[str]):

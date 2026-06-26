@@ -19,6 +19,7 @@ from app.repositories.customer_repository import CustomerRepository
 from app.repositories.deal_repository import DealRepository
 from app.repositories.lead_repository import LeadRepository
 from app.services.status_change_log_service import StatusChangeLogService
+from app.utils.team_access import get_agent_team_id
 
 
 class ConversionService:
@@ -170,7 +171,10 @@ class ConversionService:
             "company": lead.get("company") if lead else None,
             "status": "active",
             "notes": f"Converted from deal {deal_id}",
+            "owner_id": deal.get("owner_id") or (lead.get("owner_id") if lead else None),
         }
+        if customer_data.get("owner_id"):
+            customer_data["team_id"] = await get_agent_team_id(self.db, str(customer_data["owner_id"]))
 
         # Remove None values
         customer_data = {k: v for k, v in customer_data.items() if v is not None}

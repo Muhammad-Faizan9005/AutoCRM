@@ -105,6 +105,7 @@ class Settings(BaseSettings):
     AI_SERVICE_BASE_URL: str = "http://localhost:8001"
     AI_TRANSCRIPTION_NOTIFY_ENABLED: bool = True
     AI_SERVICE_NOTIFY_TIMEOUT_SECONDS: int = 10
+    AI_SERVICE_WEBHOOK_TOKEN: Optional[str] = None
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 

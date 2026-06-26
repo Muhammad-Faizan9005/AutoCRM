@@ -17,6 +17,7 @@ from app.repositories.ticket_repository import TicketRepository
 from app.schemas.lead import LeadCreate
 from app.schemas.imports import ImportFailure, ImportResult
 from app.schemas.ticket import TicketCreate
+from app.utils.team_access import get_agent_team_id
 
 
 try:
@@ -165,7 +166,12 @@ class ImportService:
         self.organization_repository = OrganizationRepository(db)
         self.ticket_repository = TicketRepository(db)
 
-    async def get_or_create_organization(self, *, company_name: str) -> dict[str, Any] | None:
+    async def get_or_create_organization(
+        self,
+        *,
+        company_name: str,
+        owner_id: str | None = None,
+    ) -> dict[str, Any] | None:
         """
         Find or create an organization by company name.
         Returns the organization dict or None if company_name is empty.
@@ -179,6 +185,9 @@ class ImportService:
             return existing_org
 
         org_data = {"name": company_name_clean}
+        if owner_id:
+            org_data["owner_id"] = owner_id
+            org_data["team_id"] = await get_agent_team_id(self.organization_repository.db, owner_id)
         created_org = await self.organization_repository.create(org_data)
         return created_org
 
@@ -187,6 +196,7 @@ class ImportService:
         *,
         row: dict[str, Any],
         notes_content: str | None,
+        owner_id: str | None = None,
     ) -> tuple[dict[str, Any] | None, bool]:
         """
         Create or update a lead from imported row data.
@@ -195,7 +205,7 @@ class ImportService:
         organization_id = None
         company = row.get("company")
         if company:
-            org = await self.get_or_create_organization(company_name=company)
+            org = await self.get_or_create_organization(company_name=company, owner_id=owner_id)
             if org:
                 organization_id = org.get("id")
 
@@ -210,6 +220,8 @@ class ImportService:
             "score": row.get("score"),
             "score_reason": row.get("score_reason") or None,
         }
+        if owner_id:
+            lead_data["owner_id"] = owner_id
 
         model = LeadCreate(**lead_data)
         payload = model.model_dump(exclude_none=True)
@@ -219,6 +231,8 @@ class ImportService:
         if model.email:
             existing_lead = await self.lead_repository.find_one(filters={"email": str(model.email)})
             if existing_lead:
+                if existing_lead.get("owner_id"):
+                    payload.pop("owner_id", None)
                 saved_lead = await self.lead_repository.update_by_id(existing_lead["id"], payload)
             else:
                 saved_lead = await self.lead_repository.create(payload)
@@ -261,7 +275,7 @@ class ImportService:
         created_note = await self.note_repository.create(note_data)
         return created_note
 
-    async def ingest_lead_payload(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+    async def ingest_lead_payload(self, *, payload: dict[str, Any], owner_id: str | None = None) -> dict[str, Any]:
         notes_content = _extract_note_content(payload)
         lead_payload = {
             "name": (
@@ -280,13 +294,17 @@ class ImportService:
             "score_reason": payload.get("score_reason") or None,
         }
 
-        lead, _created = await self.create_or_update_lead_from_row(row=lead_payload, notes_content=notes_content)
+        lead, _created = await self.create_or_update_lead_from_row(
+            row=lead_payload,
+            notes_content=notes_content,
+            owner_id=owner_id,
+        )
         if lead:
             await self.create_notes_from_lead(lead={**lead, "notes": notes_content} if notes_content else lead)
 
         return lead
 
-    async def import_leads(self, *, file_name: str, file_bytes: bytes) -> ImportResult:
+    async def import_leads(self, *, file_name: str, file_bytes: bytes, owner_id: str | None = None) -> ImportResult:
         parsed_rows = _parse_rows(file_name=file_name, file_bytes=file_bytes)
 
         created_count = 0
@@ -315,6 +333,7 @@ class ImportService:
                 lead_to_process, was_created = await self.create_or_update_lead_from_row(
                     row=payload,
                     notes_content=notes_content,
+                    owner_id=owner_id,
                 )
                 if lead_to_process and lead_to_process.get("id"):
                     if was_created:
