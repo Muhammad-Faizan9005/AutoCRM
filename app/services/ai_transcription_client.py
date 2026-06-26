@@ -41,8 +41,15 @@ class AITranscriptionClient:
             "metadata": metadata or {},
         }
         try:
+            headers = {}
+            if settings.AI_SERVICE_WEBHOOK_TOKEN:
+                headers["X-AutoCRM-AI-Webhook-Token"] = settings.AI_SERVICE_WEBHOOK_TOKEN
             async with httpx.AsyncClient(timeout=settings.AI_SERVICE_NOTIFY_TIMEOUT_SECONDS) as client:
-                response = await client.post(f"{base_url}/transcriptions/recording-ready", json=payload)
+                response = await client.post(
+                    f"{base_url}/transcriptions/recording-ready",
+                    json=payload,
+                    headers=headers,
+                )
                 response.raise_for_status()
         except Exception as exc:
             logger.warning("ai_transcription_notify_failed recording_id=%s error=%s", recording_id, exc)

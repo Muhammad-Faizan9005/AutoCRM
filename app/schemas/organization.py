@@ -17,6 +17,8 @@ class OrganizationBase(BaseModel):
     revenue: Optional[float] = Field(default=None, ge=0)
     address: Optional[str] = Field(default=None, max_length=1000)
     phone: Optional[str] = Field(default=None, max_length=20)
+    owner_id: Optional[UUID] = None
+    team_id: Optional[UUID] = None
 
     @field_validator("name", "website", "industry", "address")
     @classmethod
@@ -47,6 +49,8 @@ class OrganizationUpdate(BaseModel):
     revenue: Optional[float] = Field(default=None, ge=0)
     address: Optional[str] = Field(default=None, max_length=1000)
     phone: Optional[str] = Field(default=None, max_length=20)
+    owner_id: Optional[UUID] = None
+    team_id: Optional[UUID] = None
 
     @field_validator("name", "website", "industry", "address")
     @classmethod

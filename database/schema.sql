@@ -16,6 +16,8 @@ CREATE TABLE customers (
     status VARCHAR(50) DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'lead', 'churned')),
     notes TEXT,
     metadata JSONB DEFAULT '{}',
+    owner_id UUID,
+    team_id UUID,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -125,6 +127,12 @@ CREATE TABLE team_members (
 ALTER TABLE agents ADD CONSTRAINT fk_agents_team_id
     FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE SET NULL;
 
+ALTER TABLE customers ADD CONSTRAINT fk_customers_owner_id
+    FOREIGN KEY (owner_id) REFERENCES agents(id) ON DELETE SET NULL;
+
+ALTER TABLE customers ADD CONSTRAINT fk_customers_team_id
+    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE SET NULL;
+
 -- =============================================
 -- REVOKED TOKENS (JWT invalidation)
 -- =============================================
@@ -159,6 +167,8 @@ CREATE TABLE organizations (
     revenue NUMERIC(14, 2),
     address TEXT,
     phone VARCHAR(50),
+    owner_id UUID REFERENCES agents(id) ON DELETE SET NULL,
+    team_id UUID REFERENCES teams(id) ON DELETE SET NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -192,6 +202,7 @@ CREATE TABLE deals (
     lead_id UUID REFERENCES leads(id) ON DELETE SET NULL,
     owner_id UUID REFERENCES agents(id) ON DELETE SET NULL,
     organization_id UUID REFERENCES organizations(id) ON DELETE SET NULL,
+    customer_id UUID REFERENCES customers(id) ON DELETE SET NULL,
     stage VARCHAR(50) DEFAULT 'prospecting',
     value NUMERIC(14, 2),
     currency VARCHAR(10) DEFAULT 'USD',
@@ -284,6 +295,8 @@ CREATE TABLE call_room_tokens (
 -- =============================================
 CREATE INDEX idx_customers_email ON customers(email);
 CREATE INDEX idx_customers_status ON customers(status);
+CREATE INDEX idx_customers_owner_id ON customers(owner_id);
+CREATE INDEX idx_customers_team_id ON customers(team_id);
 CREATE INDEX idx_tickets_customer_id ON tickets(customer_id);
 CREATE INDEX idx_tickets_status ON tickets(status);
 CREATE INDEX idx_tickets_priority ON tickets(priority);
@@ -296,6 +309,8 @@ CREATE INDEX idx_deleted_users_agent_id ON deleted_users(agent_id);
 CREATE INDEX idx_deleted_users_deleted_at ON deleted_users(deleted_at);
 CREATE INDEX idx_organizations_name ON organizations(name);
 CREATE INDEX idx_organizations_industry ON organizations(industry);
+CREATE INDEX idx_organizations_owner_id ON organizations(owner_id);
+CREATE INDEX idx_organizations_team_id ON organizations(team_id);
 CREATE INDEX idx_leads_status ON leads(status);
 CREATE INDEX idx_leads_owner_id ON leads(owner_id);
 CREATE INDEX idx_leads_source ON leads(source);
@@ -303,6 +318,7 @@ CREATE INDEX idx_leads_created_at ON leads(created_at DESC);
 CREATE INDEX idx_deals_stage ON deals(stage);
 CREATE INDEX idx_deals_owner_id ON deals(owner_id);
 CREATE INDEX idx_deals_organization_id ON deals(organization_id);
+CREATE INDEX idx_deals_customer_id ON deals(customer_id);
 CREATE INDEX idx_deals_expected_close_at ON deals(expected_close_at);
 CREATE INDEX idx_tasks_assigned_to ON tasks(assigned_to);
 CREATE INDEX idx_tasks_status ON tasks(status);
@@ -410,11 +426,186 @@ ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE teams ENABLE ROW LEVEL SECURITY;
 ALTER TABLE team_members ENABLE ROW LEVEL SECURITY;
 
+CREATE OR REPLACE FUNCTION autocrm_can_access_owner_team(
+    record_owner_id UUID,
+    record_team_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    actor_id UUID := auth.uid();
+    actor_role TEXT;
+BEGIN
+    IF auth.role() = 'service_role' THEN
+        RETURN TRUE;
+    END IF;
+
+    IF actor_id IS NULL THEN
+        RETURN FALSE;
+    END IF;
+
+    SELECT lower(role) INTO actor_role
+    FROM agents
+    WHERE id = actor_id;
+
+    IF actor_role = 'admin' THEN
+        RETURN TRUE;
+    END IF;
+
+    IF record_owner_id = actor_id THEN
+        RETURN TRUE;
+    END IF;
+
+    IF actor_role IN ('manager', 'sales_manager') THEN
+        IF EXISTS (
+            SELECT 1
+            FROM team_members tm
+            JOIN teams t ON t.id = tm.team_id
+            WHERE t.manager_id = actor_id
+              AND tm.agent_id = record_owner_id
+        ) THEN
+            RETURN TRUE;
+        END IF;
+
+        IF EXISTS (
+            SELECT 1
+            FROM teams t
+            WHERE t.manager_id = actor_id
+              AND t.id = record_team_id
+        ) THEN
+            RETURN TRUE;
+        END IF;
+    END IF;
+
+    RETURN FALSE;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION autocrm_can_access_customer(
+    customer_id UUID,
+    record_owner_id UUID,
+    record_team_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    actor_id UUID := auth.uid();
+    actor_role TEXT;
+BEGIN
+    IF autocrm_can_access_owner_team(record_owner_id, record_team_id) THEN
+        RETURN TRUE;
+    END IF;
+
+    IF auth.role() = 'service_role' THEN
+        RETURN TRUE;
+    END IF;
+
+    IF actor_id IS NULL THEN
+        RETURN FALSE;
+    END IF;
+
+    SELECT lower(role) INTO actor_role
+    FROM agents
+    WHERE id = actor_id;
+
+    IF actor_role = 'admin' THEN
+        RETURN TRUE;
+    END IF;
+
+    IF actor_role IN ('manager', 'sales_manager') THEN
+        RETURN EXISTS (
+            SELECT 1
+            FROM deals d
+            LEFT JOIN leads l ON l.id = d.lead_id
+            LEFT JOIN team_members deal_tm ON deal_tm.agent_id = d.owner_id
+            LEFT JOIN teams deal_team ON deal_team.id = deal_tm.team_id
+            LEFT JOIN team_members lead_tm ON lead_tm.agent_id = l.owner_id
+            LEFT JOIN teams lead_team ON lead_team.id = lead_tm.team_id
+            WHERE d.customer_id = customer_id
+              AND (
+                d.owner_id = actor_id
+                OR l.owner_id = actor_id
+                OR deal_team.manager_id = actor_id
+                OR lead_team.manager_id = actor_id
+              )
+        );
+    END IF;
+
+    RETURN EXISTS (
+        SELECT 1
+        FROM deals d
+        LEFT JOIN leads l ON l.id = d.lead_id
+        WHERE d.customer_id = customer_id
+          AND (d.owner_id = actor_id OR l.owner_id = actor_id)
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION autocrm_can_access_organization(
+    organization_id UUID,
+    record_owner_id UUID,
+    record_team_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    actor_id UUID := auth.uid();
+    actor_role TEXT;
+BEGIN
+    IF autocrm_can_access_owner_team(record_owner_id, record_team_id) THEN
+        RETURN TRUE;
+    END IF;
+
+    IF auth.role() = 'service_role' THEN
+        RETURN TRUE;
+    END IF;
+
+    IF actor_id IS NULL THEN
+        RETURN FALSE;
+    END IF;
+
+    SELECT lower(role) INTO actor_role
+    FROM agents
+    WHERE id = actor_id;
+
+    IF actor_role = 'admin' THEN
+        RETURN TRUE;
+    END IF;
+
+    IF actor_role IN ('manager', 'sales_manager') THEN
+        RETURN EXISTS (
+            SELECT 1
+            FROM leads l
+            LEFT JOIN team_members tm ON tm.agent_id = l.owner_id
+            LEFT JOIN teams t ON t.id = tm.team_id
+            WHERE l.organization_id = organization_id
+              AND (l.owner_id = actor_id OR t.manager_id = actor_id)
+        );
+    END IF;
+
+    RETURN EXISTS (
+        SELECT 1
+        FROM leads l
+        WHERE l.organization_id = organization_id
+          AND l.owner_id = actor_id
+    );
+END;
+$$;
+
 -- App data tables are accessible only to authenticated users.
-CREATE POLICY "authenticated_customers_access"
+CREATE POLICY "customer_owner_team_access"
     ON customers FOR ALL TO authenticated
-    USING (auth.role() = 'authenticated')
-    WITH CHECK (auth.role() = 'authenticated');
+    USING (autocrm_can_access_customer(id, owner_id, team_id))
+    WITH CHECK (autocrm_can_access_owner_team(owner_id, team_id));
 
 CREATE POLICY "authenticated_tickets_access"
     ON tickets FOR ALL TO authenticated
@@ -431,10 +622,10 @@ CREATE POLICY "authenticated_ai_interactions_access"
     USING (auth.role() = 'authenticated')
     WITH CHECK (auth.role() = 'authenticated');
 
-CREATE POLICY "authenticated_organizations_access"
+CREATE POLICY "organization_owner_team_access"
     ON organizations FOR ALL TO authenticated
-    USING (auth.role() = 'authenticated')
-    WITH CHECK (auth.role() = 'authenticated');
+    USING (autocrm_can_access_organization(id, owner_id, team_id))
+    WITH CHECK (autocrm_can_access_owner_team(owner_id, team_id));
 
 CREATE POLICY "authenticated_leads_access"
     ON leads FOR ALL TO authenticated
@@ -489,6 +680,16 @@ CREATE POLICY "service_role_deleted_users_access"
 
 CREATE POLICY "service_role_agent_permissions_access"
     ON agent_permissions FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY "service_role_customers_access"
+    ON customers FOR ALL TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY "service_role_organizations_access"
+    ON organizations FOR ALL TO service_role
     USING (true)
     WITH CHECK (true);
 

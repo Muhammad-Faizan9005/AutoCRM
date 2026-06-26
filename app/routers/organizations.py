@@ -11,12 +11,58 @@ from app.auth.dependencies import require_admin, require_auth
 from app.database import get_db, run_db_operation
 from app.repositories.organization_repository import OrganizationRepository
 from app.schemas.organization import OrganizationCreate, OrganizationResponse, OrganizationUpdate
+from app.utils.team_access import can_access_organization_record, can_assign_owned_record, get_agent_team_id
 
 router = APIRouter()
 
 
 def get_organization_repository(db: Client = Depends(get_db)) -> OrganizationRepository:
     return OrganizationRepository(db)
+
+
+async def _assert_organization_access(db: Client, current_user: dict, organization: dict[str, Any]) -> None:
+    if await can_access_organization_record(
+        db,
+        current_user,
+        organization_id=str(organization.get("id") or ""),
+        owner_id=str(organization.get("owner_id")) if organization.get("owner_id") else None,
+        team_id=str(organization.get("team_id")) if organization.get("team_id") else None,
+    ):
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+
+
+async def _prepare_organization_ownership(
+    db: Client,
+    current_user: dict,
+    payload: dict[str, Any],
+    *,
+    default_owner: bool,
+) -> dict[str, Any]:
+    owner_id = payload.get("owner_id")
+    team_id = payload.get("team_id")
+
+    if default_owner and owner_id is None and team_id is None:
+        owner_id = current_user.get("id")
+        payload["owner_id"] = str(owner_id) if owner_id else None
+
+    if owner_id is not None:
+        payload["owner_id"] = str(owner_id)
+    if team_id is not None:
+        payload["team_id"] = str(team_id)
+
+    if not await can_assign_owned_record(
+        db,
+        current_user,
+        owner_id=payload.get("owner_id"),
+        team_id=payload.get("team_id"),
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions to assign organization")
+
+    if payload.get("owner_id") and not payload.get("team_id"):
+        payload["team_id"] = await get_agent_team_id(db, payload["owner_id"])
+
+    return payload
 
 
 
@@ -166,7 +212,13 @@ async def get_organizations(
     repository: OrganizationRepository = Depends(get_organization_repository),
 ):
     """Get organizations with optional filtering."""
-    return await repository.list_organizations(skip=skip, limit=limit, industry=industry, search=search)
+    return await repository.list_organizations_for_user(
+        current_user=current_user,
+        skip=skip,
+        limit=limit,
+        industry=industry,
+        search=search,
+    )
 
 
 
@@ -175,8 +227,11 @@ async def get_organization_workspace(
     organization_id: UUID,
     current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db),
+    repository: OrganizationRepository = Depends(get_organization_repository),
 ):
     """Get organization/account workspace with linked CRM records."""
+    organization = await repository.get_by_id(organization_id)
+    await _assert_organization_access(db, current_user, organization)
     workspace = await _build_organization_workspace(db, str(organization_id), current_user)
     if workspace is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
@@ -187,20 +242,30 @@ async def get_organization_workspace(
 async def get_organization(
     organization_id: UUID,
     current_user: dict = Depends(require_auth),
+    db: Client = Depends(get_db),
     repository: OrganizationRepository = Depends(get_organization_repository),
 ):
     """Get an organization by ID."""
-    return await repository.get_by_id(organization_id)
+    organization = await repository.get_by_id(organization_id)
+    await _assert_organization_access(db, current_user, organization)
+    return organization
 
 
 @router.post("/", response_model=OrganizationResponse, status_code=status.HTTP_201_CREATED)
 async def create_organization(
     payload: OrganizationCreate,
     current_user: dict = Depends(require_auth),
+    db: Client = Depends(get_db),
     repository: OrganizationRepository = Depends(get_organization_repository),
 ):
     """Create a new organization."""
-    return await repository.create(payload.model_dump())
+    organization_data = await _prepare_organization_ownership(
+        db,
+        current_user,
+        payload.model_dump(),
+        default_owner=True,
+    )
+    return await repository.create(organization_data)
 
 
 @router.patch("/{organization_id}", response_model=OrganizationResponse)
@@ -208,13 +273,19 @@ async def update_organization(
     organization_id: UUID,
     payload: OrganizationUpdate,
     current_user: dict = Depends(require_auth),
+    db: Client = Depends(get_db),
     repository: OrganizationRepository = Depends(get_organization_repository),
 ):
     """Update an organization."""
+    existing = await repository.get_by_id(organization_id)
+    await _assert_organization_access(db, current_user, existing)
     update_data = payload.model_dump(exclude_unset=True)
 
     if not update_data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
+
+    if "owner_id" in update_data or "team_id" in update_data:
+        update_data = await _prepare_organization_ownership(db, current_user, update_data, default_owner=False)
 
     return await repository.update_by_id(organization_id, update_data)
 

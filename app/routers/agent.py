@@ -7,7 +7,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
 from supabase import Client
 
-from app.auth.dependencies import require_auth, require_ai_agent_auth, require_sales_manager_or_admin, generate_ai_service_token
+from app.auth.dependencies import (
+    require_auth,
+    require_ai_agent_auth,
+    require_human_or_ai_agent_auth,
+    require_sales_manager_or_admin,
+    generate_ai_service_token,
+)
 from app.database import get_db, run_db_operation
 from app.repositories.agent_control_repository import (
     AgentActionRepository,
@@ -26,6 +32,7 @@ from app.schemas.agent_action import (
     AgentApprovalDecision,
     AgentRunCreate,
     AgentRunResponse,
+    AgentRunUpdate,
     AgentSettingResponse,
     AgentSettingUpdate,
     AgentTraceCreate,
@@ -34,6 +41,7 @@ from app.schemas.agent_action import (
 )
 from app.schemas.note import NoteCreate
 from app.schemas.task import TaskCreate
+from app.services.lead_scoring_service import calculate_lead_score_sweep
 from app.services.notification_service import NotificationService
 
 router = APIRouter()
@@ -93,7 +101,7 @@ def get_ai_agent_credential_repository(db=Depends(get_db)) -> AiAgentCredentialR
 
 @router.get("/settings", response_model=list[AgentSettingResponse])
 async def list_agent_settings(
-    _current_user: dict = Depends(require_sales_manager_or_admin()),
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
     setting_repository: AgentSettingRepository = Depends(get_setting_repository),
 ):
     return await _ensure_agent_settings(setting_repository)
@@ -129,7 +137,7 @@ async def get_agent_team_stats(
 @router.post("/runs", response_model=AgentRunResponse, status_code=status.HTTP_201_CREATED)
 async def create_agent_run(
     payload: AgentRunCreate,
-    _current_user: dict = Depends(require_auth),
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
     run_repository: AgentRunRepository = Depends(get_run_repository),
 ):
     if payload.external_run_id:
@@ -144,7 +152,7 @@ async def list_agent_runs(
     status_filter: str | None = None,
     entity_type: str | None = None,
     entity_id: UUID | None = None,
-    _current_user: dict = Depends(require_auth),
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
     db: Client = Depends(get_db),
     run_repository: AgentRunRepository = Depends(get_run_repository),
 ):
@@ -162,17 +170,30 @@ async def list_agent_runs(
 @router.get("/runs/{run_id}", response_model=AgentRunResponse)
 async def get_agent_run(
     run_id: UUID,
-    _current_user: dict = Depends(require_auth),
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
     run_repository: AgentRunRepository = Depends(get_run_repository),
 ):
     return await run_repository.get_by_id(run_id)
+
+
+@router.patch("/runs/{run_id}", response_model=AgentRunResponse)
+async def update_agent_run(
+    run_id: UUID,
+    payload: AgentRunUpdate,
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
+    run_repository: AgentRunRepository = Depends(get_run_repository),
+):
+    update_payload = payload.model_dump(exclude_none=True)
+    if payload.status in {"completed", "failed", "cancelled"}:
+        update_payload["finished_at"] = datetime.now(timezone.utc).isoformat()
+    return await run_repository.update_by_id(run_id, update_payload)
 
 
 @router.post("/runs/{run_id}/trace", status_code=status.HTTP_201_CREATED)
 async def create_run_trace(
     run_id: UUID,
     payload: AgentTraceCreate,
-    _current_user: dict = Depends(require_auth),
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
     trace_repository: AgentTraceRepository = Depends(get_trace_repository),
 ):
     return await trace_repository.create({"run_id": str(run_id), **payload.model_dump(mode="json")})
@@ -181,7 +202,7 @@ async def create_run_trace(
 @router.get("/runs/{run_id}/trace")
 async def get_run_trace(
     run_id: UUID,
-    _current_user: dict = Depends(require_auth),
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
     db: Client = Depends(get_db),
     trace_repository: AgentTraceRepository = Depends(get_trace_repository),
 ):
@@ -198,7 +219,7 @@ async def get_run_trace(
 async def get_entity_memory(
     entity_type: str,
     entity_id: UUID,
-    _current_user: dict = Depends(require_auth),
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
     db: Client = Depends(get_db),
     action_repository: AgentActionRepository = Depends(get_action_repository),
 ):
@@ -210,6 +231,29 @@ async def get_entity_memory(
     )
     legacy_memory = await _list_legacy_ai_actions(db, entity_type, entity_id)
     return _sort_memory([*current_memory, *legacy_memory])[:25]
+
+
+@router.get("/entity-snapshot/{entity_type}/{entity_id}")
+async def get_ai_entity_snapshot(
+    entity_type: str,
+    entity_id: UUID,
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
+    db: Client = Depends(get_db),
+):
+    table_by_type = {
+        "lead": "leads",
+        "deal": "deals",
+        "user": "agents",
+        "agent": "agents",
+        "task": "tasks",
+        "note": "notes",
+        "call": "call_sessions",
+    }
+    table = table_by_type.get(entity_type.strip().lower())
+    if table is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported entity_type")
+    rows = await _safe_table_select(db, table, filters={"id": str(entity_id)}, limit=1)
+    return rows[0] if rows else {}
 
 
 @router.get("/approvals")
@@ -324,7 +368,7 @@ async def reject_agent_action(
 @router.post("/actions", response_model=AgentActionResponse, status_code=status.HTTP_202_ACCEPTED)
 async def dispatch_agent_action(
     payload: AgentActionIn,
-    current_user: dict = Depends(require_auth),
+    current_user: dict = Depends(require_human_or_ai_agent_auth),
     db: Client = Depends(get_db),
     run_repository: AgentRunRepository = Depends(get_run_repository),
     action_repository: AgentActionRepository = Depends(get_action_repository),
@@ -507,6 +551,8 @@ async def _notify_approval_recipients(
     payload = action.get("payload") or {}
     title = str(payload.get("title") or action.get("action_type") or "AI action")
     reason = str(action.get("reason") or "An AI workflow requires approval.")
+    if not hasattr(db, "engine"):
+        return
 
     def _query_recipients():
         with db.engine.connect() as conn:
@@ -1149,3 +1195,288 @@ async def ai_service_heartbeat(
         "agent_type": ai_agent.get("agent_type"),
         "scopes":     ai_agent.get("credential_scopes"),
     }
+
+
+@router.post("/leads/score/sweep", status_code=status.HTTP_200_OK)
+async def ai_service_lead_score_sweep(
+    limit: int = 100,
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
+    db: Client = Depends(get_db),
+):
+    """
+    Recalculate lead scores from the AI service scheduler.
+
+    This lets the AI worker refresh scores without a user opening each lead
+    detail page or pressing the manual scoring button.
+    """
+    return await calculate_lead_score_sweep(db, limit=limit)
+
+
+@router.get("/rag/snapshot", status_code=status.HTTP_200_OK)
+async def ai_service_rag_snapshot(
+    entity_type: str | None = None,
+    changed_since: str | None = None,
+    limit: int = 100,
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
+    db: Client = Depends(get_db),
+):
+    """
+    Return CRM text documents for AI-service RAG indexing.
+
+    The worker calls this in small background batches. The backend remains the
+    source of truth and only emits normalized, indexable documents.
+    """
+    batch_limit = min(max(limit, 1), 250)
+    allowed_types = {"lead", "deal", "task", "note", "call", "agent", "user", "organization", "customer"}
+    if entity_type and entity_type not in allowed_types:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported entity_type")
+
+    def _query() -> list[dict]:
+        clauses = []
+        params: dict[str, object] = {"limit": batch_limit}
+        if changed_since:
+            params["changed_since"] = changed_since
+
+        def maybe_filter(updated_expr: str) -> str:
+            filters = []
+            if changed_since:
+                filters.append(f"{updated_expr} >= CAST(:changed_since AS timestamptz)")
+            return "WHERE " + " AND ".join(filters) if filters else ""
+
+        if entity_type in {None, "lead"}:
+            clauses.append(
+            f"""
+            SELECT 'lead' AS kind, 'lead' AS target_entity_type, leads.id::text AS entity_id, leads.id::text AS source_id,
+                   leads.owner_id::text AS owner_id, leads.updated_at, concat_ws(' ',
+                       'Lead',
+                       to_jsonb(leads)->>'name',
+                       to_jsonb(leads)->>'email',
+                       to_jsonb(leads)->>'phone',
+                       to_jsonb(leads)->>'company',
+                       to_jsonb(leads)->>'source',
+                       to_jsonb(leads)->>'status',
+                       'Organization',
+                       to_jsonb(organizations)->>'name',
+                       to_jsonb(organizations)->>'industry',
+                       to_jsonb(leads)->>'lost_reason',
+                       to_jsonb(leads)->>'lost_notes',
+                       to_jsonb(leads)->>'score_reason',
+                       to_jsonb(leads)->>'notes'
+                   ) AS content
+            FROM leads
+            LEFT JOIN organizations ON organizations.id = leads.organization_id
+            {maybe_filter('leads.updated_at')}
+            """
+            )
+        if entity_type in {None, "organization"}:
+            clauses.append(
+            f"""
+            SELECT 'organization' AS kind, 'organization' AS target_entity_type, id::text AS entity_id, id::text AS source_id,
+                   owner_id::text AS owner_id, updated_at, concat_ws(' ',
+                       'Organization',
+                       to_jsonb(organizations)->>'name',
+                       to_jsonb(organizations)->>'website',
+                       to_jsonb(organizations)->>'industry',
+                       to_jsonb(organizations)->>'revenue',
+                       to_jsonb(organizations)->>'address',
+                       to_jsonb(organizations)->>'phone'
+                   ) AS content
+            FROM organizations
+            {maybe_filter('updated_at')}
+            """
+            )
+        if entity_type in {None, "customer"}:
+            clauses.append(
+            f"""
+            SELECT 'customer' AS kind, 'customer' AS target_entity_type, id::text AS entity_id, id::text AS source_id,
+                   owner_id::text AS owner_id, updated_at, concat_ws(' ',
+                       'Customer',
+                       to_jsonb(customers)->>'full_name',
+                       to_jsonb(customers)->>'email',
+                       to_jsonb(customers)->>'phone',
+                       to_jsonb(customers)->>'company',
+                       to_jsonb(customers)->>'status',
+                       to_jsonb(customers)->>'notes',
+                       to_jsonb(customers)->>'metadata'
+                   ) AS content
+            FROM customers
+            {maybe_filter('updated_at')}
+            """
+            )
+        if entity_type in {None, "deal"}:
+            clauses.append(
+            f"""
+            SELECT 'deal' AS kind, 'deal' AS target_entity_type, deals.id::text AS entity_id, deals.id::text AS source_id,
+                   deals.owner_id::text AS owner_id, deals.updated_at, concat_ws(' ',
+                       'Deal',
+                       to_jsonb(deals)->>'title',
+                       to_jsonb(deals)->>'stage',
+                       to_jsonb(deals)->>'value',
+                       to_jsonb(deals)->>'currency',
+                       to_jsonb(deals)->>'expected_close_at',
+                       to_jsonb(deals)->>'deal_type',
+                       'Lead',
+                       to_jsonb(leads)->>'name',
+                       'Organization',
+                       to_jsonb(organizations)->>'name',
+                       'Customer',
+                       to_jsonb(customers)->>'full_name',
+                       to_jsonb(customers)->>'company',
+                       to_jsonb(deals)->>'lost_reason',
+                       to_jsonb(deals)->>'loss_reason'
+                   ) AS content
+            FROM deals
+            LEFT JOIN leads ON leads.id = deals.lead_id
+            LEFT JOIN organizations ON organizations.id = deals.organization_id
+            LEFT JOIN customers ON customers.id = deals.customer_id
+            {maybe_filter('deals.updated_at')}
+            """
+            )
+        if entity_type in {None, "task"}:
+            clauses.append(
+            f"""
+            SELECT 'task' AS kind, entity_type AS target_entity_type, entity_id::text AS entity_id, id::text AS source_id,
+                   assigned_to::text AS owner_id, updated_at, concat_ws(' ',
+                       'Task',
+                       to_jsonb(tasks)->>'title',
+                       to_jsonb(tasks)->>'description',
+                       to_jsonb(tasks)->>'status',
+                       to_jsonb(tasks)->>'priority',
+                       to_jsonb(tasks)->>'due_at',
+                       to_jsonb(tasks)->>'source',
+                       to_jsonb(tasks)->>'ai_reason'
+                   ) AS content
+            FROM tasks
+            {maybe_filter('updated_at')}
+              {"AND" if changed_since else "WHERE"} entity_id IS NOT NULL
+            """
+            )
+        if entity_type in {None, "note"}:
+            clauses.append(
+            f"""
+            SELECT 'note' AS kind, entity_type AS target_entity_type, entity_id::text AS entity_id, id::text AS source_id,
+                   author_id::text AS owner_id, updated_at, concat_ws(' ',
+                       'Note',
+                       to_jsonb(notes)->>'content',
+                       to_jsonb(notes)->>'source',
+                       to_jsonb(notes)->>'ai_reason'
+                   ) AS content
+            FROM notes
+            {maybe_filter('updated_at')}
+              {"AND" if changed_since else "WHERE"} entity_id IS NOT NULL
+            """
+            )
+        if entity_type in {None, "call"}:
+            clauses.append(
+            f"""
+            SELECT 'call' AS kind, 'lead' AS target_entity_type, lead_id::text AS entity_id, id::text AS source_id,
+                   initiated_by::text AS owner_id, updated_at, concat_ws(' ',
+                       'Call',
+                       to_jsonb(call_sessions)->>'status',
+                       to_jsonb(call_sessions)->>'direction',
+                       to_jsonb(call_sessions)->>'started_at',
+                       to_jsonb(call_sessions)->>'ended_at',
+                       to_jsonb(call_sessions)->>'transcript',
+                       to_jsonb(call_sessions)->>'meeting_summary'
+                   ) AS content
+            FROM call_sessions
+            {maybe_filter('updated_at')}
+              {"AND" if changed_since else "WHERE"} lead_id IS NOT NULL
+            """
+            )
+        if entity_type in {None, "agent", "user"}:
+            clauses.append(
+            f"""
+            SELECT 'agent' AS kind, 'user' AS target_entity_type, id::text AS entity_id, id::text AS source_id,
+                   id::text AS owner_id, updated_at, concat_ws(' ',
+                       'Agent',
+                       to_jsonb(agents)->>'full_name',
+                       to_jsonb(agents)->>'name',
+                       to_jsonb(agents)->>'email',
+                       to_jsonb(agents)->>'role'
+                   ) AS content
+            FROM agents
+            {maybe_filter('updated_at')}
+            """
+            )
+        sql = " UNION ALL ".join(clauses) + " ORDER BY updated_at ASC LIMIT :limit"
+        with db.engine.connect() as conn:
+            rows = conn.execute(text(sql), params).mappings().all()
+            return [dict(row) for row in rows]
+
+    rows = await run_db_operation(_query)
+    documents = [
+        {
+            "entity_type": row["target_entity_type"],
+            "entity_id": row["entity_id"],
+            "source": f"backend.{row['kind']}",
+            "source_id": row["source_id"],
+            "content": str(row.get("content") or "").strip(),
+            "updated_at": row["updated_at"].isoformat() if hasattr(row.get("updated_at"), "isoformat") else row.get("updated_at"),
+            "metadata": {
+                "source_table": row["kind"],
+                "source_id": row["source_id"],
+                "owner_id": row.get("owner_id"),
+                "entity_type": row["target_entity_type"],
+                "entity_id": row["entity_id"],
+            },
+        }
+        for row in rows
+        if str(row.get("content") or "").strip()
+    ]
+    return {"documents": documents, "count": len(documents)}
+
+
+@router.post("/rag/reconcile", status_code=status.HTTP_200_OK)
+async def ai_service_rag_reconcile(
+    payload: dict,
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
+    db: Client = Depends(get_db),
+):
+    """
+    Return which indexed backend source records no longer exist.
+
+    This lets the AI worker remove stale FAISS chunks even when the source row
+    was hard-deleted and therefore cannot appear in an incremental snapshot.
+    """
+    raw_sources = payload.get("sources") if isinstance(payload, dict) else []
+    if not isinstance(raw_sources, list):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="sources must be a list")
+
+    table_by_source = {
+        "lead": "leads",
+        "deal": "deals",
+        "task": "tasks",
+        "note": "notes",
+        "call": "call_sessions",
+        "agent": "agents",
+        "user": "agents",
+        "organization": "organizations",
+        "customer": "customers",
+    }
+    normalized = []
+    for item in raw_sources[:1000]:
+        if not isinstance(item, dict):
+            continue
+        source_table = str(item.get("source_table") or "").strip()
+        source_id = str(item.get("source_id") or "").strip()
+        if source_table in table_by_source and source_id:
+            normalized.append({"source_table": source_table, "source_id": source_id})
+
+    def _query_existing() -> set[tuple[str, str]]:
+        existing: set[tuple[str, str]] = set()
+        with db.engine.connect() as conn:
+            for source_table, table_name in table_by_source.items():
+                ids = [item["source_id"] for item in normalized if item["source_table"] == source_table]
+                if not ids:
+                    continue
+                rows = conn.execute(
+                    text(f"SELECT id::text AS id FROM {table_name} WHERE id::text = ANY(:ids)"),
+                    {"ids": ids},
+                ).mappings().all()
+                existing.update((source_table, str(row["id"])) for row in rows)
+        return existing
+
+    existing = await run_db_operation(_query_existing)
+    missing = [item for item in normalized if (item["source_table"], item["source_id"]) not in existing]
+    return {"missing": missing, "checked": len(normalized)}

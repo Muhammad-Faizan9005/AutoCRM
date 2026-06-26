@@ -16,6 +16,13 @@ def get_import_service(db: Client = Depends(get_db)) -> ImportService:
     return ImportService(db)
 
 
+def _default_import_owner_id(current_user: dict) -> str | None:
+    role = str(current_user.get("role") or "").strip().lower()
+    if role == "admin":
+        return None
+    return str(current_user.get("id") or "") or None
+
+
 async def _validate_uploaded_file(file: UploadFile) -> None:
     if not file.filename:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file must have a filename")
@@ -30,7 +37,11 @@ async def import_leads(
     """Import lead rows from CSV or Excel file."""
     await _validate_uploaded_file(file)
     file_bytes = await file.read()
-    return await service.import_leads(file_name=file.filename, file_bytes=file_bytes)
+    return await service.import_leads(
+        file_name=file.filename,
+        file_bytes=file_bytes,
+        owner_id=_default_import_owner_id(current_user),
+    )
 
 
 @router.post("/customers", response_model=ImportResult)
@@ -42,7 +53,11 @@ async def import_customers(
     """Compatibility alias for lead import."""
     await _validate_uploaded_file(file)
     file_bytes = await file.read()
-    return await service.import_leads(file_name=file.filename, file_bytes=file_bytes)
+    return await service.import_leads(
+        file_name=file.filename,
+        file_bytes=file_bytes,
+        owner_id=_default_import_owner_id(current_user),
+    )
 
 
 @router.post("/tickets", response_model=ImportResult)

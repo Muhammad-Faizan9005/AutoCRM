@@ -23,6 +23,7 @@ from app.services.import_service import ImportService
 from app.services.notification_service import NotificationService
 from app.services.email_service import MailjetEmailService
 from app.services.status_change_log_service import StatusChangeLogService
+from app.services.lead_scoring_service import calculate_lead_score
 from app.utils.statuses import LEAD_STATUSES, normalize_status
 from app.utils.team_access import can_access_lead, is_manager_of_rep
 
@@ -94,9 +95,37 @@ async def _can_manager_assign_to_rep(db: Client, manager_id: str, rep_id: str) -
     return await is_manager_of_rep(db, manager_id, rep_id)
 
 
+async def _get_agent_role(db: Client, agent_id: str) -> str | None:
+    def _query():
+        engine = getattr(db, "engine", None)
+        if engine is not None:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT role FROM agents WHERE id = :agent_id"),
+                    {"agent_id": agent_id},
+                ).mappings().first()
+                return str(row.get("role")) if row and row.get("role") else None
+
+        rows = db.table("agents").select("*").eq("id", agent_id).limit(1).execute().data or []
+        row = rows[0] if rows else None
+        return str(row.get("role")) if row and row.get("role") else None
+
+    return await run_db_operation(_query)
 
 
-async def _find_or_create_organization_for_company(db: Client, company: str | None) -> str | None:
+async def _is_admin_assignable_manager(db: Client, agent_id: str) -> bool:
+    role = str(await _get_agent_role(db, agent_id) or "").strip().lower()
+    return role in {"manager", "sales_manager"}
+
+
+
+
+async def _find_or_create_organization_for_company(
+    db: Client,
+    company: str | None,
+    *,
+    owner_id: str | None = None,
+) -> str | None:
     company_name = (company or "").strip()
     if not company_name:
         return None
@@ -109,55 +138,32 @@ async def _find_or_create_organization_for_company(db: Client, company: str | No
             ).mappings().first()
             if existing:
                 return str(existing["id"])
+            team_id = get_agent_team_id_sync(conn, owner_id) if owner_id else None
             created = conn.execute(
                 text(
-                    "INSERT INTO organizations (name) VALUES (:name) "
+                    "INSERT INTO organizations (name, owner_id, team_id) VALUES (:name, :owner_id, :team_id) "
                     "RETURNING id"
                 ),
-                {"name": company_name},
+                {"name": company_name, "owner_id": owner_id, "team_id": team_id},
             ).mappings().first()
             return str(created["id"]) if created else None
 
     return await run_db_operation(_query)
 
 
-async def _calculate_lead_score(db: Client, lead_id: str) -> dict[str, Any] | None:
-    def _query():
-        with db.engine.begin() as conn:
-            lead = conn.execute(text("SELECT * FROM leads WHERE id = :lead_id"), {"lead_id": lead_id}).mappings().first()
-            if not lead:
-                return None
-            tasks = conn.execute(text("SELECT status, due_at FROM tasks WHERE entity_type='lead' AND entity_id=:lead_id"), {"lead_id": lead_id}).mappings().all()
-            deals = conn.execute(text("SELECT status, value FROM deals WHERE lead_id=:lead_id"), {"lead_id": lead_id}).mappings().all()
-            calls = conn.execute(text("SELECT transcript, processing_status FROM call_sessions WHERE lead_id=:lead_id"), {"lead_id": lead_id}).mappings().all()
-            notes_count = conn.execute(text("SELECT COUNT(*) FROM notes WHERE entity_type='lead' AND entity_id=:lead_id"), {"lead_id": lead_id}).scalar() or 0
-
-            score = 35
-            reasons: list[str] = []
-            status_value = str(lead.get("status") or "").lower()
-            if status_value in {"qualified", "proposal", "negotiation"}:
-                score += 25; reasons.append("lead is in a high-intent status")
-            elif status_value in {"unqualified", "junk", "lost"}:
-                score -= 35; reasons.append("lead is marked low quality")
-            if lead.get("email") and lead.get("phone"):
-                score += 10; reasons.append("complete contact information is available")
-            elif lead.get("email") or lead.get("phone"):
-                score += 5; reasons.append("partial contact information is available")
-            open_deals = [d for d in deals if str(d.get("status") or "").lower() not in {"won", "lost", "closed_won", "closed_lost"}]
-            if open_deals:
-                score += 20; reasons.append(f"{len(open_deals)} open deal(s) are linked")
-            if any(str(t.get("status") or "").lower() not in {"done", "canceled"} for t in tasks):
-                score += 10; reasons.append("there are active follow-up tasks")
-            if any(c.get("transcript") for c in calls):
-                score += 10; reasons.append("meeting/call transcript is available")
-            if notes_count:
-                score += 5; reasons.append("notes are captured for this lead")
-            score = max(0, min(100, score))
-            priority = "High" if score >= 75 else "Medium" if score >= 45 else "Low"
-            reason = f"{priority} priority because " + (", ".join(reasons[:4]) if reasons else "limited engagement data is available") + "."
-            conn.execute(text("UPDATE leads SET score=:score, score_reason=:reason, updated_at=NOW() WHERE id=:lead_id"), {"score": score, "reason": reason, "lead_id": lead_id})
-            return {"score": score, "priority": priority, "score_reason": reason}
-    return await run_db_operation(_query)
+def get_agent_team_id_sync(conn, agent_id: str | None) -> str | None:
+    if not agent_id:
+        return None
+    row = conn.execute(
+        text(
+            "SELECT COALESCE(a.team_id, tm.team_id) AS team_id "
+            "FROM agents a "
+            "LEFT JOIN team_members tm ON tm.agent_id = a.id "
+            "WHERE a.id = :agent_id LIMIT 1"
+        ),
+        {"agent_id": agent_id},
+    ).mappings().first()
+    return str(row.get("team_id")) if row and row.get("team_id") else None
 
 
 async def _get_lead_ai_history(db: Client, lead_id: str) -> list[dict[str, Any]]:
@@ -303,6 +309,10 @@ async def _assert_lead_assignment_permissions(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
     if role == "admin":
+        if await _is_admin_assignable_manager(db, owner_id):
+            return
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admins can assign leads only to managers")
+    if role in {"sales_manager", "manager"} and owner_id == user_id:
         return
     if role in {"sales_manager", "manager"}:
         if await _can_manager_assign_to_rep(db, user_id, owner_id):
@@ -333,32 +343,67 @@ async def get_leads(
         return []
 
     if role in {"manager", "sales_manager"}:
+        if owner_id is not None:
+            requested_owner_id = str(owner_id)
+            if requested_owner_id != requester_id and not await _can_manager_assign_to_rep(db, requester_id, requested_owner_id):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+
         def _query_team_leads():
-            with db.engine.connect() as conn:
-                sql = (
-                    "SELECT l.* FROM leads l "
-                    "JOIN team_members tm ON tm.agent_id = l.owner_id "
-                    "JOIN teams t ON t.id = tm.team_id "
-                    "WHERE t.manager_id = :mid "
-                )
-                params: dict[str, Any] = {"mid": requester_id}
-                if status:
-                    sql += "AND l.status = :status "
-                    params["status"] = status
-                if organization_id:
-                    sql += "AND l.organization_id = :org_id "
-                    params["org_id"] = str(organization_id)
-                if source:
-                    sql += "AND l.source = :source "
-                    params["source"] = source
-                if search:
-                    sql += "AND l.name ILIKE :search "
-                    params["search"] = f"%{search}%"
-                sql += "ORDER BY l.created_at DESC OFFSET :skip LIMIT :limit"
-                params["skip"] = skip
-                params["limit"] = limit
-                rows = conn.execute(text(sql), params).mappings().all()
-                return [dict(row) for row in rows]
+            engine = getattr(db, "engine", None)
+            if engine is not None:
+                with engine.connect() as conn:
+                    sql = (
+                        "SELECT DISTINCT l.* FROM leads l "
+                        "LEFT JOIN team_members tm ON tm.agent_id = l.owner_id "
+                        "LEFT JOIN teams t ON t.id = tm.team_id "
+                        "WHERE (l.owner_id = :mid OR t.manager_id = :mid) "
+                    )
+                    params: dict[str, Any] = {"mid": requester_id}
+                    if owner_id:
+                        sql += "AND l.owner_id = :owner_id "
+                        params["owner_id"] = str(owner_id)
+                    if status:
+                        sql += "AND l.status = :status "
+                        params["status"] = status
+                    if organization_id:
+                        sql += "AND l.organization_id = :org_id "
+                        params["org_id"] = str(organization_id)
+                    if source:
+                        sql += "AND l.source = :source "
+                        params["source"] = source
+                    if search:
+                        sql += "AND l.name ILIKE :search "
+                        params["search"] = f"%{search}%"
+                    sql += "ORDER BY l.created_at DESC OFFSET :skip LIMIT :limit"
+                    params["skip"] = skip
+                    params["limit"] = limit
+                    rows = conn.execute(text(sql), params).mappings().all()
+                    return [dict(row) for row in rows]
+
+            tables = getattr(db, "tables", {})
+            team_ids = {str(team.get("id")) for team in tables.get("teams", []) if str(team.get("manager_id")) == requester_id}
+            member_ids = {
+                str(member.get("agent_id"))
+                for member in tables.get("team_members", [])
+                if str(member.get("team_id")) in team_ids
+            }
+            visible_owner_ids = {requester_id, *member_ids}
+            rows = [
+                lead.copy()
+                for lead in tables.get("leads", [])
+                if str(lead.get("owner_id") or "") in visible_owner_ids
+            ]
+            if owner_id:
+                rows = [lead for lead in rows if str(lead.get("owner_id") or "") == str(owner_id)]
+            if status:
+                rows = [lead for lead in rows if str(lead.get("status") or "") == status]
+            if organization_id:
+                rows = [lead for lead in rows if str(lead.get("organization_id") or "") == str(organization_id)]
+            if source:
+                rows = [lead for lead in rows if str(lead.get("source") or "") == source]
+            if search:
+                rows = [lead for lead in rows if search.lower() in str(lead.get("name") or "").lower()]
+            return rows[skip : skip + limit]
 
         return await run_db_operation(_query_team_leads)
 
@@ -381,35 +426,67 @@ async def get_assignment_reps(
     db: Client = Depends(get_db),
     current_user: dict = Depends(require_auth),
 ):
-    """List reps available for lead assignment."""
+    """List users available for lead assignment in the current actor's scope."""
     role = str(current_user.get("role") or "").strip().lower()
     if role not in {"admin", "manager", "sales_manager"}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
     def _query():
-        with db.engine.connect() as conn:
-            if str(current_user.get("role") or "").strip().lower() == "admin":
+        engine = getattr(db, "engine", None)
+        if engine is not None:
+            with engine.connect() as conn:
+                if str(current_user.get("role") or "").strip().lower() == "admin":
+                    rows = conn.execute(
+                        text(
+                            "SELECT id, full_name, email, role FROM agents "
+                            "WHERE role IN ('manager', 'sales_manager') "
+                            "ORDER BY created_at DESC"
+                        )
+                    ).mappings().all()
+                    return [dict(row) for row in rows]
+
                 rows = conn.execute(
                     text(
-                        "SELECT id, full_name, email, role FROM agents "
-                        "WHERE role IN ('sales_rep', 'agent') "
-                        "ORDER BY created_at DESC"
-                    )
+                        "SELECT a.id, a.full_name, a.email, a.role "
+                        "FROM team_members tm "
+                        "JOIN teams t ON t.id = tm.team_id "
+                        "JOIN agents a ON a.id = tm.agent_id "
+                        "WHERE t.manager_id = :mid "
+                        "ORDER BY a.created_at DESC"
+                    ),
+                    {"mid": str(current_user.get("id"))},
                 ).mappings().all()
                 return [dict(row) for row in rows]
 
-            rows = conn.execute(
-                text(
-                    "SELECT a.id, a.full_name, a.email, a.role "
-                    "FROM team_members tm "
-                    "JOIN teams t ON t.id = tm.team_id "
-                    "JOIN agents a ON a.id = tm.agent_id "
-                    "WHERE t.manager_id = :mid "
-                    "ORDER BY a.created_at DESC"
-                ),
-                {"mid": str(current_user.get("id"))},
-            ).mappings().all()
-            return [dict(row) for row in rows]
+        tables = getattr(db, "tables", {})
+        if role == "admin":
+            return [
+                {
+                    "id": agent.get("id"),
+                    "full_name": agent.get("full_name"),
+                    "email": agent.get("email"),
+                    "role": agent.get("role"),
+                }
+                for agent in tables.get("agents", [])
+                if str(agent.get("role") or "").strip().lower() in {"manager", "sales_manager"}
+            ]
+
+        team_ids = {str(team.get("id")) for team in tables.get("teams", []) if str(team.get("manager_id")) == str(current_user.get("id"))}
+        member_ids = {
+            str(member.get("agent_id"))
+            for member in tables.get("team_members", [])
+            if str(member.get("team_id")) in team_ids
+        }
+        return [
+            {
+                "id": agent.get("id"),
+                "full_name": agent.get("full_name"),
+                "email": agent.get("email"),
+                "role": agent.get("role"),
+            }
+            for agent in tables.get("agents", [])
+            if str(agent.get("id")) in member_ids
+        ]
 
     return await run_db_operation(_query)
 
@@ -423,7 +500,7 @@ async def recalculate_lead_score(
     current_user: dict = Depends(require_auth),
 ):
     await _assert_can_view_lead(db, current_user, str(lead_id))
-    result = await _calculate_lead_score(db, str(lead_id))
+    result = await calculate_lead_score(db, str(lead_id))
     if result is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lead not found")
     return result
@@ -446,6 +523,7 @@ async def get_lead_workspace(
     current_user: dict = Depends(require_auth),
 ):
     await _assert_can_view_lead(db, current_user, str(lead_id))
+    await calculate_lead_score(db, str(lead_id))
     return await _get_lead_workspace(db, str(lead_id))
 
 
@@ -479,7 +557,10 @@ async def create_lead(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
-    owner_id = lead_data.get("owner_id") or current_user.get("id")
+    actor_role = str(current_user.get("role") or "").strip().lower()
+    owner_id = lead_data.get("owner_id")
+    if not owner_id and actor_role != "admin":
+        owner_id = current_user.get("id")
     if owner_id:
         lead_data["owner_id"] = str(owner_id)
         await _assert_lead_assignment_permissions(db, current_user, lead_data["owner_id"])
@@ -488,9 +569,16 @@ async def create_lead(
     if organization_id:
         lead_data["organization_id"] = str(organization_id)
     elif lead_data.get("company"):
-        lead_data["organization_id"] = await _find_or_create_organization_for_company(db, lead_data.get("company"))
+        lead_data["organization_id"] = await _find_or_create_organization_for_company(
+            db,
+            lead_data.get("company"),
+            owner_id=lead_data.get("owner_id"),
+        )
 
     created = await repository.create(lead_data)
+    score_result = await calculate_lead_score(db, str(created.get("id")))
+    if score_result:
+        created = {**created, **score_result}
     await status_log_service.log_change(
         entity_type="lead",
         entity_id=str(created.get("id")),
@@ -547,6 +635,8 @@ async def update_lead(
     if not update_data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
 
+    await _assert_can_view_lead(db, current_user, str(lead_id))
+
     if "owner_id" in update_data and update_data["owner_id"] is not None:
         update_data["owner_id"] = str(update_data["owner_id"])
         await _assert_lead_assignment_permissions(db, current_user, update_data["owner_id"])
@@ -555,6 +645,9 @@ async def update_lead(
         update_data["organization_id"] = str(update_data["organization_id"])
 
     updated = await repository.update_by_id(lead_id, update_data)
+    score_result = await calculate_lead_score(db, str(lead_id))
+    if score_result:
+        updated = {**updated, **score_result}
     old_status = existing.get("status")
     new_status = updated.get("status")
     if new_status and new_status != old_status:
@@ -615,6 +708,7 @@ async def bulk_assign_leads(
     updated_rows: list[dict[str, Any]] = []
     for item in payload.assignments:
         owner_id = str(item.owner_id) if item.owner_id else None
+        await _assert_can_view_lead(db, current_user, str(item.lead_id))
         await _assert_lead_assignment_permissions(db, current_user, owner_id)
         updated = await repository.update_by_id(str(item.lead_id), {"owner_id": owner_id})
         updated_rows.append(updated)
@@ -728,7 +822,11 @@ async def ingest_lead_payload(
     service: ImportService = Depends(get_import_service),
 ):
     """Ingest a lead payload from a connected site or integration."""
-    return await service.ingest_lead_payload(payload=payload)
+    actor_role = str(current_user.get("role") or "").strip().lower()
+    return await service.ingest_lead_payload(
+        payload=payload,
+        owner_id=None if actor_role == "admin" else str(current_user.get("id") or "") or None,
+    )
 
 
 @router.get("/{lead_id}/emails")

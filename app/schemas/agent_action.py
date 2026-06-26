@@ -44,6 +44,13 @@ class AgentTraceCreate(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class AgentRunUpdate(BaseModel):
+    status: str = Field(..., min_length=1, max_length=50)
+    summary: Optional[str] = Field(default=None, max_length=2000)
+    failure_cause: Optional[str] = Field(default=None, max_length=100)
+    failure_detail: Optional[str] = Field(default=None, max_length=4000)
+
+
 class AgentApprovalDecision(BaseModel):
     note: Optional[str] = Field(default=None, max_length=1000)
 

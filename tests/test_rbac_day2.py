@@ -104,7 +104,18 @@ class FakeDB:
         self.admin_id = str(uuid4())
         self.manager_id = str(uuid4())
         self.rep_id = str(uuid4())
+        self.other_rep_id = str(uuid4())
+        self.team_id = str(uuid4())
         self.customer_id = str(uuid4())
+        self.linked_customer_id = str(uuid4())
+        self.other_customer_id = str(uuid4())
+        self.unassigned_customer_id = str(uuid4())
+        self.organization_id = str(uuid4())
+        self.linked_organization_id = str(uuid4())
+        self.other_organization_id = str(uuid4())
+        self.unassigned_organization_id = str(uuid4())
+        self.lead_id = str(uuid4())
+        self.deal_id = str(uuid4())
         self.ticket_id = str(uuid4())
 
         self.tables: dict[str, list[dict[str, Any]]] = {
@@ -139,6 +150,32 @@ class FakeDB:
                     "created_at": now,
                     "updated_at": now,
                 },
+                {
+                    "id": self.other_rep_id,
+                    "email": "other.rep@example.com",
+                    "full_name": "Other Rep",
+                    "role": "sales_rep",
+                    "is_active": True,
+                    "password_hash": "hashed::x",
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            ],
+            "teams": [
+                {
+                    "id": self.team_id,
+                    "name": "Manager Team",
+                    "manager_id": self.manager_id,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            ],
+            "team_members": [
+                {
+                    "team_id": self.team_id,
+                    "agent_id": self.rep_id,
+                    "joined_at": now,
+                }
             ],
             "customers": [
                 {
@@ -149,6 +186,137 @@ class FakeDB:
                     "company": None,
                     "status": "active",
                     "notes": None,
+                    "owner_id": self.rep_id,
+                    "team_id": self.team_id,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+                {
+                    "id": self.other_customer_id,
+                    "email": "other.customer@example.com",
+                    "full_name": "Other Customer",
+                    "phone": None,
+                    "company": None,
+                    "status": "active",
+                    "notes": None,
+                    "owner_id": self.other_rep_id,
+                    "team_id": None,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+                {
+                    "id": self.linked_customer_id,
+                    "email": "linked.customer@example.com",
+                    "full_name": "Linked Customer",
+                    "phone": None,
+                    "company": "Linked Org",
+                    "status": "active",
+                    "notes": None,
+                    "owner_id": None,
+                    "team_id": None,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+                {
+                    "id": self.unassigned_customer_id,
+                    "email": "unassigned.customer@example.com",
+                    "full_name": "Unassigned Customer",
+                    "phone": None,
+                    "company": None,
+                    "status": "active",
+                    "notes": None,
+                    "owner_id": None,
+                    "team_id": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            ],
+            "organizations": [
+                {
+                    "id": self.organization_id,
+                    "name": "Rep Org",
+                    "website": None,
+                    "industry": "software",
+                    "revenue": None,
+                    "address": None,
+                    "phone": None,
+                    "owner_id": self.rep_id,
+                    "team_id": self.team_id,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+                {
+                    "id": self.other_organization_id,
+                    "name": "Other Org",
+                    "website": None,
+                    "industry": "finance",
+                    "revenue": None,
+                    "address": None,
+                    "phone": None,
+                    "owner_id": self.other_rep_id,
+                    "team_id": None,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+                {
+                    "id": self.linked_organization_id,
+                    "name": "Linked Org",
+                    "website": None,
+                    "industry": "healthcare",
+                    "revenue": None,
+                    "address": None,
+                    "phone": None,
+                    "owner_id": None,
+                    "team_id": None,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+                {
+                    "id": self.unassigned_organization_id,
+                    "name": "Unassigned Org",
+                    "website": None,
+                    "industry": "retail",
+                    "revenue": None,
+                    "address": None,
+                    "phone": None,
+                    "owner_id": None,
+                    "team_id": None,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            ],
+            "leads": [
+                {
+                    "id": self.lead_id,
+                    "owner_id": self.rep_id,
+                    "organization_id": self.linked_organization_id,
+                    "name": "Linked Lead",
+                    "email": "linked@example.com",
+                    "phone": None,
+                    "company": "Linked Org",
+                    "source": "manual",
+                    "status": "new",
+                    "score": None,
+                    "score_reason": None,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            ],
+            "deals": [
+                {
+                    "id": self.deal_id,
+                    "lead_id": self.lead_id,
+                    "owner_id": self.rep_id,
+                    "organization_id": self.linked_organization_id,
+                    "customer_id": self.linked_customer_id,
+                    "stage": "closing",
+                    "status": "won",
+                    "deal_type": "new_business",
+                    "value": 1000,
+                    "currency": "USD",
+                    "expected_close_at": None,
+                    "closed_at": now,
+                    "lost_reason": None,
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -185,7 +353,24 @@ def _token_for(user_id: str) -> str:
 
 def _client_with_fake_db(monkeypatch) -> tuple[TestClient, FakeDB]:
     fake_db = FakeDB()
+
+    async def _fake_calculate_lead_score(*_args, **_kwargs):
+        return None
+
+    async def _fake_get_agent_name(*_args, **_kwargs):
+        return "Test User"
+
+    async def _fake_create_notification(*_args, **_kwargs):
+        return {"id": str(uuid4())}
+
+    async def _fake_get_recipient_email(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr("app.services.registration_service.hash_password", lambda password: f"hashed::{password}")
+    monkeypatch.setattr("app.routers.leads.calculate_lead_score", _fake_calculate_lead_score)
+    monkeypatch.setattr("app.services.notification_service.NotificationService.get_agent_name", _fake_get_agent_name)
+    monkeypatch.setattr("app.services.notification_service.NotificationService.create_notification", _fake_create_notification)
+    monkeypatch.setattr("app.services.email_service.MailjetEmailService.get_recipient_email", _fake_get_recipient_email)
     app.dependency_overrides[get_db] = lambda: fake_db
     return TestClient(app), fake_db
 
@@ -203,7 +388,7 @@ def test_day2_rbac_permissions_and_user_crud(monkeypatch):
 
     admin_users_res = client.get("/api/users/", headers=admin_headers)
     assert admin_users_res.status_code == 200
-    assert len(admin_users_res.json()) == 3
+    assert len(admin_users_res.json()) == 4
 
     # Admin user creation.
     create_user_res = client.post(
@@ -239,6 +424,114 @@ def test_day2_rbac_permissions_and_user_crud(monkeypatch):
         json={"assigned_to": fake_db.manager_id},
     )
     assert manager_assign.status_code == 200
+
+
+def test_customer_and_organization_record_visibility(monkeypatch):
+    client, fake_db = _client_with_fake_db(monkeypatch)
+
+    admin_headers = {"Authorization": f"Bearer {_token_for(fake_db.admin_id)}"}
+    manager_headers = {"Authorization": f"Bearer {_token_for(fake_db.manager_id)}"}
+    rep_headers = {"Authorization": f"Bearer {_token_for(fake_db.rep_id)}"}
+
+    rep_customers = client.get("/api/customers/", headers=rep_headers)
+    assert rep_customers.status_code == 200
+    assert {row["id"] for row in rep_customers.json()} == {
+        fake_db.customer_id,
+        fake_db.linked_customer_id,
+    }
+
+    manager_customers = client.get("/api/customers/", headers=manager_headers)
+    assert manager_customers.status_code == 200
+    assert {row["id"] for row in manager_customers.json()} == {
+        fake_db.customer_id,
+        fake_db.linked_customer_id,
+    }
+
+    admin_customers = client.get("/api/customers/", headers=admin_headers)
+    assert admin_customers.status_code == 200
+    assert {row["id"] for row in admin_customers.json()} == {
+        fake_db.customer_id,
+        fake_db.linked_customer_id,
+        fake_db.other_customer_id,
+        fake_db.unassigned_customer_id,
+    }
+
+    linked_customer = client.get(f"/api/customers/{fake_db.linked_customer_id}", headers=rep_headers)
+    assert linked_customer.status_code == 200
+
+    forbidden_customer = client.get(f"/api/customers/{fake_db.other_customer_id}", headers=rep_headers)
+    assert forbidden_customer.status_code == 403
+
+    manager_unassigned_customer = client.get(f"/api/customers/{fake_db.unassigned_customer_id}", headers=manager_headers)
+    assert manager_unassigned_customer.status_code == 403
+
+    rep_organizations = client.get("/api/organizations/", headers=rep_headers)
+    assert rep_organizations.status_code == 200
+    assert {row["id"] for row in rep_organizations.json()} == {
+        fake_db.organization_id,
+        fake_db.linked_organization_id,
+    }
+
+    manager_organizations = client.get("/api/organizations/", headers=manager_headers)
+    assert manager_organizations.status_code == 200
+    assert {row["id"] for row in manager_organizations.json()} == {
+        fake_db.organization_id,
+        fake_db.linked_organization_id,
+    }
+
+    linked_organization = client.get(f"/api/organizations/{fake_db.linked_organization_id}", headers=rep_headers)
+    assert linked_organization.status_code == 200
+
+    forbidden_organization = client.get(f"/api/organizations/{fake_db.other_organization_id}", headers=rep_headers)
+    assert forbidden_organization.status_code == 403
+
+    manager_unassigned_organization = client.get(
+        f"/api/organizations/{fake_db.unassigned_organization_id}",
+        headers=manager_headers,
+    )
+    assert manager_unassigned_organization.status_code == 403
+
+
+def test_admin_allocates_leads_to_managers_then_manager_assigns_team(monkeypatch):
+    client, fake_db = _client_with_fake_db(monkeypatch)
+
+    admin_headers = {"Authorization": f"Bearer {_token_for(fake_db.admin_id)}"}
+    manager_headers = {"Authorization": f"Bearer {_token_for(fake_db.manager_id)}"}
+
+    admin_targets = client.get("/api/leads/assignment-reps", headers=admin_headers)
+    assert admin_targets.status_code == 200
+    assert {row["id"] for row in admin_targets.json()} == {fake_db.manager_id}
+
+    manager_targets = client.get("/api/leads/assignment-reps", headers=manager_headers)
+    assert manager_targets.status_code == 200
+    assert {row["id"] for row in manager_targets.json()} == {fake_db.rep_id}
+
+    admin_to_rep = client.patch(
+        f"/api/leads/{fake_db.lead_id}",
+        headers=admin_headers,
+        json={"owner_id": fake_db.rep_id},
+    )
+    assert admin_to_rep.status_code == 403
+
+    admin_to_manager = client.patch(
+        f"/api/leads/{fake_db.lead_id}",
+        headers=admin_headers,
+        json={"owner_id": fake_db.manager_id},
+    )
+    assert admin_to_manager.status_code == 200
+    assert admin_to_manager.json()["owner_id"] == fake_db.manager_id
+
+    manager_leads = client.get("/api/leads/", headers=manager_headers)
+    assert manager_leads.status_code == 200
+    assert fake_db.lead_id in {row["id"] for row in manager_leads.json()}
+
+    manager_to_rep = client.patch(
+        f"/api/leads/{fake_db.lead_id}",
+        headers=manager_headers,
+        json={"owner_id": fake_db.rep_id},
+    )
+    assert manager_to_rep.status_code == 200
+    assert manager_to_rep.json()["owner_id"] == fake_db.rep_id
 
 
 if __name__ == "__main__":
