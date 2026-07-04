@@ -17,7 +17,7 @@
 
 ## 📋 Overview
 
-AutoCRM is a Customer Relationship Management backend built with FastAPI and PostgreSQL. The current implementation delivers production-oriented CRM fundamentals (auth, RBAC, admin console, invites, imports, and security middleware), while AI/LLM features are scaffolded and planned in the roadmap.
+AutoCRM is a Customer Relationship Management backend built with FastAPI and PostgreSQL. The current implementation delivers production-oriented CRM fundamentals (auth, RBAC, admin console, invites, imports, calls, and security middleware) plus backend control-plane APIs used by the AI service.
 
 ### 🎯 Problem Statement
 
@@ -29,6 +29,14 @@ Traditional CRM systems require significant manual effort for:
 - Extracting actionable insights from conversations
 
 AutoCRM addresses these challenges by integrating AI-powered automation.
+
+### Current AI + Call Capabilities
+
+- **AI Control Plane** - Agent runs, traces, approvals, settings, team stats, and AI agent credentials.
+- **Lead + Deal Insights** - AI scoring, risk alerts, summaries, and suggested next actions.
+- **Human Approval Flow** - AI actions are proposed to backend APIs before CRM writes are applied.
+- **Call Rooms + Recordings** - Authenticated call start/end flows, recording upload, and protected playback.
+- **Meeting Intelligence Hooks** - Backend notification path for AI transcription and follow-up workflows.
 
 ---
 
@@ -166,7 +174,31 @@ Optional AI:
 LLM_API_KEY=
 LLM_MODEL=gpt-4
 LLM_BASE_URL=
+AI_SERVICE_BASE_URL=http://localhost:8001
+AI_SERVICE_WEBHOOK_TOKEN=<shared-dev-token>
+AUTOCRM_AI_AGENT_KEY=<agent-key>
+AUTOCRM_AI_SERVICE_TOKEN=<agent-service-token>
 ```
+
+Operational limits:
+
+```env
+CALL_RECORDINGS_DIR=storage/recordings
+CALL_RECORDING_CHUNK_MAX_BYTES=5000000
+CALL_RECORDING_MAX_BYTES=100000000
+IMPORT_MAX_FILE_BYTES=5000000
+IMPORT_MAX_ROWS=5000
+```
+
+---
+
+## Current Security Notes
+
+- `DEBUG=True` is acceptable for local development. For staging or production, set production-safe values for debug, CORS origins, JWT secrets, webhook tokens, and database credentials.
+- Public static exposure is limited to `/static/avatars`. Call recordings are not mounted as static files; clients should use authenticated playback through `GET /api/calls/{call_id}/recording/file`.
+- AI agent endpoints support authenticated human users and AI service credentials. Configure `AUTOCRM_AI_AGENT_KEY`, `AUTOCRM_AI_SERVICE_TOKEN`, and `AI_SERVICE_WEBHOOK_TOKEN` for service-to-service traffic.
+- Import and recording uploads are bounded by configurable size and row limits to avoid accidental memory pressure.
+- Keep real credentials only in `.env` or a secret manager. Do not put live DB, Supabase, Mailjet, JWT, AI-service, or service-account values into docs.
 
 ---
 
