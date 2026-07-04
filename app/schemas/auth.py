@@ -81,6 +81,7 @@ class ProfileUpdateRequest(BaseModel):
     full_name: str | None = Field(default=None, min_length=2, max_length=255)
     email: EmailStr | None = None
     avatar_url: str | None = Field(default=None, max_length=4096)
+    developer_mode: bool | None = None
     current_password: str | None = Field(default=None, min_length=6)
     new_password: str | None = Field(default=None, min_length=6, max_length=128)
 
@@ -97,5 +98,6 @@ class UserResponse(BaseModel):
     permissions: dict[str, bool] | None = None
     is_admin: bool | None = None
     is_superuser: bool | None = None
+    developer_mode: bool | None = None
     
     model_config = ConfigDict(from_attributes=True)

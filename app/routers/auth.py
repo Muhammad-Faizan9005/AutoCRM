@@ -79,6 +79,7 @@ def _safe_auth_user(user: dict, permissions: dict[str, bool] | None = None) -> d
     safe_user = dict(user)
     safe_user.pop("password_hash", None)
     safe_user["avatar_url"] = _local_avatar_url(str(safe_user.get("id") or ""))
+    safe_user["developer_mode"] = bool(safe_user.get("developer_mode", False)) if is_admin_user(safe_user) else False
     if permissions is not None:
         safe_user["permissions"] = permissions
     safe_user["is_admin"] = is_admin_user(safe_user)
@@ -90,6 +91,7 @@ async def _ensure_profile_columns(db: Client) -> None:
     def _exec():
         with db.engine.begin() as conn:
             conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS avatar_url TEXT"))
+            conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS developer_mode BOOLEAN NOT NULL DEFAULT false"))
 
     await run_db_operation(_exec)
 
@@ -290,7 +292,7 @@ async def update_current_user_profile(
 
     new_password = update_data.pop("new_password", None)
     current_password = update_data.pop("current_password", None)
-    allowed_fields = {"full_name", "email"}
+    allowed_fields = {"full_name", "email", "developer_mode"}
     update_data = {key: value for key, value in update_data.items() if key in allowed_fields}
     if "email" in update_data and update_data["email"] is not None:
         update_data["email"] = str(update_data["email"]).strip().lower()
@@ -310,6 +312,8 @@ async def update_current_user_profile(
     fresh_user = await run_db_operation(_fetch_user)
     if not fresh_user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if "developer_mode" in update_data and not is_admin_user(fresh_user):
+        update_data.pop("developer_mode", None)
 
     email_changed = (
         "email" in update_data
