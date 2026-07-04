@@ -46,7 +46,10 @@ async def security_middleware(request: Request, call_next):
     if request.url.path == "/api/auth/avatar":
         max_size = max(max_size, settings.SUPABASE_MAX_AVATAR_BYTES + 250_000)
     if request.url.path.startswith("/api/calls/") and "/recording" in request.url.path:
-        max_size = None
+        if request.url.path.endswith("/recording/chunks"):
+            max_size = max(max_size, settings.CALL_RECORDING_CHUNK_MAX_BYTES + 250_000)
+        elif request.url.path.endswith("/recording"):
+            max_size = max(max_size, settings.CALL_RECORDING_MAX_BYTES + 250_000)
 
     content_length = request.headers.get("content-length")
 

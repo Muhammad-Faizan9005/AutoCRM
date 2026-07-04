@@ -99,7 +99,13 @@ class Settings(BaseSettings):
         default="storage/recordings",
         validation_alias=AliasChoices("CALL_RECORDINGS_DIR", "AUTOCRM_RECORDINGS_DIR", "RECORDINGS_STORAGE_DIR"),
     )
-    CALL_RECORDINGS_URL_BASE: str = "/static/recordings"
+    CALL_RECORDINGS_URL_BASE: str = "/api/calls"
+    CALL_RECORDING_CHUNK_MAX_BYTES: int = 5_000_000
+    CALL_RECORDING_MAX_BYTES: int = 100_000_000
+
+    # Import limits
+    IMPORT_MAX_FILE_BYTES: int = 5_000_000
+    IMPORT_MAX_ROWS: int = 5_000
 
     # AI service transcription notification
     AI_SERVICE_BASE_URL: str = "http://localhost:8001"

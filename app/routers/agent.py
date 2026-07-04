@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -99,6 +100,212 @@ def get_ai_agent_credential_repository(db=Depends(get_db)) -> AiAgentCredentialR
     return AiAgentCredentialRepository(db)
 
 
+async def _enrich_approvals_with_actions(
+    approvals: list[dict[str, Any]],
+    action_repository: AgentActionRepository,
+    db: Client | None = None,
+) -> list[dict[str, Any]]:
+    enriched: list[dict[str, Any]] = []
+    for approval in approvals:
+        row = dict(approval)
+        try:
+            action = await action_repository.get_by_id(row.get("action_id"))
+        except Exception:
+            action = None
+        if action:
+            row["action_type"] = action.get("action_type")
+            row["entity_type"] = action.get("entity_type")
+            row["entity_id"] = action.get("entity_id")
+            row["payload"] = action.get("payload")
+            row["action_reason"] = action.get("reason")
+        enriched.append(row)
+    if db is not None:
+        return await _enrich_control_rows(db, enriched)
+    return enriched
+
+
+def _normalize_entity_type(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    aliases = {"org": "organization", "organisation": "organization", "agent": "user", "rep": "user"}
+    return aliases.get(normalized, normalized)
+
+
+def _entity_label(entity_type: object) -> str:
+    labels = {
+        "lead": "Lead",
+        "deal": "Deal",
+        "organization": "Organization",
+        "customer": "Customer",
+        "user": "User",
+        "task": "Task",
+        "note": "Note",
+        "call": "Call",
+        "call_session": "Call",
+        "ticket": "Ticket",
+        "ai_interaction": "AI interaction",
+    }
+    normalized = _normalize_entity_type(entity_type)
+    return labels.get(normalized, str(entity_type or "Record").replace("_", " ").title())
+
+
+def _collect_entity_refs(rows: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    refs: set[tuple[str, str]] = set()
+    payload_id_keys = {
+        "lead_id": "lead",
+        "deal_id": "deal",
+        "organization_id": "organization",
+        "org_id": "organization",
+        "customer_id": "customer",
+        "recipient_id": "user",
+        "assigned_to": "user",
+        "owner_id": "user",
+        "created_by": "user",
+        "actor_id": "user",
+    }
+    for row in rows:
+        entity_type = _normalize_entity_type(row.get("entity_type"))
+        entity_id = str(row.get("entity_id") or "").strip()
+        if entity_type and entity_id:
+            refs.add((entity_type, entity_id))
+        for key in ("requested_by", "approver_id", "created_by"):
+            value = str(row.get(key) or "").strip()
+            if value:
+                refs.add(("user", value))
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        for key, ref_type in payload_id_keys.items():
+            value = str(payload.get(key) or "").strip()
+            if value:
+                refs.add((ref_type, value))
+    return refs
+
+
+async def _load_entity_names(db: Client, refs: set[tuple[str, str]]) -> dict[tuple[str, str], str]:
+    if not refs or not hasattr(db, "engine"):
+        return {}
+    ids_by_type: dict[str, list[str]] = {}
+    for entity_type, entity_id in refs:
+        ids_by_type.setdefault(entity_type, []).append(entity_id)
+
+    def _query_names() -> dict[tuple[str, str], str]:
+        names: dict[tuple[str, str], str] = {}
+        queries = {
+            "lead": "SELECT id::text AS id, COALESCE(NULLIF(name, ''), NULLIF(email, ''), 'Lead') AS name FROM leads WHERE id::text = ANY(:ids)",
+            "organization": "SELECT id::text AS id, COALESCE(NULLIF(name, ''), 'Organization') AS name FROM organizations WHERE id::text = ANY(:ids)",
+            "deal": """
+                SELECT d.id::text AS id,
+                       COALESCE(NULLIF(o.name, ''), NULLIF(l.company, ''), NULLIF(l.name, ''), 'Deal') AS name
+                FROM deals d
+                LEFT JOIN organizations o ON o.id = d.organization_id
+                LEFT JOIN leads l ON l.id = d.lead_id
+                WHERE d.id::text = ANY(:ids)
+            """,
+            "user": "SELECT id::text AS id, COALESCE(NULLIF(full_name, ''), NULLIF(email, ''), 'User') AS name FROM agents WHERE id::text = ANY(:ids)",
+            "customer": "SELECT id::text AS id, COALESCE(NULLIF(full_name, ''), NULLIF(company, ''), NULLIF(email, ''), 'Customer') AS name FROM customers WHERE id::text = ANY(:ids)",
+            "task": "SELECT id::text AS id, COALESCE(NULLIF(title, ''), 'Task') AS name FROM tasks WHERE id::text = ANY(:ids)",
+            "note": "SELECT id::text AS id, COALESCE(NULLIF(title, ''), LEFT(NULLIF(content, ''), 60), 'Note') AS name FROM notes WHERE id::text = ANY(:ids)",
+            "call": """
+                SELECT c.id::text AS id, COALESCE(NULLIF(l.name, ''), 'Call') AS name
+                FROM call_sessions c
+                LEFT JOIN leads l ON l.id = c.lead_id
+                WHERE c.id::text = ANY(:ids)
+            """,
+            "call_session": """
+                SELECT c.id::text AS id, COALESCE(NULLIF(l.name, ''), 'Call') AS name
+                FROM call_sessions c
+                LEFT JOIN leads l ON l.id = c.lead_id
+                WHERE c.id::text = ANY(:ids)
+            """,
+        }
+        with db.engine.connect() as conn:
+            for entity_type, ids in ids_by_type.items():
+                query = queries.get(entity_type)
+                if not query or not ids:
+                    continue
+                for row in conn.execute(text(query), {"ids": ids}).mappings().all():
+                    names[(entity_type, str(row["id"]))] = str(row.get("name") or _entity_label(entity_type))
+        return names
+
+    try:
+        return await run_db_operation(_query_names)
+    except Exception:
+        return {}
+
+
+def _action_display_title(action_type: object) -> str:
+    labels = {
+        "create_task": "Create follow-up task",
+        "create_note": "Create note",
+        "create_alert": "Create risk alert",
+        "send_email": "Send email",
+        "update_deal_stage": "Update deal stage",
+        "update_lead_status": "Update lead status",
+        "deal_risk": "Deal risk analysis",
+        "lead_nudge": "Lead follow-up recommendation",
+        "daily_summary": "Daily summary",
+        "agent_action_callback": "AI action callback",
+    }
+    normalized = str(action_type or "").strip().lower()
+    return labels.get(normalized, normalized.replace("_", " ").title() or "AI action")
+
+
+def _payload_summary(payload: object, fallback: object = None) -> str:
+    data = payload if isinstance(payload, dict) else {}
+    for key in ("title", "message", "summary", "description", "content"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            return _truncate(value, 220)
+    return _truncate(fallback or "No summary provided.", 220)
+
+
+async def _enrich_control_rows(db: Client, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    entity_names = await _load_entity_names(db, _collect_entity_refs(rows))
+    payload_id_keys = {
+        "lead_id": "lead",
+        "deal_id": "deal",
+        "organization_id": "organization",
+        "org_id": "organization",
+        "customer_id": "customer",
+        "recipient_id": "user",
+        "assigned_to": "user",
+        "owner_id": "user",
+        "created_by": "user",
+        "actor_id": "user",
+    }
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        entity_type = _normalize_entity_type(item.get("entity_type"))
+        entity_id = str(item.get("entity_id") or "").strip()
+        entity_name = entity_names.get((entity_type, entity_id)) if entity_type and entity_id else None
+        item["entity_type"] = entity_type or item.get("entity_type")
+        item["entity_display_type"] = _entity_label(entity_type)
+        item["entity_display_name"] = entity_name
+        item["entity_display_label"] = f"{_entity_label(entity_type)}: {entity_name}" if entity_name else _entity_label(entity_type)
+
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        related_entities = []
+        for key, ref_type in payload_id_keys.items():
+            ref_id = str(payload.get(key) or "").strip()
+            if not ref_id:
+                continue
+            related_entities.append({
+                "field": key,
+                "type": ref_type,
+                "label": _entity_label(ref_type),
+                "name": entity_names.get((ref_type, ref_id)),
+            })
+        item["related_entities"] = related_entities
+        item["action_display_title"] = _action_display_title(item.get("action_type") or item.get("trigger_type"))
+        item["action_summary"] = _payload_summary(payload, item.get("action_reason") or item.get("reason") or item.get("summary"))
+
+        for user_field in ("requested_by", "approver_id", "created_by"):
+            user_id = str(item.get(user_field) or "").strip()
+            if user_id:
+                item[f"{user_field}_name"] = entity_names.get(("user", user_id))
+        enriched.append(item)
+    return enriched
+
+
 @router.get("/settings", response_model=list[AgentSettingResponse])
 async def list_agent_settings(
     _current_user: dict = Depends(require_human_or_ai_agent_auth),
@@ -164,7 +371,7 @@ async def list_agent_runs(
     current_runs = await run_repository.list(filters=filters, order_by="started_at", order_desc=True)
     legacy_runs = await _list_legacy_ai_runs(db, filters)
     legacy_interactions = await _list_legacy_ai_interactions(db, filters)
-    return _sort_runs([*current_runs, *legacy_runs, *legacy_interactions])
+    return await _enrich_control_rows(db, _sort_runs([*current_runs, *legacy_runs, *legacy_interactions]))
 
 
 @router.get("/runs/{run_id}", response_model=AgentRunResponse)
@@ -230,7 +437,7 @@ async def get_entity_memory(
         limit=25,
     )
     legacy_memory = await _list_legacy_ai_actions(db, entity_type, entity_id)
-    return _sort_memory([*current_memory, *legacy_memory])[:25]
+    return await _enrich_control_rows(db, _sort_memory([*current_memory, *legacy_memory])[:25])
 
 
 @router.get("/entity-snapshot/{entity_type}/{entity_id}")
@@ -259,9 +466,12 @@ async def get_ai_entity_snapshot(
 @router.get("/approvals")
 async def list_pending_approvals(
     _current_user: dict = Depends(require_sales_manager_or_admin()),
+    db: Client = Depends(get_db),
     approval_repository: AgentApprovalRepository = Depends(get_approval_repository),
+    action_repository: AgentActionRepository = Depends(get_action_repository),
 ):
-    return await approval_repository.list_pending()
+    approvals = await approval_repository.list_pending()
+    return await _enrich_approvals_with_actions(approvals, action_repository, db)
 
 
 @router.get("/control-center")
@@ -284,9 +494,9 @@ async def get_control_center_snapshot(
     current_runs = await run_repository.list(order_by="started_at", order_desc=True)
     legacy_runs = await _list_legacy_ai_runs(db, filters)
     legacy_interactions = await _list_legacy_ai_interactions(db, filters)
-    runs = _sort_runs([*current_runs, *legacy_runs, *legacy_interactions])
+    runs = await _enrich_control_rows(db, _sort_runs([*current_runs, *legacy_runs, *legacy_interactions]))
 
-    approvals = await approval_repository.list_pending()
+    approvals = await _enrich_approvals_with_actions(await approval_repository.list_pending(), get_action_repository(db), db)
     agents = await ai_agent_repo.list_all()
     actions = await _safe_table_select(db, "ai_agent_actions", order_by="created_at", order_desc=True, limit=1000)
 
@@ -313,6 +523,12 @@ async def approve_agent_action(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Approval is already decided")
 
     action = await action_repository.get_by_id(approval["action_id"])
+    if str(action.get("action_type") or "").strip().lower() == "create_task":
+        if not decision or not decision.due_at:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Task approval requires a deadline")
+        payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+        payload = {**payload, "due_at": decision.due_at.isoformat()}
+        action = await action_repository.update_by_id(action["id"], {"payload": payload})
     created = await _dispatch_stored_action(
         action,
         current_user=current_user,

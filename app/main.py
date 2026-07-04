@@ -16,6 +16,7 @@ from app.utils.logger import configure_logging
 configure_logging(settings.DEBUG)
 
 os.makedirs(settings.CALL_RECORDINGS_DIR, exist_ok=True)
+os.makedirs(settings.AVATAR_STORAGE_DIR, exist_ok=True)
 
 app = FastAPI(
     title="AutoCRM API",
@@ -23,8 +24,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-app.mount("/static/recordings", StaticFiles(directory=settings.CALL_RECORDINGS_DIR), name="recordings")
-app.mount("/static", StaticFiles(directory="storage"), name="static")
+app.mount("/static/avatars", StaticFiles(directory=settings.AVATAR_STORAGE_DIR), name="avatars")
 
 # CORS middleware for frontend integration — register early so preflight
 # requests receive CORS headers before any custom middleware intercepts them.

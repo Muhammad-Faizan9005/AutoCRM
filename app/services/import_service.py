@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import HTTPException, status
 from supabase import Client
 
+from app.config import settings
 from app.repositories.customer_repository import CustomerRepository
 from app.repositories.lead_repository import LeadRepository
 from app.repositories.note_repository import NoteRepository
@@ -154,8 +155,15 @@ def _parse_rows(file_name: str, file_bytes: bytes) -> list[ParsedRow]:
         )
 
     if suffix == ".csv":
-        return _parse_csv(file_bytes)
-    return _parse_excel(file_bytes)
+        rows = _parse_csv(file_bytes)
+    else:
+        rows = _parse_excel(file_bytes)
+    if len(rows) > settings.IMPORT_MAX_ROWS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Import files are limited to {settings.IMPORT_MAX_ROWS} data rows",
+        )
+    return rows
 
 
 class ImportService:

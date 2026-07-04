@@ -221,12 +221,14 @@ class ConversionService:
         # Update deal status
         update_data = {"status": new_status.lower()}
 
-        # Auto-set closed_at for terminal statuses
-        if new_status.lower() == "won":
+        # Auto-set closed_at only when the deal actually moves into Won.
+        # Editing other fields on an already-won deal should not rewrite the
+        # close date.
+        old_status = existing.get("status")
+        if new_status.lower() == "won" and old_status != "won":
             update_data["closed_at"] = datetime.utcnow()
 
         updated_deal = await self.deal_repository.update_by_id(deal_id, update_data)
-        old_status = existing.get("status")
         new_value = updated_deal.get("status")
         if new_value and new_value != old_status:
             await self.status_log_service.log_change(

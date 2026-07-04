@@ -171,8 +171,9 @@ async def _get_lead_ai_history(db: Client, lead_id: str) -> list[dict[str, Any]]
         with db.engine.connect() as conn:
             rows = conn.execute(
                 text(
-                    "SELECT aa.id, aa.action_type, aa.reason, aa.approval_status, aa.dispatch_status, "
-                    "aa.crm_record_type, aa.crm_record_id, aa.created_at, ar.trigger_type, ar.status AS run_status "
+                    "SELECT aa.id, aa.action_type, aa.reason, aa.payload, aa.approval_status, "
+                    "aa.dispatch_status, aa.crm_record_type, aa.crm_record_id, aa.created_at, "
+                    "ar.trigger_type, ar.status AS run_status "
                     "FROM ai_agent_actions aa LEFT JOIN ai_agent_runs ar ON ar.id = aa.run_id "
                     "WHERE aa.entity_type='lead' AND aa.entity_id=:lead_id "
                     "ORDER BY aa.created_at DESC LIMIT 50"
@@ -184,29 +185,7 @@ async def _get_lead_ai_history(db: Client, lead_id: str) -> list[dict[str, Any]]
 
 
 def _build_mock_lead_emails(lead_id: str, lead_name: str | None, lead_email: str | None) -> list[dict[str, Any]]:
-    display_name = lead_name or "Lead"
-    display_email = lead_email or "unknown@example.com"
-    now = datetime.now(timezone.utc)
-    return [
-        {
-            "id": f"email-{lead_id}-1",
-            "direction": "received",
-            "subject": f"Re: {display_name} onboarding",
-            "from": display_email,
-            "to": "sales@autocrm.io",
-            "sent_at": (now - timedelta(days=2, hours=3)).isoformat(),
-            "snippet": "Thanks for the details, can we schedule a quick call?",
-        },
-        {
-            "id": f"email-{lead_id}-2",
-            "direction": "sent",
-            "subject": f"Welcome {display_name}",
-            "from": "sales@autocrm.io",
-            "to": display_email,
-            "sent_at": (now - timedelta(days=1, hours=2)).isoformat(),
-            "snippet": "Sharing next steps and a short overview of the platform.",
-        },
-    ]
+    return []
 
 
 async def _get_lead_workspace(db: Client, lead_id: str) -> dict[str, Any]:
@@ -261,8 +240,9 @@ async def _get_lead_workspace(db: Client, lead_id: str) -> dict[str, Any]:
 
             ai_history = conn.execute(
                 text(
-                    "SELECT aa.id, aa.action_type, aa.reason, aa.approval_status, aa.dispatch_status, "
-                    "aa.crm_record_type, aa.crm_record_id, aa.created_at, ar.trigger_type, ar.status AS run_status "
+                    "SELECT aa.id, aa.action_type, aa.reason, aa.payload, aa.approval_status, "
+                    "aa.dispatch_status, aa.crm_record_type, aa.crm_record_id, aa.created_at, "
+                    "ar.trigger_type, ar.status AS run_status "
                     "FROM ai_agent_actions aa LEFT JOIN ai_agent_runs ar ON ar.id = aa.run_id "
                     "WHERE aa.entity_type='lead' AND aa.entity_id=:lead_id "
                     "ORDER BY aa.created_at DESC LIMIT 50"

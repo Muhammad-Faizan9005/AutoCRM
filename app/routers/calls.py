@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import logging
 import secrets
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import FileResponse
 from supabase import Client
 
 from app.auth.dependencies import require_auth
@@ -25,6 +27,10 @@ from app.utils.team_access import can_access_lead
 logger = logging.getLogger("autocrm")
 
 router = APIRouter()
+
+_UPLOAD_READ_SIZE = 1024 * 1024
+_ALLOWED_RECORDING_MIME_PREFIXES = ("audio/", "video/")
+_ALLOWED_RECORDING_MIME_TYPES = {"application/octet-stream"}
 
 
 def get_call_repository(db: Client = Depends(get_db)) -> CallRepository:
@@ -68,7 +74,49 @@ def _recording_db_path(call_id: str, extension: str) -> str:
 
 
 def _recording_url(call_id: str, extension: str) -> str:
-    return f"{settings.CALL_RECORDINGS_URL_BASE}/call_{call_id}.{extension}"
+    return f"{settings.CALL_RECORDINGS_URL_BASE}/{call_id}/recording/file"
+
+
+def _validate_recording_mime(mime_type: str | None) -> str | None:
+    if not mime_type:
+        return None
+    cleaned = mime_type.split(";")[0].strip().lower()
+    if cleaned in _ALLOWED_RECORDING_MIME_TYPES or cleaned.startswith(_ALLOWED_RECORDING_MIME_PREFIXES):
+        return cleaned
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported recording MIME type")
+
+
+def _tmp_recording_size(tmp_dir: Path) -> int:
+    total = 0
+    for chunk in tmp_dir.glob("chunk_*.part"):
+        if chunk.is_file():
+            total += chunk.stat().st_size
+    return total
+
+
+async def _write_upload_stream(
+    file: UploadFile,
+    destination: Path,
+    *,
+    max_bytes: int,
+    existing_bytes: int = 0,
+) -> int:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    bytes_written = 0
+    with destination.open("wb") as handle:
+        while True:
+            chunk = await file.read(_UPLOAD_READ_SIZE)
+            if not chunk:
+                break
+            bytes_written += len(chunk)
+            if bytes_written + existing_bytes > max_bytes:
+                try:
+                    destination.unlink()
+                except OSError:
+                    pass
+                raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Recording is too large")
+            handle.write(chunk)
+    return bytes_written
 
 
 async def _assert_can_use_call(db: Client, repository: CallRepository, current_user: dict, call_id: UUID) -> dict[str, Any]:
@@ -104,10 +152,24 @@ async def _finalize_recording_from_chunks(
 
         final_path.parent.mkdir(parents=True, exist_ok=True)
         partial_path = final_path.with_suffix(final_path.suffix + ".partial")
+        total_size = 0
         with partial_path.open("wb") as destination:
             for chunk in chunks:
                 with chunk.open("rb") as source:
-                    destination.write(source.read())
+                    while True:
+                        data = source.read(_UPLOAD_READ_SIZE)
+                        if not data:
+                            break
+                        total_size += len(data)
+                        if total_size > settings.CALL_RECORDING_MAX_BYTES:
+                            try:
+                                partial_path.unlink()
+                            except OSError:
+                                pass
+                            await repository.update_by_id(call_id, {"processing_status": "failed"})
+                            logger.warning("call_recording_finalize_failed call_id=%s reason=max_size", call_id)
+                            return
+                        destination.write(data)
         partial_path.replace(final_path)
 
         size = final_path.stat().st_size
@@ -284,10 +346,16 @@ class CallSignalingManager:
 
     async def broadcast(self, room_id: str, payload: dict[str, Any], sender: WebSocket | None = None) -> None:
         clients = self.rooms.get(room_id, set())
-        for client in list(clients):
-            if sender is not None and client is sender:
-                continue
-            await client.send_json(payload)
+        targets = [client for client in list(clients) if sender is None or client is not sender]
+        if not targets:
+            return
+        results = await asyncio.gather(
+            *(client.send_json(payload) for client in targets),
+            return_exceptions=True,
+        )
+        for client, result in zip(targets, results):
+            if isinstance(result, Exception):
+                self.disconnect(room_id, client)
 
 
 signaling_manager = CallSignalingManager()
@@ -390,6 +458,41 @@ async def end_call_session(
     return CallSessionResponse(**updated)
 
 
+@router.get("/{call_id}/recording/file")
+async def get_call_recording_file(
+    call_id: UUID,
+    db: Client = Depends(get_db),
+    current_user: dict = Depends(require_auth),
+    repository: CallRepository = Depends(get_call_repository),
+):
+    existing = await _assert_can_use_call(db, repository, current_user, call_id)
+    recording_path = str(existing.get("recording_path") or "").strip()
+    if not recording_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recording not found")
+
+    base_dir = _recordings_dir()
+    requested = Path(recording_path.replace("\\", "/"))
+    candidates = []
+    if requested.is_absolute():
+        candidates.append(requested)
+    candidates.extend([base_dir / requested.name, base_dir / requested])
+
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        try:
+            resolved.relative_to(base_dir)
+        except ValueError:
+            continue
+        if resolved.is_file():
+            return FileResponse(
+                path=str(resolved),
+                media_type=existing.get("recording_mime") or "application/octet-stream",
+                filename=resolved.name,
+            )
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recording not found")
+
+
 @router.post("/{call_id}/recording/start")
 async def start_call_recording_upload(
     call_id: UUID,
@@ -427,17 +530,34 @@ async def upload_call_recording_chunk(
     repository: CallRepository = Depends(get_call_repository),
 ):
     await _assert_can_use_call(db, repository, current_user, call_id)
+    _validate_recording_mime(file.content_type)
     if chunk_index < 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid recording chunk index")
 
     tmp_dir = _recording_tmp_dir(str(call_id))
     tmp_dir.mkdir(parents=True, exist_ok=True)
     chunk_path = tmp_dir / f"chunk_{chunk_index:08d}.part"
-    contents = await file.read()
-    if not contents:
+    existing_size = _tmp_recording_size(tmp_dir)
+    if chunk_path.exists():
+        existing_size -= chunk_path.stat().st_size
+    size = await _write_upload_stream(
+        file,
+        chunk_path,
+        max_bytes=settings.CALL_RECORDING_CHUNK_MAX_BYTES,
+    )
+    if not size:
+        try:
+            chunk_path.unlink()
+        except OSError:
+            pass
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Recording chunk is empty")
-    chunk_path.write_bytes(contents)
-    return {"status": "stored", "call_id": str(call_id), "chunk_index": chunk_index, "size": len(contents)}
+    if max(0, existing_size) + size > settings.CALL_RECORDING_MAX_BYTES:
+        try:
+            chunk_path.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Recording is too large")
+    return {"status": "stored", "call_id": str(call_id), "chunk_index": chunk_index, "size": size}
 
 
 @router.post("/{call_id}/recording/complete")
@@ -451,6 +571,10 @@ async def complete_call_recording_upload(
     repository: CallRepository = Depends(get_call_repository),
 ):
     existing = await _assert_can_use_call(db, repository, current_user, call_id)
+    mime_type = _validate_recording_mime(mime_type)
+    tmp_dir = _recording_tmp_dir(str(call_id))
+    if _tmp_recording_size(tmp_dir) > settings.CALL_RECORDING_MAX_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Recording is too large")
     await repository.update_by_id(call_id, {"processing_status": "processing"})
     background_tasks.add_task(
         _finalize_recording_from_chunks,
@@ -481,6 +605,7 @@ async def upload_call_recording(
 ):
     existing = await _assert_can_use_call(db, repository, current_user, call_id)
     lead_id = existing.get("lead_id")
+    mime_type = _validate_recording_mime(file.content_type)
 
     if not file.filename:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing recording file")
@@ -489,15 +614,15 @@ async def upload_call_recording(
     extension = _safe_recording_extension(file.filename.split(".")[-1] if "." in file.filename else "webm")
     storage_path = _recording_storage_path(str(call_id), extension)
 
-    contents = await file.read()
-    with open(storage_path, "wb") as handle:
-        handle.write(contents)
+    size = await _write_upload_stream(file, Path(storage_path), max_bytes=settings.CALL_RECORDING_MAX_BYTES)
+    if not size:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Recording file is empty")
 
     recording_url = _recording_url(str(call_id), extension)
     update = {
         "recording_path": _recording_db_path(str(call_id), extension),
-        "recording_mime": file.content_type,
-        "recording_size": len(contents),
+        "recording_mime": mime_type,
+        "recording_size": size,
         "processing_status": "pending",
     }
     updated = await repository.update_by_id(call_id, update)
@@ -514,8 +639,8 @@ async def upload_call_recording(
             "call_id": str(call_id),
             "lead_id": str(lead_id) if lead_id else None,
             "actor_id": str(current_user.get("id") or "") or None,
-            "recording_mime": file.content_type,
-            "recording_size": len(contents),
+            "recording_mime": mime_type,
+            "recording_size": size,
         },
     )
 
