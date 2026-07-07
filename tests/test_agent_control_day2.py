@@ -195,9 +195,11 @@ class FakeLegacyDB:
         return FakeLegacyTable(self.tables[table_name])
 
 
-def test_safe_agent_task_is_stored_and_dispatched() -> None:
+def test_agent_task_is_stored_for_approval_without_dispatch() -> None:
     action_repo = FakeActionRepository()
+    approval_repo = FakeApprovalRepository()
     task_repo = FakeTaskRepository()
+    notifications = FakeNotificationService()
     user = {"id": str(uuid4()), "role": "sales_rep"}
     entity_id = uuid4()
 
@@ -214,19 +216,21 @@ def test_safe_agent_task_is_stored_and_dispatched() -> None:
             current_user=user,
             run_repository=FakeRunRepository(),
             action_repository=action_repo,
-            approval_repository=FakeApprovalRepository(),
+            approval_repository=approval_repo,
             task_repository=task_repo,
             note_repository=FakeNoteRepository(),
-            notification_service=FakeNotificationService(),
+            notification_service=notifications,
         )
     )
 
-    assert response.status == "created"
-    assert task_repo.created[0]["title"] == "Call lead"
-    assert action_repo.rows[0]["dispatch_status"] == "dispatched"
+    assert response.status == "pending_approval"
+    assert task_repo.created == []
+    assert action_repo.rows[0]["approval_status"] == "pending"
+    assert action_repo.rows[0]["dispatch_status"] == "not_dispatched"
+    assert approval_repo.rows[0]["state"] == "pending"
 
 
-def test_risky_agent_alert_is_stored_for_approval_without_dispatch() -> None:
+def test_agent_alert_is_auto_dispatched_without_approval() -> None:
     action_repo = FakeActionRepository()
     approval_repo = FakeApprovalRepository()
     notifications = FakeNotificationService()
@@ -240,7 +244,6 @@ def test_risky_agent_alert_is_stored_for_approval_without_dispatch() -> None:
                 entity_id=uuid4(),
                 reason="Deal risk",
                 data={"title": "Risk", "message": "Deal stalled", "recipient_id": str(uuid4())},
-                requires_approval=True,
             ),
             current_user=user,
             run_repository=FakeRunRepository(),
@@ -252,10 +255,11 @@ def test_risky_agent_alert_is_stored_for_approval_without_dispatch() -> None:
         )
     )
 
-    assert response.status == "pending_approval"
-    assert action_repo.rows[0]["approval_status"] == "pending"
-    assert approval_repo.rows[0]["state"] == "pending"
-    assert notifications.created == []
+    assert response.status == "created"
+    assert action_repo.rows[0]["approval_status"] == "approved"
+    assert action_repo.rows[0]["dispatch_status"] == "dispatched"
+    assert approval_repo.rows == []
+    assert notifications.created[0]["type"] == "agent_alert"
 
 
 def test_approval_executes_pending_alert() -> None:

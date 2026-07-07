@@ -3,38 +3,41 @@ import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, Header, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Depends, Header, HTTPException, Request, status
 
 from app.database import get_db, run_db_operation
 from app.postgres_client import PostgresClient as Client
+from app.auth.cookies import ACCESS_TOKEN_COOKIE
 from app.auth.utils import verify_token
 from app.auth.token_store import is_token_blacklisted
 from app.utils.cache import get_cached_user, cache_user
 from app.services.permission_service import PermissionService
 
-security = HTTPBearer()
-optional_security = HTTPBearer(auto_error=False)
-
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
     db: Client = Depends(get_db)
 ) -> Dict[str, Any]:
     """
-    Get the current authenticated user from JWT token.
-    
+    Get the current authenticated user from the access token cookie.
+
     Args:
-        credentials: HTTP Bearer token from Authorization header
+        request: Incoming request (reads the httpOnly access_token cookie)
         db: Database client
-        
+
     Returns:
         User/agent dictionary
-        
+
     Raises:
         HTTPException: If token is invalid or user not found
     """
-    token = credentials.credentials
+    token = request.cookies.get(ACCESS_TOKEN_COOKIE)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     if await is_token_blacklisted(db, token):
         raise HTTPException(
@@ -132,19 +135,19 @@ async def require_auth(current_user: dict = Depends(get_current_user)) -> dict:
 
 
 async def require_human_or_ai_agent_auth(
-    credentials: HTTPAuthorizationCredentials | None = Depends(optional_security),
+    request: Request,
     x_ai_agent_key: Optional[str] = Header(default=None, alias="X-AI-Agent-Key"),
     x_ai_service_token: Optional[str] = Header(default=None, alias="X-AI-Service-Token"),
     db: Client = Depends(get_db),
 ) -> Dict[str, Any]:
     if x_ai_agent_key or x_ai_service_token:
         return await require_ai_agent_auth(x_ai_agent_key, x_ai_service_token, db)
-    if credentials is None:
+    if ACCESS_TOKEN_COOKIE not in request.cookies:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication credentials are required",
         )
-    return await get_current_user(credentials, db)
+    return await get_current_user(request, db)
 
 
 def require_role(allowed_roles: list[str]):
@@ -227,39 +230,27 @@ async def require_ai_agent_auth(
     Authenticate incoming requests from AI services.
 
     Expected headers:
-        X-AI-Agent-Key:     e.g. writer_agent
         X-AI-Service-Token: raw service token issued via the admin credential API
+        X-AI-Agent-Key:     optional runtime attribution, e.g. deal_risk_watcher
 
     Validates:
-        - ai_agents.agent_key exists, enabled=true, status=active
         - ai_agent_credentials row with matching SHA-256 hash, is_active=true
         - credential not expired
-    Returns merged AI agent dict with a 'credential_scopes' key.
+        - X-AI-Agent-Key, when provided, points to an enabled active AI agent
+    Returns service auth context with a 'credential_scopes' key.
     """
-    if not x_ai_agent_key or not x_ai_service_token:
+    if not x_ai_service_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="X-AI-Agent-Key and X-AI-Service-Token headers are required",
+            detail="X-AI-Service-Token header is required",
         )
 
-    # 1. Look up the AI agent
-    agent_rows = await run_db_operation(
-        lambda: db.table("ai_agents").select("*").eq("agent_key", x_ai_agent_key).limit(1).execute()
-    )
-    rows = agent_rows.data or []
-    if not rows:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unknown AI agent key")
-    agent = rows[0]
-
-    if not agent.get("enabled") or str(agent.get("status") or "").lower() != "active":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="AI agent is disabled or inactive")
-
-    # 2. Verify the token hash
+    # 1. Verify the service token hash globally. The token authenticates the AI
+    # service, not a single logical agent identity.
     token_hash = hashlib.sha256(x_ai_service_token.encode()).hexdigest()
     cred_rows = await run_db_operation(
         lambda: db.table("ai_agent_credentials")
             .select("*")
-            .eq("ai_agent_id", str(agent["id"]))
             .eq("token_hash", token_hash)
             .eq("is_active", True)
             .limit(5)
@@ -278,15 +269,39 @@ async def require_ai_agent_auth(
     if not valid_cred:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired service token")
 
-    # 3. Fire-and-forget last_seen / last_used timestamps
-    try:
-        await run_db_operation(
-            lambda: db.table("ai_agents").update({"last_seen_at": now_iso}).eq("id", str(agent["id"])).execute()
+    # 2. Optional runtime attribution. This is for logs/visibility only; it does
+    # not bind the token to one agent.
+    agent: dict[str, Any] | None = None
+    if x_ai_agent_key:
+        agent_rows = await run_db_operation(
+            lambda: db.table("ai_agents").select("*").eq("agent_key", x_ai_agent_key).limit(1).execute()
         )
+        rows = agent_rows.data or []
+        if not rows:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unknown AI agent key")
+        agent = rows[0]
+
+        if not agent.get("enabled") or str(agent.get("status") or "").lower() != "active":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="AI agent is disabled or inactive")
+
+    # 3. Fire-and-forget last_seen / last_used timestamps.
+    try:
+        if agent:
+            await run_db_operation(
+                lambda: db.table("ai_agents").update({"last_seen_at": now_iso}).eq("id", str(agent["id"])).execute()
+            )
         await run_db_operation(
             lambda: db.table("ai_agent_credentials").update({"last_used_at": now_iso}).eq("id", str(valid_cred["id"])).execute()
         )
     except Exception:
         pass
 
-    return {**agent, "credential_scopes": valid_cred.get("scopes") or []}
+    return {
+        "auth_type": "ai_service",
+        "id": str(valid_cred.get("id") or ""),
+        "agent_key": x_ai_agent_key or "ai_service",
+        "agent_type": (agent or {}).get("agent_type") or "service",
+        "display_name": (agent or {}).get("display_name") or "AI Service",
+        "credential_id": str(valid_cred.get("id") or ""),
+        "credential_scopes": valid_cred.get("scopes") or [],
+    }

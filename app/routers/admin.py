@@ -351,10 +351,10 @@ def _to_admin_user(user: dict[str, Any]) -> dict[str, Any]:
 
 @router.get("/overview", response_model=AdminOverview)
 async def get_admin_overview(
-    current_user: dict = Depends(require_permissions(["admin_panel"])),
+    current_user: dict = Depends(require_permissions(["admin_users"])),
     service: AdminOverviewService = Depends(get_overview_service),
 ):
-    return await service.get_overview()
+    return await service.get_overview(current_user)
 
 
 @router.get("/users", response_model=AdminUserList)

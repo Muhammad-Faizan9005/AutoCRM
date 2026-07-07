@@ -75,6 +75,9 @@ class ConversionService:
 
         old_status = lead.get("status")
 
+        # The converter owns the new deal unless an authorized owner was supplied.
+        deal_owner_id = owner_id or actor_id or lead.get("owner_id")
+
         # Create deal
         deal_data = {
             "lead_id": str(lead_id),
@@ -83,7 +86,7 @@ class ConversionService:
             "value": value,
             "currency": currency,
             "expected_close_at": expected_close_at,
-            "owner_id": owner_id or lead.get("owner_id"),
+            "owner_id": deal_owner_id,
             "organization_id": organization_id or lead.get("organization_id"),
         }
 

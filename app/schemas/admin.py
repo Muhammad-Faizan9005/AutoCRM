@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, List, Literal, Optional
+from typing import Any, List, Literal, Optional, Union
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
@@ -62,13 +62,15 @@ class AdminUserUpdate(BaseModel):
 
 class AdminHighlight(BaseModel):
     label: str
-    value: str
+    value: Union[str, int, float]
     meta: Optional[str] = None
 
 
 class AdminCoverageItem(BaseModel):
     label: str
     percent: int
+    value: Optional[str] = None
+    meta: Optional[str] = None
 
 
 class AdminWatchItem(BaseModel):
@@ -91,6 +93,8 @@ class AdminActivityItem(BaseModel):
 class AdminOverview(BaseModel):
     highlights: List[AdminHighlight]
     coverage: List[AdminCoverageItem]
+    sources: List[AdminCoverageItem] = Field(default_factory=list)
     watchlist: List[AdminWatchItem]
     queues: List[AdminQueueItem]
+    team_performance: List[AdminHighlight] = Field(default_factory=list)
     activity: List[AdminActivityItem]

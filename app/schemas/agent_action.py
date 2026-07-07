@@ -130,7 +130,7 @@ class AiAgentCredentialCreate(BaseModel):
 
 class AiAgentCredentialResponse(BaseModel):
     id: UUID
-    ai_agent_id: UUID
+    ai_agent_id: Optional[UUID] = None
     key_prefix: str
     scopes: list[str] = []
     is_active: bool
