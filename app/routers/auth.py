@@ -1,10 +1,10 @@
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 from pathlib import Path
 import secrets
 
-from fastapi import APIRouter, File, HTTPException, status, Depends, UploadFile
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import APIRouter, File, HTTPException, Request, Response, status, Depends, UploadFile
 from sqlalchemy import text
 from supabase import Client
 
@@ -16,9 +16,6 @@ from app.schemas.auth import (
     RegisterRequest,
     RegisterResponse,
     UserResponse,
-    RefreshTokenRequest,
-    TokenResponse,
-    LogoutRequest,
     ForgotPasswordRequest,
     ResetPasswordRequest,
     ProfileUpdateRequest,
@@ -30,6 +27,12 @@ from app.auth.utils import (
     verify_token,
     hash_password,
 )
+from app.auth.cookies import (
+    ACCESS_TOKEN_COOKIE,
+    REFRESH_TOKEN_COOKIE,
+    set_auth_cookies,
+    clear_auth_cookies,
+)
 from app.auth.dependencies import require_auth, get_permission_service
 from app.auth.token_store import blacklist_token, is_token_blacklisted
 from app.config import settings
@@ -38,8 +41,6 @@ from app.services.registration_service import register_user_account
 from app.services.email_service import MailjetEmailService
 
 router = APIRouter()
-security = HTTPBearer()
-optional_security = HTTPBearer(auto_error=False)
 
 ALLOWED_AVATAR_TYPES = {
     "image/jpeg": "jpg",
@@ -79,7 +80,19 @@ def _safe_auth_user(user: dict, permissions: dict[str, bool] | None = None) -> d
     safe_user = dict(user)
     safe_user.pop("password_hash", None)
     safe_user["avatar_url"] = _local_avatar_url(str(safe_user.get("id") or ""))
-    safe_user["developer_mode"] = bool(safe_user.get("developer_mode", False)) if is_admin_user(safe_user) else False
+    raw_settings = safe_user.get("settings")
+    if isinstance(raw_settings, str):
+        try:
+            raw_settings = json.loads(raw_settings)
+        except json.JSONDecodeError:
+            raw_settings = {}
+    settings_payload = raw_settings if isinstance(raw_settings, dict) else {}
+    legacy_developer_mode = bool(safe_user.get("developer_mode", False))
+    developer_mode = bool(settings_payload.get("developer_mode", legacy_developer_mode))
+    if not is_admin_user(safe_user):
+        developer_mode = False
+    safe_user["settings"] = {**settings_payload, "developer_mode": developer_mode}
+    safe_user["developer_mode"] = developer_mode
     if permissions is not None:
         safe_user["permissions"] = permissions
     safe_user["is_admin"] = is_admin_user(safe_user)
@@ -92,8 +105,32 @@ async def _ensure_profile_columns(db: Client) -> None:
         with db.engine.begin() as conn:
             conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS avatar_url TEXT"))
             conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS developer_mode BOOLEAN NOT NULL DEFAULT false"))
+            conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb"))
 
     await run_db_operation(_exec)
+
+
+def _merge_settings(current: object, patch: object, *, allow_developer_mode: bool) -> dict:
+    if isinstance(current, str):
+        try:
+            current = json.loads(current)
+        except json.JSONDecodeError:
+            current = {}
+    base = dict(current) if isinstance(current, dict) else {}
+    incoming = dict(patch) if isinstance(patch, dict) else {}
+    if not allow_developer_mode:
+        incoming.pop("developer_mode", None)
+
+    def merge_dict(left: dict, right: dict) -> dict:
+        merged = dict(left)
+        for key, value in right.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = merge_dict(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    return merge_dict(base, incoming)
 
 
 async def _return_current_user(
@@ -117,15 +154,14 @@ async def _return_current_user(
 
 async def _assert_admin_for_role_override(
     db: Client,
-    credentials: HTTPAuthorizationCredentials | None,
+    token: str | None,
 ) -> None:
-    if not credentials:
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admin can assign this role",
         )
 
-    token = credentials.credentials
     if await is_token_blacklisted(db, token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -163,7 +199,8 @@ async def _assert_admin_for_role_override(
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 async def register(
     user_data: RegisterRequest,
-    credentials: HTTPAuthorizationCredentials | None = Depends(optional_security),
+    request: Request,
+    response: Response,
     db: Client = Depends(get_db),
     permission_service: PermissionService = Depends(get_permission_service),
 ):
@@ -174,7 +211,7 @@ async def register(
     assign elevated roles.
     """
     if user_data.role != "sales_rep":
-        await _assert_admin_for_role_override(db=db, credentials=credentials)
+        await _assert_admin_for_role_override(db=db, token=request.cookies.get(ACCESS_TOKEN_COOKIE))
 
     created_user = await register_user_account(
         db,
@@ -184,49 +221,46 @@ async def register(
         role=user_data.role,
         is_active=True,
     )
-    
+
     # Create tokens
     access_token = create_access_token(data={"sub": created_user["id"]})
     refresh_token = create_refresh_token(data={"sub": created_user["id"]})
-    
+    set_auth_cookies(response, access_token=access_token, refresh_token=refresh_token)
+
     safe_user = _safe_auth_user(
         created_user,
         await permission_service.get_effective_permissions(created_user),
     )
-    
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-        "user": safe_user
-    }
+
+    return {"user": safe_user}
 
 
 @router.post("/login", response_model=LoginResponse)
 async def login(
     credentials: LoginRequest,
+    response: Response,
     db: Client = Depends(get_db),
     permission_service: PermissionService = Depends(get_permission_service),
 ):
     """
     Login with email and password.
-    
-    Returns JWT access and refresh tokens upon successful authentication.
+
+    Issues access and refresh tokens as httpOnly cookies upon successful authentication.
     """
     # Get user by email
-    response = await run_db_operation(
+    response_data = await run_db_operation(
         lambda: db.table("agents").select("*").eq("email", credentials.email).limit(1).execute()
     )
-    
-    if not response.data:
+
+    if not response_data.data:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    user = response.data[0]
-    
+
+    user = response_data.data[0]
+
     # Verify password
     stored_hash = user.get("password_hash")
     if not stored_hash or not verify_password(credentials.password, stored_hash):
@@ -235,29 +269,25 @@ async def login(
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     # Check if user is active
     if not user.get("is_active", True):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is inactive"
         )
-    
+
     # Create tokens
     access_token = create_access_token(data={"sub": user["id"]})
     refresh_token = create_refresh_token(data={"sub": user["id"]})
-    
+    set_auth_cookies(response, access_token=access_token, refresh_token=refresh_token)
+
     safe_user = _safe_auth_user(
         user,
         await permission_service.get_effective_permissions(user),
     )
-    
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-        "user": safe_user
-    }
+
+    return {"user": safe_user}
 
 
 @router.get("/me", response_model=UserResponse)
@@ -292,7 +322,9 @@ async def update_current_user_profile(
 
     new_password = update_data.pop("new_password", None)
     current_password = update_data.pop("current_password", None)
-    allowed_fields = {"full_name", "email", "developer_mode"}
+    settings_patch = update_data.pop("settings", None)
+    developer_mode_patch = update_data.pop("developer_mode", None)
+    allowed_fields = {"full_name", "email"}
     update_data = {key: value for key, value in update_data.items() if key in allowed_fields}
     if "email" in update_data and update_data["email"] is not None:
         update_data["email"] = str(update_data["email"]).strip().lower()
@@ -312,8 +344,19 @@ async def update_current_user_profile(
     fresh_user = await run_db_operation(_fetch_user)
     if not fresh_user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    if "developer_mode" in update_data and not is_admin_user(fresh_user):
-        update_data.pop("developer_mode", None)
+    if developer_mode_patch is not None:
+        settings_patch = {
+            **(settings_patch if isinstance(settings_patch, dict) else {}),
+            "developer_mode": bool(developer_mode_patch),
+        }
+
+    if settings_patch is not None:
+        merged_settings = _merge_settings(
+            fresh_user.get("settings"),
+            settings_patch,
+            allow_developer_mode=is_admin_user(fresh_user),
+        )
+        update_data["settings"] = json.dumps(merged_settings)
 
     email_changed = (
         "email" in update_data
@@ -351,7 +394,10 @@ async def update_current_user_profile(
     set_clauses = []
     params: dict[str, object] = {"user_id": user_id}
     for key, value in update_data.items():
-        set_clauses.append(f"{key} = :{key}")
+        if key == "settings":
+            set_clauses.append("settings = CAST(:settings AS jsonb)")
+        else:
+            set_clauses.append(f"{key} = :{key}")
         params[key] = value
     set_clauses.append("updated_at = NOW()")
 
@@ -440,17 +486,26 @@ async def delete_current_user_avatar(
     return await _return_current_user(db, permission_service, user_id)
 
 
-@router.post("/refresh", response_model=TokenResponse)
+@router.post("/refresh")
 async def refresh_access_token(
-    refresh_data: RefreshTokenRequest,
-    db: Client = Depends(get_db)
+    request: Request,
+    response: Response,
+    db: Client = Depends(get_db),
 ):
     """
-    Refresh access token using refresh token.
-    
-    Returns new access and refresh tokens.
+    Refresh the access token using the refresh_token cookie.
+
+    Rotates and re-issues access/refresh/csrf cookies.
     """
-    if await is_token_blacklisted(db, refresh_data.refresh_token):
+    refresh_token = request.cookies.get(REFRESH_TOKEN_COOKIE)
+    if not refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing refresh token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if await is_token_blacklisted(db, refresh_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token has been invalidated",
@@ -458,15 +513,15 @@ async def refresh_access_token(
         )
 
     # Verify refresh token
-    payload = verify_token(refresh_data.refresh_token)
-    
+    payload = verify_token(refresh_token)
+
     if payload is None or payload.get("type") != "refresh":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid refresh token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(
@@ -474,53 +529,53 @@ async def refresh_access_token(
             detail="Invalid refresh token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     # Verify user still exists and is active
-    response = await run_db_operation(lambda: db.table("agents").select("*").eq("id", user_id).execute())
-    if not response.data or not response.data[0].get("is_active", True):
+    user_lookup = await run_db_operation(lambda: db.table("agents").select("*").eq("id", user_id).execute())
+    if not user_lookup.data or not user_lookup.data[0].get("is_active", True):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     # Create new tokens
     access_token = create_access_token(data={"sub": user_id})
     new_refresh_token = create_refresh_token(data={"sub": user_id})
 
     # Refresh token rotation: old refresh token is no longer valid.
-    await blacklist_token(db, refresh_data.refresh_token, payload.get("exp"))
-    
-    return {
-        "access_token": access_token,
-        "refresh_token": new_refresh_token,
-        "token_type": "bearer",
-        "expires_in": settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60
-    }
+    await blacklist_token(db, refresh_token, payload.get("exp"))
+
+    set_auth_cookies(response, access_token=access_token, refresh_token=new_refresh_token)
+
+    return {"success": True}
 
 
 @router.post("/logout")
 async def logout(
-    payload: LogoutRequest | None = None,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
+    response: Response,
     current_user: dict = Depends(require_auth),
     db: Client = Depends(get_db),
 ):
     """
     Logout current user.
-    
-    Note: With JWT, actual logout is handled client-side by removing tokens.
-    This endpoint is for logging/audit purposes and to invalidate cached user data.
-    """
-    access_payload = verify_token(credentials.credentials)
-    if access_payload and access_payload.get("exp"):
-        await blacklist_token(db, credentials.credentials, access_payload.get("exp"))
 
-    refresh_token = payload.refresh_token if payload else None
+    Blacklists the active access/refresh tokens and clears auth cookies.
+    """
+    access_token = request.cookies.get(ACCESS_TOKEN_COOKIE)
+    if access_token:
+        access_payload = verify_token(access_token)
+        if access_payload and access_payload.get("exp"):
+            await blacklist_token(db, access_token, access_payload.get("exp"))
+
+    refresh_token = request.cookies.get(REFRESH_TOKEN_COOKIE)
     if refresh_token:
         refresh_payload = verify_token(refresh_token)
         if refresh_payload and refresh_payload.get("exp"):
             await blacklist_token(db, refresh_token, refresh_payload.get("exp"))
+
+    clear_auth_cookies(response)
 
     # Invalidate user cache on logout
     user_id = current_user.get("id")

@@ -6,6 +6,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import get_db, run_db_operation
+from app.auth.cookies import csrf_middleware
 from app.middleware.error_handler import error_handler_middleware, setup_exception_handlers
 from app.middleware.logging_middleware import logging_middleware
 from app.middleware.rate_limiter import rate_limit_middleware
@@ -32,12 +33,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "http://localhost:3000",
-        "https://auto-crm-frontend-pink.vercel.app",
         "https://auto-crm-frontend-henna.vercel.app",
-        "http://192.168.100.17:5173",
-        "http://172.21.32.1:5173",
-        "https://subsensuously-unhumored-ngoc.ngrok-free.dev"
     ],  # only allow known frontend origins
     allow_credentials=True,
     allow_methods=["*"],
@@ -46,6 +42,7 @@ app.add_middleware(
 
 # Middleware registration order matters.
 # Last registered executes first, so request-id gets attached before request logs.
+app.middleware("http")(csrf_middleware)
 app.middleware("http")(security_middleware)
 app.middleware("http")(rate_limit_middleware)
 app.middleware("http")(logging_middleware)

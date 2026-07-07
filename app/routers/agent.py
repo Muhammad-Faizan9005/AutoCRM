@@ -4,12 +4,13 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import text
 from supabase import Client
 
 from app.auth.dependencies import (
     require_auth,
+    require_admin,
     require_ai_agent_auth,
     require_human_or_ai_agent_auth,
     require_sales_manager_or_admin,
@@ -42,12 +43,12 @@ from app.schemas.agent_action import (
 )
 from app.schemas.note import NoteCreate
 from app.schemas.task import TaskCreate
-from app.services.lead_scoring_service import calculate_lead_score_sweep
+from app.services.lead_scoring_service import queue_lead_score_sweep
 from app.services.notification_service import NotificationService
 
 router = APIRouter()
 
-RISKY_ACTIONS = {"create_alert", "send_email", "update_deal_stage", "update_lead_status"}
+RISKY_ACTIONS = {"create_task", "send_email", "update_deal_stage", "update_lead_status"}
 SUPPORTED_ACTIONS = {"create_task", "create_note", "create_alert"}
 
 AI_AGENT_RUNTIME_ALIASES = {
@@ -411,14 +412,34 @@ async def get_run_trace(
     run_id: UUID,
     _current_user: dict = Depends(require_human_or_ai_agent_auth),
     db: Client = Depends(get_db),
+    run_repository: AgentRunRepository = Depends(get_run_repository),
     trace_repository: AgentTraceRepository = Depends(get_trace_repository),
 ):
     trace = await trace_repository.list_for_run(run_id)
     if trace:
         return trace
+    external_trace = await _list_current_run_trace_by_external_id(db, run_id)
+    if external_trace:
+        return external_trace
+    try:
+        current_run = await run_repository.get_by_id(run_id)
+    except Exception:
+        current_run = None
+    if not current_run:
+        current_run = await run_repository.find_by_external_id(str(run_id))
+    if current_run and current_run.get("id"):
+        current_run_id = str(current_run["id"])
+        if current_run_id != str(run_id):
+            trace = await trace_repository.list_for_run(current_run_id)
+            if trace:
+                return trace
     legacy_trace = await _list_legacy_run_trace(db, run_id)
     if legacy_trace:
         return legacy_trace
+    if current_run and current_run.get("external_run_id"):
+        legacy_trace = await _list_legacy_run_trace(db, UUID(str(current_run["external_run_id"])))
+        if legacy_trace:
+            return legacy_trace
     return await _legacy_interaction_as_trace(db, run_id)
 
 
@@ -476,6 +497,8 @@ async def list_pending_approvals(
 
 @router.get("/control-center")
 async def get_control_center_snapshot(
+    runs_page: int = Query(default=1, ge=1),
+    runs_limit: int = Query(default=25, ge=5, le=100),
     _current_user: dict = Depends(require_sales_manager_or_admin()),
     db: Client = Depends(get_db),
     run_repository: AgentRunRepository = Depends(get_run_repository),
@@ -490,11 +513,15 @@ async def get_control_center_snapshot(
     duplicate round trips.
     """
     filters = {"status": None, "entity_type": None, "entity_id": None}
+    offset = (runs_page - 1) * runs_limit
+    source_window = offset + runs_limit + 1
 
-    current_runs = await run_repository.list(order_by="started_at", order_desc=True)
-    legacy_runs = await _list_legacy_ai_runs(db, filters)
-    legacy_interactions = await _list_legacy_ai_interactions(db, filters)
-    runs = await _enrich_control_rows(db, _sort_runs([*current_runs, *legacy_runs, *legacy_interactions]))
+    current_runs = await run_repository.list(limit=source_window, order_by="started_at", order_desc=True)
+    legacy_runs = await _list_legacy_ai_runs(db, filters, limit=source_window)
+    legacy_interactions = await _list_legacy_ai_interactions(db, filters, limit=source_window)
+    sorted_runs = _sort_runs([*current_runs, *legacy_runs, *legacy_interactions])
+    paged_runs = sorted_runs[offset:offset + runs_limit]
+    runs = await _enrich_control_rows(db, paged_runs)
 
     approvals = await _enrich_approvals_with_actions(await approval_repository.list_pending(), get_action_repository(db), db)
     agents = await ai_agent_repo.list_all()
@@ -502,6 +529,11 @@ async def get_control_center_snapshot(
 
     return {
         "runs": runs,
+        "runs_pagination": {
+            "page": runs_page,
+            "limit": runs_limit,
+            "has_more": len(sorted_runs) > offset + runs_limit,
+        },
         "approvals": approvals,
         "ai_agents": _build_ai_agent_rows(agents, runs, actions),
     }
@@ -945,6 +977,7 @@ async def _safe_table_select(
     order_by: str | None = None,
     order_desc: bool = False,
     limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict]:
     try:
         query = db.table(table_name).select("*")
@@ -954,14 +987,17 @@ async def _safe_table_select(
         if order_by:
             query = query.order(order_by, desc=order_desc)
         if limit:
-            query = query.limit(limit)
+            if offset > 0:
+                query = query.range(offset, offset + limit - 1)
+            else:
+                query = query.limit(limit)
         response = await run_db_operation(lambda: query.execute())
         return response.data or []
     except Exception:
         return []
 
 
-async def _list_legacy_ai_runs(db: Client, filters: dict[str, object]) -> list[dict]:
+async def _list_legacy_ai_runs(db: Client, filters: dict[str, object], *, limit: int = 100) -> list[dict]:
     rows = await _safe_table_select(
         db,
         "ai_runs",
@@ -972,7 +1008,7 @@ async def _list_legacy_ai_runs(db: Client, filters: dict[str, object]) -> list[d
         },
         order_by="started_at",
         order_desc=True,
-        limit=100,
+        limit=limit,
     )
     return [
         {
@@ -993,10 +1029,10 @@ async def _list_legacy_ai_runs(db: Client, filters: dict[str, object]) -> list[d
     ]
 
 
-async def _list_legacy_ai_interactions(db: Client, filters: dict[str, object]) -> list[dict]:
+async def _list_legacy_ai_interactions(db: Client, filters: dict[str, object], *, limit: int = 100) -> list[dict]:
     if filters.get("status") or filters.get("entity_type") or filters.get("entity_id"):
         return []
-    rows = await _safe_table_select(db, "ai_interactions", order_by="created_at", order_desc=True, limit=100)
+    rows = await _safe_table_select(db, "ai_interactions", order_by="created_at", order_desc=True, limit=limit)
     return [
         {
             "id": row.get("id"),
@@ -1031,6 +1067,28 @@ async def _list_legacy_run_trace(db: Client, run_id: UUID) -> list[dict]:
             "payload": row.get("payload") or {},
             "created_at": row.get("created_at"),
             "legacy_source": "ai_service.ai_run_traces",
+        }
+        for row in rows
+    ]
+
+
+async def _list_current_run_trace_by_external_id(db: Client, external_run_id: UUID) -> list[dict]:
+    rows = await _safe_table_select(
+        db,
+        "ai_agent_run_traces",
+        filters={"external_run_id": str(external_run_id)},
+        order_by="created_at",
+        limit=100,
+    )
+    return [
+        {
+            "id": row.get("id"),
+            "run_id": row.get("run_id"),
+            "external_run_id": row.get("external_run_id"),
+            "step": row.get("step"),
+            "status": row.get("status") or "completed",
+            "payload": row.get("payload") or {},
+            "created_at": row.get("created_at"),
         }
         for row in rows
     ]
@@ -1317,10 +1375,73 @@ async def update_ai_agent(
 # AI Agent Credentials  (admin only — for AI service authentication)
 # ---------------------------------------------------------------------------
 
+@router.get("/service-credentials")
+async def list_ai_service_credentials(
+    _current_user: dict = Depends(require_admin()),
+    db: Client = Depends(get_db),
+):
+    """List AI service credentials without exposing raw tokens or hashes."""
+    response = await run_db_operation(
+        lambda: db.table("ai_agent_credentials")
+        .select("*")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return [{k: v for k, v in row.items() if k != "token_hash"} for row in (response.data or [])]
+
+
+@router.post("/service-credentials", status_code=status.HTTP_201_CREATED)
+async def create_ai_service_credential(
+    payload: AiAgentCredentialCreate,
+    current_user: dict = Depends(require_admin()),
+    cred_repo: AiAgentCredentialRepository = Depends(get_ai_agent_credential_repository),
+):
+    """
+    Issue a new global service token for the AI service.
+    The raw_token is returned ONCE; only its hash is stored.
+    """
+    from datetime import timedelta
+
+    raw_token, key_prefix, token_hash = generate_ai_service_token()
+
+    expires_at = None
+    if payload.expires_in_days:
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=payload.expires_in_days)).isoformat()
+
+    cred = await cred_repo.create({
+        "ai_agent_id": None,
+        "key_prefix":  key_prefix,
+        "token_hash":  token_hash,
+        "scopes":      payload.scopes,
+        "is_active":   True,
+        "expires_at":  expires_at,
+        "created_by":  str(current_user["id"]) if current_user.get("id") else None,
+    })
+
+    return {**{k: v for k, v in cred.items() if k != "token_hash"}, "raw_token": raw_token}
+
+
+@router.delete("/service-credentials/{credential_id}", status_code=status.HTTP_200_OK)
+async def revoke_ai_service_credential(
+    credential_id: UUID,
+    _current_user: dict = Depends(require_admin()),
+    cred_repo: AiAgentCredentialRepository = Depends(get_ai_agent_credential_repository),
+):
+    """Revoke a global service credential so it can no longer authenticate."""
+    await cred_repo.update_by_id(
+        credential_id,
+        {
+            "is_active":  False,
+            "revoked_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return {"status": "revoked", "credential_id": str(credential_id)}
+
+
 @router.get("/ai-agents/{agent_key}/credentials")
 async def list_ai_agent_credentials(
     agent_key: str,
-    _current_user: dict = Depends(require_sales_manager_or_admin()),
+    _current_user: dict = Depends(require_admin()),
     ai_agent_repo: AiAgentRepository = Depends(get_ai_agent_repository),
     cred_repo: AiAgentCredentialRepository = Depends(get_ai_agent_credential_repository),
 ):
@@ -1337,12 +1458,13 @@ async def list_ai_agent_credentials(
 async def create_ai_agent_credential(
     agent_key: str,
     payload: AiAgentCredentialCreate,
-    _current_user: dict = Depends(require_sales_manager_or_admin()),
+    current_user: dict = Depends(require_admin()),
     ai_agent_repo: AiAgentRepository = Depends(get_ai_agent_repository),
     cred_repo: AiAgentCredentialRepository = Depends(get_ai_agent_credential_repository),
 ):
     """
-    Issue a new service token for the given AI agent.
+    Legacy endpoint: issue a service token through an agent-specific URL.
+    New UI should use /service-credentials so tokens are service-scoped.
     The raw_token is returned ONCE — store it securely; it cannot be retrieved again.
     """
     from datetime import timedelta
@@ -1358,12 +1480,13 @@ async def create_ai_agent_credential(
         expires_at = (datetime.now(timezone.utc) + timedelta(days=payload.expires_in_days)).isoformat()
 
     cred = await cred_repo.create({
-        "ai_agent_id": str(agent["id"]),
+        "ai_agent_id": None,
         "key_prefix":  key_prefix,
         "token_hash":  token_hash,
         "scopes":      payload.scopes,
         "is_active":   True,
         "expires_at":  expires_at,
+        "created_by":  str(current_user["id"]) if current_user.get("id") else None,
     })
 
     return {**{k: v for k, v in cred.items() if k != "token_hash"}, "raw_token": raw_token}
@@ -1373,7 +1496,7 @@ async def create_ai_agent_credential(
 async def revoke_ai_agent_credential(
     agent_key: str,
     credential_id: UUID,
-    _current_user: dict = Depends(require_sales_manager_or_admin()),
+    _current_user: dict = Depends(require_admin()),
     ai_agent_repo: AiAgentRepository = Depends(get_ai_agent_repository),
     cred_repo: AiAgentCredentialRepository = Depends(get_ai_agent_credential_repository),
 ):
@@ -1413,8 +1536,9 @@ async def ai_service_heartbeat(
     }
 
 
-@router.post("/leads/score/sweep", status_code=status.HTTP_200_OK)
+@router.post("/leads/score/sweep", status_code=status.HTTP_202_ACCEPTED)
 async def ai_service_lead_score_sweep(
+    background_tasks: BackgroundTasks,
     limit: int = 100,
     _current_user: dict = Depends(require_human_or_ai_agent_auth),
     db: Client = Depends(get_db),
@@ -1425,7 +1549,167 @@ async def ai_service_lead_score_sweep(
     This lets the AI worker refresh scores without a user opening each lead
     detail page or pressing the manual scoring button.
     """
-    return await calculate_lead_score_sweep(db, limit=limit)
+    return await queue_lead_score_sweep(background_tasks, db, limit=limit)
+
+
+@router.get("/users/summary-candidates", status_code=status.HTTP_200_OK)
+async def ai_service_summary_candidates(
+    limit: int = Query(default=500, ge=1, le=1000),
+    _ai_agent: dict = Depends(require_ai_agent_auth),
+    db: Client = Depends(get_db),
+):
+    """Return active CRM users that should receive scheduled AI summaries."""
+    rows = await _safe_table_select(db, "agents", order_by="created_at", order_desc=True, limit=limit)
+    return [
+        {
+            "id": row.get("id"),
+            "full_name": row.get("full_name") or row.get("name"),
+            "name": row.get("name") or row.get("full_name"),
+            "email": row.get("email"),
+            "role": row.get("role"),
+            "status": row.get("status"),
+            "is_active": row.get("is_active", True),
+        }
+        for row in rows
+        if row.get("id") and row.get("is_active", True) is not False
+    ]
+
+
+@router.get("/ai-agents/runtime", status_code=status.HTTP_200_OK)
+async def ai_service_runtime_agents(
+    _ai_agent: dict = Depends(require_ai_agent_auth),
+    ai_agent_repo: AiAgentRepository = Depends(get_ai_agent_repository),
+):
+    """Return enabled AI runtime identities for service-side orchestration."""
+    agents = await ai_agent_repo.list_enabled()
+    return [
+        {
+            "id": row.get("id"),
+            "agent_key": row.get("agent_key"),
+            "display_name": row.get("display_name"),
+            "description": row.get("description"),
+            "agent_type": row.get("agent_type"),
+            "status": row.get("status"),
+            "enabled": row.get("enabled"),
+            "capabilities": row.get("capabilities") or [],
+            "config": row.get("config") or {},
+            "service_url": row.get("service_url"),
+            "last_seen_at": row.get("last_seen_at"),
+        }
+        for row in agents
+    ]
+
+
+@router.get("/leads/stale-candidates", status_code=status.HTTP_200_OK)
+async def ai_service_stale_lead_candidates(
+    limit: int = Query(default=500, ge=1, le=1000),
+    _ai_agent: dict = Depends(require_ai_agent_auth),
+    db: Client = Depends(get_db),
+):
+    """Return lead rows the AI service can evaluate for stale-follow-up nudges."""
+    rows = await _safe_table_select(db, "leads", order_by="updated_at", order_desc=False, limit=limit)
+    excluded_statuses = {"converted", "lost", "closed", "archived", "deleted"}
+    return [
+        {
+            "id": row.get("id"),
+            "name": row.get("name"),
+            "company": row.get("company"),
+            "email": row.get("email"),
+            "phone": row.get("phone"),
+            "status": row.get("status"),
+            "source": row.get("source"),
+            "owner_id": row.get("owner_id"),
+            "organization_id": row.get("organization_id"),
+            "updated_at": row.get("updated_at"),
+            "created_at": row.get("created_at"),
+            "last_contacted_at": row.get("last_contacted_at"),
+            "score": row.get("score"),
+            "score_reason": row.get("score_reason"),
+        }
+        for row in rows
+        if row.get("id") and str(row.get("status") or "").strip().lower() not in excluded_statuses
+    ]
+
+
+@router.get("/deals/risk-candidates", status_code=status.HTTP_200_OK)
+async def ai_service_deal_risk_candidates(
+    limit: int = Query(default=500, ge=1, le=1000),
+    _ai_agent: dict = Depends(require_ai_agent_auth),
+    db: Client = Depends(get_db),
+):
+    """Return deal rows the AI service can evaluate for risk alerts."""
+    rows = await _safe_table_select(db, "deals", order_by="updated_at", order_desc=False, limit=limit)
+    excluded_stages = {"won", "lost", "closed", "archived", "deleted"}
+    return [
+        {
+            "id": row.get("id"),
+            "title": row.get("title"),
+            "stage": row.get("stage"),
+            "value": row.get("value"),
+            "currency": row.get("currency"),
+            "owner_id": row.get("owner_id"),
+            "lead_id": row.get("lead_id"),
+            "organization_id": row.get("organization_id"),
+            "customer_id": row.get("customer_id"),
+            "expected_close_at": row.get("expected_close_at"),
+            "deal_type": row.get("deal_type"),
+            "updated_at": row.get("updated_at"),
+            "created_at": row.get("created_at"),
+            "loss_reason": row.get("loss_reason"),
+            "lost_reason": row.get("lost_reason"),
+        }
+        for row in rows
+        if row.get("id") and str(row.get("stage") or "").strip().lower() not in excluded_stages
+    ]
+
+
+@router.get("/users/{user_id}/summary-context", status_code=status.HTTP_200_OK)
+async def ai_service_user_summary_context(
+    user_id: UUID,
+    limit: int = Query(default=20, ge=1, le=100),
+    _ai_agent: dict = Depends(require_ai_agent_auth),
+    db: Client = Depends(get_db),
+):
+    """Return compact lead/deal context owned by a user for daily summaries."""
+    owner_id = str(user_id)
+
+    def _query() -> dict[str, list[dict]]:
+        with db.engine.connect() as conn:
+            leads = conn.execute(
+                text(
+                    "SELECT id::text, name, company, email, status, source, owner_id::text, "
+                    "organization_id::text, score, score_reason, updated_at, created_at "
+                    "FROM leads WHERE owner_id = :owner_id "
+                    "ORDER BY updated_at DESC LIMIT :limit"
+                ),
+                {"owner_id": owner_id, "limit": limit},
+            ).mappings().all()
+            deals = conn.execute(
+                text(
+                    "SELECT d.id::text, d.title, d.stage, d.value, d.currency, d.owner_id::text, "
+                    "d.lead_id::text, d.organization_id::text, d.customer_id::text, "
+                    "d.expected_close_at, d.deal_type, d.updated_at, d.created_at "
+                    "FROM deals d "
+                    "LEFT JOIN leads l ON l.id = d.lead_id "
+                    "WHERE d.owner_id = :owner_id OR l.owner_id = :owner_id "
+                    "ORDER BY d.updated_at DESC LIMIT :limit"
+                ),
+                {"owner_id": owner_id, "limit": limit},
+            ).mappings().all()
+            return {"owned_leads": [dict(row) for row in leads], "owned_deals": [dict(row) for row in deals]}
+
+    try:
+        return await run_db_operation(_query)
+    except Exception:
+        leads = [
+            row
+            for row in await _safe_table_select(db, "leads", filters={"owner_id": owner_id}, order_by="updated_at", order_desc=True, limit=limit)
+        ]
+        deals = [
+            row
+            for row in await _safe_table_select(db, "deals", filters={"owner_id": owner_id}, order_by="updated_at", order_desc=True, limit=limit)
+        ]
+        return {"owned_leads": leads, "owned_deals": deals}
 
 
 @router.get("/rag/snapshot", status_code=status.HTTP_200_OK)

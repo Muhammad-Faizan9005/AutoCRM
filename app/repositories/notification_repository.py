@@ -9,6 +9,26 @@ from app.exceptions.custom_exceptions import DatabaseError
 from app.repositories.base import BaseRepository
 
 
+def _normalize_legacy_notification(row: dict[str, Any]) -> dict[str, Any]:
+    title = str(row.get("title") or "")
+    message = str(row.get("message") or "")
+    is_legacy_deal_risk_approval = (
+        str(row.get("type") or "") == "agent_approval"
+        and str(row.get("entity_type") or "") == "deal"
+        and title.startswith("AI approval required: Deal risk alert")
+        and "Deal risk detected" in message
+        and "Review approval #" in message
+    )
+    if not is_legacy_deal_risk_approval:
+        return row
+
+    normalized = dict(row)
+    normalized["type"] = "agent_alert"
+    normalized["title"] = "Deal risk alert"
+    normalized["message"] = "Deal risk detected. Review stage progress, recent activity, owner follow-up, and next steps."
+    return normalized
+
+
 class NotificationRepository(BaseRepository):
     def __init__(self, db: Client):
         super().__init__(db=db, table_name="notifications", resource_name="Notification")
@@ -30,4 +50,4 @@ class NotificationRepository(BaseRepository):
         except Exception as exc:
             raise DatabaseError(detail="Failed to list notifications") from exc
 
-        return response.data or []
+        return [_normalize_legacy_notification(row) for row in response.data or []]

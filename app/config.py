@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     DB_POOL_TIMEOUT_SECONDS: int = 30
     DB_POOL_RECYCLE_SECONDS: int = 3600
     DB_MAX_CONCURRENT_OPERATIONS: int = 5
+    LEAD_SCORE_SWEEP_CONCURRENCY: int = 5
 
     # Supabase Storage
     SUPABASE_URL: Optional[str] = Field(

@@ -28,41 +28,22 @@ class UserPublic(BaseModel):
     is_active: bool
     created_at: datetime
     permissions: dict[str, bool] | None = None
+    settings: dict | None = None
+    developer_mode: bool | None = None
     is_admin: bool | None = None
     is_superuser: bool | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
-class TokenResponse(BaseModel):
-    """Token response schema"""
-    access_token: str
-    refresh_token: str
-    token_type: str = "bearer"
-    expires_in: int  # seconds
-
-
 class LoginResponse(BaseModel):
-    """Login response with tokens and user data"""
-    access_token: str
-    refresh_token: str
-    token_type: str = "bearer"
+    """Login response; tokens are issued as httpOnly cookies, not in the body"""
     user: UserPublic
 
 
 class RegisterResponse(LoginResponse):
     """Registration response; same contract as login for frontend simplicity"""
     pass
-
-
-class RefreshTokenRequest(BaseModel):
-    """Refresh token request schema"""
-    refresh_token: str
-
-
-class LogoutRequest(BaseModel):
-    """Optional logout payload for invalidating refresh token."""
-    refresh_token: str | None = None
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -82,6 +63,7 @@ class ProfileUpdateRequest(BaseModel):
     email: EmailStr | None = None
     avatar_url: str | None = Field(default=None, max_length=4096)
     developer_mode: bool | None = None
+    settings: dict | None = None
     current_password: str | None = Field(default=None, min_length=6)
     new_password: str | None = Field(default=None, min_length=6, max_length=128)
 
@@ -96,6 +78,7 @@ class UserResponse(BaseModel):
     is_active: bool
     created_at: datetime
     permissions: dict[str, bool] | None = None
+    settings: dict | None = None
     is_admin: bool | None = None
     is_superuser: bool | None = None
     developer_mode: bool | None = None

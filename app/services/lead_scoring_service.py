@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
+from fastapi import BackgroundTasks
 from sqlalchemy import text
 from supabase import Client
 
+from app.config import settings
 from app.database import run_db_operation
+
+logger = logging.getLogger(__name__)
+
+_sweep_state_lock = asyncio.Lock()
+_sweep_running = False
 
 
 async def calculate_lead_score(db: Client, lead_id: str) -> dict[str, Any] | None:
@@ -85,8 +94,14 @@ async def calculate_lead_score(db: Client, lead_id: str) -> dict[str, Any] | Non
     return await run_db_operation(_query)
 
 
-async def calculate_lead_score_sweep(db: Client, limit: int = 100) -> dict[str, Any]:
+async def calculate_lead_score_sweep(
+    db: Client,
+    limit: int = 100,
+    *,
+    concurrency: int | None = None,
+) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit or 100), 500))
+    safe_concurrency = max(1, min(int(concurrency or settings.LEAD_SCORE_SWEEP_CONCURRENCY), safe_limit))
 
     def _lead_ids():
         with db.engine.connect() as conn:
@@ -107,13 +122,67 @@ async def calculate_lead_score_sweep(db: Client, limit: int = 100) -> dict[str, 
             return [str(row["id"]) for row in rows]
 
     lead_ids = await run_db_operation(_lead_ids)
-    updated = 0
-    missing = 0
-    for lead_id in lead_ids:
-        result = await calculate_lead_score(db, lead_id)
-        if result is None:
-            missing += 1
-        else:
-            updated += 1
+    semaphore = asyncio.Semaphore(safe_concurrency)
 
-    return {"updated": updated, "missing": missing, "limit": safe_limit}
+    async def _score_one(lead_id: str) -> str:
+        async with semaphore:
+            try:
+                result = await calculate_lead_score(db, lead_id)
+            except Exception:
+                logger.exception("lead_score_sweep_item_failed lead_id=%s", lead_id)
+                return "error"
+            return "missing" if result is None else "updated"
+
+    outcomes = await asyncio.gather(*(_score_one(lead_id) for lead_id in lead_ids))
+    updated = sum(1 for outcome in outcomes if outcome == "updated")
+    missing = sum(1 for outcome in outcomes if outcome == "missing")
+    errors = sum(1 for outcome in outcomes if outcome == "error")
+
+    return {
+        "updated": updated,
+        "missing": missing,
+        "errors": errors,
+        "limit": safe_limit,
+        "selected": len(lead_ids),
+        "concurrency": safe_concurrency,
+    }
+
+
+async def queue_lead_score_sweep(
+    background_tasks: BackgroundTasks,
+    db: Client,
+    limit: int = 100,
+) -> dict[str, Any]:
+    global _sweep_running
+
+    safe_limit = max(1, min(int(limit or 100), 500))
+    async with _sweep_state_lock:
+        if _sweep_running:
+            return {
+                "status": "already_running",
+                "accepted": False,
+                "limit": safe_limit,
+                "mode": "background",
+            }
+        _sweep_running = True
+
+    background_tasks.add_task(_run_queued_lead_score_sweep, db, safe_limit)
+    return {
+        "status": "accepted",
+        "accepted": True,
+        "limit": safe_limit,
+        "mode": "background",
+    }
+
+
+async def _run_queued_lead_score_sweep(db: Client, limit: int) -> None:
+    global _sweep_running
+
+    try:
+        result = await calculate_lead_score_sweep(db, limit=limit)
+        logger.info("lead_score_sweep_background_completed result=%s", result)
+    except Exception:
+        logger.exception("lead_score_sweep_background_failed")
+    finally:
+        async with _sweep_state_lock:
+            _sweep_running = False

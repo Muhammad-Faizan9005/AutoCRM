@@ -17,7 +17,7 @@ from app.schemas.deal import DealCreate, DealResponse, DealUpdate
 from app.services.conversion_service import ConversionService
 from app.services.status_change_log_service import StatusChangeLogService
 from app.utils.statuses import DEAL_STATUSES, normalize_status
-from app.utils.team_access import can_access_lead, can_access_rep
+from app.utils.team_access import can_access_rep
 
 router = APIRouter()
 
@@ -67,6 +67,29 @@ async def _can_manager_assign_to_rep(db: Client, manager_id: str, rep_id: str) -
     return await run_db_operation(_query)
 
 
+async def _get_agent_role(db: Client, agent_id: str | None) -> str | None:
+    if not agent_id:
+        return None
+
+    def _query():
+        engine = getattr(db, "engine", None)
+        if engine is not None:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT role FROM agents WHERE id = :agent_id LIMIT 1"),
+                    {"agent_id": agent_id},
+                ).mappings().first()
+                return str(row.get("role") or "").strip().lower() if row else None
+
+        tables = getattr(db, "tables", {})
+        for agent in tables.get("agents", []):
+            if str(agent.get("id")) == str(agent_id):
+                return str(agent.get("role") or "").strip().lower()
+        return None
+
+    return await run_db_operation(_query)
+
+
 async def _assert_deal_assignment_permissions(
     db: Client,
     current_user: dict,
@@ -81,6 +104,11 @@ async def _assert_deal_assignment_permissions(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
 
     if role == "admin":
+        owner_role = await _get_agent_role(db, owner_id)
+        if owner_role in {"manager", "sales_manager"}:
+            return
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admins can assign deals only to managers")
+    if role in {"sales_manager", "manager"} and owner_id == user_id:
         return
     if role in {"sales_manager", "manager"}:
         if await _can_manager_assign_to_rep(db, user_id, owner_id):
@@ -92,6 +120,35 @@ async def _assert_deal_assignment_permissions(
     if owner_id == user_id:
         return
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions to assign deal")
+
+
+async def _move_linked_lead_to_admin_assigned_manager(
+    db: Client,
+    current_user: dict,
+    deal: dict,
+    owner_id: str | None,
+) -> None:
+    role = str(current_user.get("role") or "").strip().lower()
+    if role != "admin" or not owner_id or not deal.get("lead_id"):
+        return
+
+    owner_role = await _get_agent_role(db, owner_id)
+    if owner_role not in {"manager", "sales_manager"}:
+        return
+
+    def _query():
+        engine = getattr(db, "engine", None)
+        if engine is not None:
+            with engine.connect() as conn:
+                conn.execute(
+                    text("UPDATE leads SET owner_id = :owner_id WHERE id = :lead_id"),
+                    {"lead_id": str(deal.get("lead_id")), "owner_id": owner_id},
+                )
+                conn.commit()
+            return
+        db.table("leads").update({"owner_id": owner_id}).eq("id", str(deal.get("lead_id"))).execute()
+
+    await run_db_operation(_query)
 
 
 async def _get_lead_owner_for_deal(db: Client, lead_id: str | None) -> str | None:
@@ -110,12 +167,13 @@ async def _get_lead_owner_for_deal(db: Client, lead_id: str | None) -> str | Non
 
 
 async def _can_access_deal(db: Client, current_user: dict, deal: dict) -> bool:
-    if await can_access_rep(db, current_user, str(deal.get("owner_id") or "")):
+    role = str(current_user.get("role") or "").strip().lower()
+    owner_id = str(deal.get("owner_id") or "")
+    if role == "admin":
         return True
-    lead_id = str(deal.get("lead_id") or "")
-    if lead_id and await can_access_lead(db, current_user, lead_id):
-        return True
-    return False
+    if not owner_id:
+        return False
+    return await can_access_rep(db, current_user, owner_id)
 
 
 async def _list_deals_workspace(
@@ -154,13 +212,11 @@ async def _list_deals_workspace(
                 sql += (
                     "LEFT JOIN team_members tm_deal ON tm_deal.agent_id = d.owner_id "
                     "LEFT JOIN teams team_deal ON team_deal.id = tm_deal.team_id "
-                    "LEFT JOIN team_members tm_lead ON tm_lead.agent_id = l.owner_id "
-                    "LEFT JOIN teams team_lead ON team_lead.id = tm_lead.team_id "
                 )
-                where_clauses.append("(team_deal.manager_id = :mid OR team_lead.manager_id = :mid)")
+                where_clauses.append("(d.owner_id = :mid OR team_deal.manager_id = :mid)")
                 params["mid"] = requester_id
             elif role not in {"admin", "manager", "sales_manager"} and owner_id is None:
-                where_clauses.append("(d.owner_id = :uid OR l.owner_id = :uid)")
+                where_clauses.append("d.owner_id = :uid")
                 params["uid"] = requester_id
             elif owner_id is not None:
                 where_clauses.append("d.owner_id = :owner_id")
@@ -405,9 +461,7 @@ async def get_deals(
                     "LEFT JOIN leads l ON l.id = d.lead_id "
                     "LEFT JOIN team_members tm_deal ON tm_deal.agent_id = d.owner_id "
                     "LEFT JOIN teams team_deal ON team_deal.id = tm_deal.team_id "
-                    "LEFT JOIN team_members tm_lead ON tm_lead.agent_id = l.owner_id "
-                    "LEFT JOIN teams team_lead ON team_lead.id = tm_lead.team_id "
-                    "WHERE (team_deal.manager_id = :mid OR team_lead.manager_id = :mid) "
+                    "WHERE (d.owner_id = :mid OR team_deal.manager_id = :mid) "
                 )
                 params: dict[str, Any] = {"mid": requester_id}
                 if stage:
@@ -436,7 +490,7 @@ async def get_deals(
                 sql = (
                     "SELECT DISTINCT d.* FROM deals d "
                     "LEFT JOIN leads l ON l.id = d.lead_id "
-                    "WHERE (d.owner_id = :uid OR l.owner_id = :uid) "
+                    "WHERE d.owner_id = :uid "
                 )
                 params: dict[str, Any] = {"uid": requester_id}
                 if stage:
@@ -490,6 +544,76 @@ async def get_deals_workspace(
         organization_id=organization_id,
         lead_id=lead_id,
     )
+
+
+@router.get("/assignment-owners")
+async def get_assignment_owners(
+    db: Client = Depends(get_db),
+    current_user: dict = Depends(require_auth),
+):
+    """List users available for deal assignment in the current actor's scope."""
+    role = str(current_user.get("role") or "").strip().lower()
+    if role not in {"admin", "manager", "sales_manager"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+
+    def _query():
+        engine = getattr(db, "engine", None)
+        if engine is not None:
+            with engine.connect() as conn:
+                if role == "admin":
+                    rows = conn.execute(
+                        text(
+                            "SELECT id, full_name, email, role FROM agents "
+                            "WHERE role IN ('manager', 'sales_manager') "
+                            "ORDER BY created_at DESC"
+                        )
+                    ).mappings().all()
+                    return [dict(row) for row in rows]
+
+                rows = conn.execute(
+                    text(
+                        "SELECT a.id, a.full_name, a.email, a.role "
+                        "FROM team_members tm "
+                        "JOIN teams t ON t.id = tm.team_id "
+                        "JOIN agents a ON a.id = tm.agent_id "
+                        "WHERE t.manager_id = :mid "
+                        "ORDER BY a.created_at DESC"
+                    ),
+                    {"mid": str(current_user.get("id"))},
+                ).mappings().all()
+                return [dict(row) for row in rows]
+
+        tables = getattr(db, "tables", {})
+        if role == "admin":
+            return [
+                {
+                    "id": agent.get("id"),
+                    "full_name": agent.get("full_name"),
+                    "email": agent.get("email"),
+                    "role": agent.get("role"),
+                }
+                for agent in tables.get("agents", [])
+                if str(agent.get("role") or "").strip().lower() in {"manager", "sales_manager"}
+            ]
+
+        team_ids = {str(team.get("id")) for team in tables.get("teams", []) if str(team.get("manager_id")) == str(current_user.get("id"))}
+        member_ids = {
+            str(member.get("agent_id"))
+            for member in tables.get("team_members", [])
+            if str(member.get("team_id")) in team_ids
+        }
+        return [
+            {
+                "id": agent.get("id"),
+                "full_name": agent.get("full_name"),
+                "email": agent.get("email"),
+                "role": agent.get("role"),
+            }
+            for agent in tables.get("agents", [])
+            if str(agent.get("id")) in member_ids
+        ]
+
+    return await run_db_operation(_query)
 
 
 @router.get("/{deal_id}/ai-history")
@@ -559,10 +683,12 @@ async def create_deal(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
+    role = str(current_user.get("role") or "").strip().lower()
     owner_id = deal_data.get("owner_id")
     if not owner_id and deal_data.get("lead_id"):
         owner_id = await _get_lead_owner_for_deal(db, str(deal_data.get("lead_id")))
-    owner_id = owner_id or current_user.get("id")
+    if not owner_id and role != "admin":
+        owner_id = current_user.get("id")
     if owner_id:
         deal_data["owner_id"] = str(owner_id)
         await _assert_deal_assignment_permissions(db, current_user, deal_data["owner_id"])
@@ -613,6 +739,10 @@ async def update_deal(
             update_data[key] = str(update_data[key])
     if "owner_id" in update_data and update_data["owner_id"] is not None:
         await _assert_deal_assignment_permissions(db, current_user, update_data["owner_id"])
+    owner_changed = (
+        "owner_id" in update_data
+        and str(update_data.get("owner_id") or "") != str(existing.get("owner_id") or "")
+    )
     if "deal_type" in update_data and update_data["deal_type"] is not None:
         try:
             update_data["deal_type"] = _normalize_deal_type(update_data["deal_type"])
@@ -633,9 +763,14 @@ async def update_deal(
             if status_value == existing_status:
                 if not update_data:
                     return existing
-                return await repository.update_by_id(deal_id, update_data)
+                updated = await repository.update_by_id(deal_id, update_data)
+                if owner_changed:
+                    await _move_linked_lead_to_admin_assigned_manager(db, current_user, existing, update_data.get("owner_id"))
+                return updated
             if update_data:
                 await repository.update_by_id(deal_id, update_data)
+                if owner_changed:
+                    await _move_linked_lead_to_admin_assigned_manager(db, current_user, existing, update_data.get("owner_id"))
             return await service.update_deal_status(
                 deal_id=str(deal_id),
                 new_status=status_value,
@@ -647,7 +782,10 @@ async def update_deal(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
     # For other updates, use the repository directly
-    return await repository.update_by_id(deal_id, update_data)
+    updated = await repository.update_by_id(deal_id, update_data)
+    if owner_changed:
+        await _move_linked_lead_to_admin_assigned_manager(db, current_user, existing, update_data.get("owner_id"))
+    return updated
 
 
 @router.post("/{deal_id}/convert-to-customer", response_model=CustomerResponse, status_code=status.HTTP_201_CREATED)
