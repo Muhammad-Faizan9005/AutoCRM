@@ -90,6 +90,23 @@ class AdminActivityItem(BaseModel):
     at: datetime
 
 
+class AdminActivityLogItem(BaseModel):
+    id: str
+    event_type: str
+    entity_type: str
+    entity_id: Optional[UUID] = None
+    message: str
+    actor_id: Optional[UUID] = None
+    actor_name: Optional[str] = None
+    actor_email: Optional[str] = None
+    happened_at: datetime
+
+
+class AdminActivityLog(BaseModel):
+    items: List[AdminActivityLogItem]
+    total: int
+
+
 class AdminOverview(BaseModel):
     highlights: List[AdminHighlight]
     coverage: List[AdminCoverageItem]

@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import os
 
 from fastapi import FastAPI
@@ -15,6 +17,7 @@ from app.utils.logger import configure_logging
 
 
 configure_logging(settings.DEBUG)
+logger = logging.getLogger(__name__)
 
 os.makedirs(settings.CALL_RECORDINGS_DIR, exist_ok=True)
 os.makedirs(settings.AVATAR_STORAGE_DIR, exist_ok=True)
@@ -54,37 +57,44 @@ setup_exception_handlers(app)
 
 @app.on_event("startup")
 async def warmup_database_metadata() -> None:
-    # Preload metadata used by the main app screens so first page visits are not penalized.
+    # Warm metadata after startup so health checks and first page loads are not blocked.
+    asyncio.create_task(_warmup_database_metadata_background())
+
+
+async def _warmup_database_metadata_background() -> None:
     db = get_db()
-    await run_db_operation(
-        lambda: db.warmup_tables(
-            [
-                "agents",
-                "agent_permissions",
-                "revoked_tokens",
-                "organizations",
-                "leads",
-                "deals",
-                "tasks",
-                "notes",
-                "notifications",
-                "teams",
-                "team_members",
-                "call_sessions",
-                "call_room_tokens",
-                "ai_interactions",
-                "ai_agent_runs",
-                "ai_agent_run_traces",
-                "ai_agent_actions",
-                "ai_agent_approval_requests",
-                "ai_agent_settings",
-                "customers",
-                "tickets",
-                "ticket_messages",
-                "status_change_logs",
-            ]
+    try:
+        await run_db_operation(
+            lambda: db.warmup_tables(
+                [
+                    "agents",
+                    "agent_permissions",
+                    "revoked_tokens",
+                    "organizations",
+                    "leads",
+                    "deals",
+                    "tasks",
+                    "notes",
+                    "notifications",
+                    "teams",
+                    "team_members",
+                    "call_sessions",
+                    "call_room_tokens",
+                    "ai_interactions",
+                    "ai_agent_runs",
+                    "ai_agent_run_traces",
+                    "ai_agent_actions",
+                    "ai_agent_approval_requests",
+                    "ai_agent_settings",
+                    "customers",
+                    "tickets",
+                    "ticket_messages",
+                    "status_change_logs",
+                ]
+            )
         )
-    )
+    except Exception:
+        logger.exception("database_metadata_warmup_failed")
 
 @app.get("/")
 async def root():
