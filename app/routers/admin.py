@@ -16,6 +16,7 @@ from app.postgres_client import PostgresClient
 from app.repositories.user_repository import UserRepository
 from app.schemas.admin import (
     AdminOverview,
+    AdminActivityLog,
     AdminUserCreate,
     AdminUserList,
     AdminUserResponse,
@@ -25,6 +26,7 @@ from app.schemas.admin import (
 from app.schemas.failed_invite import FailedInviteResponse
 from app.schemas.permissions import PermissionSet, PermissionUpdate
 from app.services import permission_service
+from app.services.admin_activity_log_service import AdminActivityLogService
 from app.services.admin_overview_service import AdminOverviewService
 from app.services.email_service import MailjetEmailService
 from app.services.invite_service import InviteService
@@ -286,6 +288,10 @@ def get_overview_service(db: PostgresClient = Depends(get_db)) -> AdminOverviewS
     return AdminOverviewService(db)
 
 
+def get_activity_log_service(db: PostgresClient = Depends(get_db)) -> AdminActivityLogService:
+    return AdminActivityLogService(db)
+
+
 def get_email_service(db: PostgresClient = Depends(get_db)) -> MailjetEmailService:
     return MailjetEmailService(db)
 
@@ -355,6 +361,26 @@ async def get_admin_overview(
     service: AdminOverviewService = Depends(get_overview_service),
 ):
     return await service.get_overview(current_user)
+
+
+@router.get("/activity-log", response_model=AdminActivityLog)
+async def get_admin_activity_log(
+    skip: int = 0,
+    limit: int = 50,
+    entity_type: str | None = None,
+    event_type: str | None = None,
+    search: str | None = None,
+    current_user: dict = Depends(require_permissions(["admin_users"])),
+    service: AdminActivityLogService = Depends(get_activity_log_service),
+):
+    return await service.get_activity_log(
+        current_user,
+        skip=skip,
+        limit=limit,
+        entity_type=entity_type,
+        event_type=event_type,
+        search=search,
+    )
 
 
 @router.get("/users", response_model=AdminUserList)

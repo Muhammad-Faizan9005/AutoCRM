@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from supabase import Client
@@ -9,9 +10,26 @@ from app.exceptions.custom_exceptions import DatabaseError
 from app.repositories.base import BaseRepository
 
 
+_APPROVAL_ID_REVIEW_RE = re.compile(
+    r"\s*Review approval #[0-9a-fA-F-]+ in the AI Control Center\.?",
+)
+
+
+def _hide_approval_id_from_message(message: str) -> str:
+    cleaned = _APPROVAL_ID_REVIEW_RE.sub("", message).strip()
+    if not cleaned:
+        return "Review in the AI Control Center."
+    return f"{cleaned.rstrip('. ')}. Review in the AI Control Center."
+
+
 def _normalize_legacy_notification(row: dict[str, Any]) -> dict[str, Any]:
     title = str(row.get("title") or "")
     message = str(row.get("message") or "")
+    is_legacy_agent_approval = (
+        str(row.get("type") or "") == "agent_approval"
+        and "Review approval #" in message
+        and "in the AI Control Center" in message
+    )
     is_legacy_deal_risk_approval = (
         str(row.get("type") or "") == "agent_approval"
         and str(row.get("entity_type") or "") == "deal"
@@ -20,6 +38,10 @@ def _normalize_legacy_notification(row: dict[str, Any]) -> dict[str, Any]:
         and "Review approval #" in message
     )
     if not is_legacy_deal_risk_approval:
+        if is_legacy_agent_approval:
+            normalized = dict(row)
+            normalized["message"] = _hide_approval_id_from_message(message)
+            return normalized
         return row
 
     normalized = dict(row)

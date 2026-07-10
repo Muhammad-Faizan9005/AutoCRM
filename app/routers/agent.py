@@ -41,10 +41,16 @@ from app.schemas.agent_action import (
     AiAgentCredentialCreate,
     AiAgentUpdate,
 )
+from app.schemas.task_deadline import (
+    TaskDeadlineAlertIn,
+    TaskDeadlineAlertResponse,
+    TaskDeadlineCandidateList,
+)
 from app.schemas.note import NoteCreate
 from app.schemas.task import TaskCreate
 from app.services.lead_scoring_service import queue_lead_score_sweep
 from app.services.notification_service import NotificationService
+from app.services.task_deadline_service import TaskDeadlineService
 
 router = APIRouter()
 
@@ -57,8 +63,48 @@ AI_AGENT_RUNTIME_ALIASES = {
     "deal_risk_watcher": {"deal_risk_watcher", "deal_risk"},
     "daily_summary_assistant": {"daily_summary_assistant", "daily_summary", "summary_assistant"},
     "meeting_agent": {"meeting_agent", "meeting_assistant", "meeting_complete", "meeting_intel"},
+    "task_deadline_watcher": {"task_deadline_watcher", "task_deadline_watch", "deadline_watch"},
 }
 IMPLEMENTED_AI_AGENT_KEYS = set(AI_AGENT_RUNTIME_ALIASES.keys())
+
+DEFAULT_AI_AGENT_REGISTRY = [
+    {
+        "agent_key": "action_manager_agent",
+        "display_name": "Action Manager Agent",
+        "description": "Creates and dispatches playbook task actions.",
+        "agent_type": "action_manager",
+    },
+    {
+        "agent_key": "lead_assistant",
+        "display_name": "Lead Assistant",
+        "description": "Monitors lead health and suggests follow-ups.",
+        "agent_type": "lead_assistant",
+    },
+    {
+        "agent_key": "deal_risk_watcher",
+        "display_name": "Deal Risk Watcher",
+        "description": "Detects at-risk deals and triggers alerts.",
+        "agent_type": "deal_risk_watcher",
+    },
+    {
+        "agent_key": "daily_summary_assistant",
+        "display_name": "Daily Summary Assistant",
+        "description": "Produces daily CRM performance digests.",
+        "agent_type": "summary_assistant",
+    },
+    {
+        "agent_key": "meeting_agent",
+        "display_name": "Meeting Agent",
+        "description": "Summarizes completed meetings and creates actions.",
+        "agent_type": "meeting_assistant",
+    },
+    {
+        "agent_key": "task_deadline_watcher",
+        "display_name": "Task Deadline Watcher",
+        "description": "Monitors due and overdue tasks, escalates risk, and drafts internal recovery guidance.",
+        "agent_type": "task_deadline_watcher",
+    },
+]
 
 
 def get_task_repository(db: Client = Depends(get_db)) -> TaskRepository:
@@ -71,6 +117,10 @@ def get_note_repository(db: Client = Depends(get_db)) -> NoteRepository:
 
 def get_notification_service(db: Client = Depends(get_db)) -> NotificationService:
     return NotificationService(db)
+
+
+def get_task_deadline_service(db: Client = Depends(get_db)) -> TaskDeadlineService:
+    return TaskDeadlineService(db)
 
 
 def get_run_repository(db: Client = Depends(get_db)) -> AgentRunRepository:
@@ -123,6 +173,128 @@ async def _enrich_approvals_with_actions(
     if db is not None:
         return await _enrich_control_rows(db, enriched)
     return enriched
+
+
+async def _load_control_center_snapshot_fast(
+    db: Client,
+    *,
+    runs_limit: int,
+    source_window: int,
+) -> dict[str, list[dict[str, Any]]] | None:
+    if not hasattr(db, "engine"):
+        return None
+
+    def _query() -> dict[str, list[dict[str, Any]]]:
+        with db.engine.connect() as conn:
+            runs = [
+                dict(row)
+                for row in conn.execute(
+                    text(
+                        """
+                        SELECT id, external_run_id, trigger_type, entity_id, entity_type,
+                               status, event_payload, context_payload, plan_payload, summary,
+                               failure_cause, failure_detail, started_at, finished_at
+                        FROM ai_agent_runs
+                        ORDER BY started_at DESC
+                        LIMIT :limit
+                        """
+                    ),
+                    {"limit": source_window},
+                ).mappings().all()
+            ]
+            approvals = [
+                dict(row)
+                for row in conn.execute(
+                    text(
+                        """
+                        SELECT apr.id, apr.action_id, apr.state, apr.requested_by, apr.approver_id,
+                               apr.reason, apr.approver_note, apr.created_at, apr.decided_at,
+                               aa.action_type, aa.entity_type, aa.entity_id, aa.payload,
+                               aa.reason AS action_reason
+                        FROM ai_agent_approval_requests apr
+                        LEFT JOIN ai_agent_actions aa ON aa.id = apr.action_id
+                        WHERE apr.state = 'pending'
+                        ORDER BY apr.created_at ASC
+                        LIMIT 100
+                        """
+                    )
+                ).mappings().all()
+            ]
+            agents = [
+                dict(row)
+                for row in conn.execute(
+                    text(
+                        """
+                        SELECT id, agent_key, display_name, description, agent_type, status,
+                               enabled, capabilities, config, service_url, last_seen_at,
+                               created_at, updated_at
+                        FROM ai_agents
+                        ORDER BY display_name ASC
+                        LIMIT 100
+                        """
+                    )
+                ).mappings().all()
+            ]
+            actions = [
+                dict(row)
+                for row in conn.execute(
+                    text(
+                        """
+                        SELECT id, run_id, external_run_id, action_type, entity_type, entity_id,
+                               reason, payload, idempotency_key, approval_status,
+                               dispatch_status, created_by, crm_record_type, crm_record_id,
+                               created_at, executed_at
+                        FROM ai_agent_actions
+                        ORDER BY created_at DESC
+                        LIMIT :limit
+                        """
+                    ),
+                    {"limit": max(1000, runs_limit * 40)},
+                ).mappings().all()
+            ]
+        return {
+            "runs": runs,
+            "approvals": approvals,
+            "agents": agents,
+            "actions": actions,
+        }
+
+    try:
+        return await run_db_operation(_query)
+    except Exception:
+        return None
+
+
+async def _load_pending_approvals_fast(db: Client, *, limit: int = 100) -> list[dict[str, Any]] | None:
+    if not hasattr(db, "engine"):
+        return None
+
+    def _query() -> list[dict[str, Any]]:
+        with db.engine.connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    text(
+                        """
+                        SELECT apr.id, apr.action_id, apr.state, apr.requested_by, apr.approver_id,
+                               apr.reason, apr.approver_note, apr.created_at, apr.decided_at,
+                               aa.action_type, aa.entity_type, aa.entity_id, aa.payload,
+                               aa.reason AS action_reason
+                        FROM ai_agent_approval_requests apr
+                        LEFT JOIN ai_agent_actions aa ON aa.id = apr.action_id
+                        WHERE apr.state = 'pending'
+                        ORDER BY apr.created_at ASC
+                        LIMIT :limit
+                        """
+                    ),
+                    {"limit": limit},
+                ).mappings().all()
+            ]
+
+    try:
+        return await run_db_operation(_query)
+    except Exception:
+        return None
 
 
 def _normalize_entity_type(value: object) -> str:
@@ -491,6 +663,9 @@ async def list_pending_approvals(
     approval_repository: AgentApprovalRepository = Depends(get_approval_repository),
     action_repository: AgentActionRepository = Depends(get_action_repository),
 ):
+    fast_approvals = await _load_pending_approvals_fast(db)
+    if fast_approvals is not None:
+        return await _enrich_control_rows(db, fast_approvals)
     approvals = await approval_repository.list_pending()
     return await _enrich_approvals_with_actions(approvals, action_repository, db)
 
@@ -515,6 +690,30 @@ async def get_control_center_snapshot(
     filters = {"status": None, "entity_type": None, "entity_id": None}
     offset = (runs_page - 1) * runs_limit
     source_window = offset + runs_limit + 1
+    await _ensure_ai_agent_registry(ai_agent_repo)
+
+    fast_snapshot = await _load_control_center_snapshot_fast(
+        db,
+        runs_limit=runs_limit,
+        source_window=source_window,
+    )
+    if fast_snapshot is not None:
+        sorted_runs = _sort_runs(fast_snapshot["runs"])
+        paged_runs = sorted_runs[offset:offset + runs_limit]
+        runs_count = len(paged_runs)
+        enriched_rows = await _enrich_control_rows(db, [*paged_runs, *fast_snapshot["approvals"]])
+        runs = enriched_rows[:runs_count]
+        approvals = enriched_rows[runs_count:]
+        return {
+            "runs": runs,
+            "runs_pagination": {
+                "page": runs_page,
+                "limit": runs_limit,
+                "has_more": len(sorted_runs) > offset + runs_limit,
+            },
+            "approvals": approvals,
+            "ai_agents": _build_ai_agent_rows(fast_snapshot["agents"], runs, fast_snapshot["actions"]),
+        }
 
     current_runs = await run_repository.list(limit=source_window, order_by="started_at", order_desc=True)
     legacy_runs = await _list_legacy_ai_runs(db, filters, limit=source_window)
@@ -524,7 +723,7 @@ async def get_control_center_snapshot(
     runs = await _enrich_control_rows(db, paged_runs)
 
     approvals = await _enrich_approvals_with_actions(await approval_repository.list_pending(), get_action_repository(db), db)
-    agents = await ai_agent_repo.list_all()
+    agents = await _ensure_ai_agent_registry(ai_agent_repo)
     actions = await _safe_table_select(db, "ai_agent_actions", order_by="created_at", order_desc=True, limit=1000)
 
     return {
@@ -823,7 +1022,7 @@ async def _notify_approval_recipients(
             actor_id=actor_id,
             type="agent_approval",
             title=f"AI approval required: {title}",
-            message=f"{reason} Review approval #{approval_id} in the AI Control Center.",
+            message=f"{reason.rstrip('. ')}. Review in the AI Control Center.",
             entity_type=str(action.get("entity_type") or ""),
             entity_id=str(action.get("entity_id") or ""),
         )
@@ -1163,6 +1362,7 @@ async def _ensure_agent_settings(setting_repository: AgentSettingRepository) -> 
         ("lead_assistant", True),
         ("deal_risk_watcher", True),
         ("daily_summary_assistant", True),
+        ("task_deadline_watcher", True),
     ]
     existing = await setting_repository.list_settings()
     by_type = {item.get("agent_type"): item for item in existing}
@@ -1171,6 +1371,17 @@ async def _ensure_agent_settings(setting_repository: AgentSettingRepository) -> 
             created = await setting_repository.create({"agent_type": agent_type, "enabled": enabled})
             by_type[agent_type] = created
     return sorted(by_type.values(), key=lambda item: str(item.get("agent_type") or ""))
+
+
+async def _ensure_ai_agent_registry(ai_agent_repo: AiAgentRepository) -> list[dict]:
+    existing = await ai_agent_repo.list_all()
+    by_key = {str(item.get("agent_key") or ""): item for item in existing}
+    for payload in DEFAULT_AI_AGENT_REGISTRY:
+        agent_key = payload["agent_key"]
+        if agent_key not in by_key:
+            created = await ai_agent_repo.create(payload)
+            by_key[agent_key] = created
+    return sorted(by_key.values(), key=lambda item: str(item.get("display_name") or ""))
 
 
 async def _build_team_agent_stats(db: Client, current_user: dict) -> dict:
@@ -1319,7 +1530,7 @@ async def list_ai_agents(
     center should show the workers that are actually wired to the AI service so
     the page behaves like one application instead of a disconnected name list.
     """
-    agents = await ai_agent_repo.list_all()
+    agents = await _ensure_ai_agent_registry(ai_agent_repo)
 
     actions = await _safe_table_select(db, "ai_agent_actions", order_by="created_at", order_desc=True, limit=2000)
     runs = await _safe_table_select(db, "ai_agent_runs", order_by="started_at", order_desc=True, limit=2000)
@@ -1550,6 +1761,36 @@ async def ai_service_lead_score_sweep(
     detail page or pressing the manual scoring button.
     """
     return await queue_lead_score_sweep(background_tasks, db, limit=limit)
+
+
+@router.get("/tasks/deadline-candidates", response_model=TaskDeadlineCandidateList, status_code=status.HTTP_200_OK)
+async def ai_service_task_deadline_candidates(
+    limit: int = Query(default=100, ge=1, le=500),
+    _ai_agent: dict = Depends(require_ai_agent_auth),
+    service: TaskDeadlineService = Depends(get_task_deadline_service),
+):
+    """Return due-soon and overdue task rows for the deadline watch agent."""
+    return {"items": await service.list_candidates(limit=limit)}
+
+
+@router.post("/tasks/deadline-alerts", response_model=TaskDeadlineAlertResponse, status_code=status.HTTP_201_CREATED)
+async def ai_service_record_task_deadline_alert(
+    payload: TaskDeadlineAlertIn,
+    _ai_agent: dict = Depends(require_ai_agent_auth),
+    service: TaskDeadlineService = Depends(get_task_deadline_service),
+):
+    """Record an AI deadline alert/output with dedupe semantics."""
+    return await service.record_alert(payload)
+
+
+@router.post("/tasks/deadline-sweep", status_code=status.HTTP_202_ACCEPTED)
+async def ai_service_task_deadline_sweep(
+    limit: int = Query(default=100, ge=1, le=500),
+    _current_user: dict = Depends(require_human_or_ai_agent_auth),
+    service: TaskDeadlineService = Depends(get_task_deadline_service),
+):
+    """Run the deterministic task deadline notification sweep."""
+    return await service.process_due_alerts(limit=limit)
 
 
 @router.get("/users/summary-candidates", status_code=status.HTTP_200_OK)

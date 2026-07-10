@@ -197,29 +197,30 @@ async def _list_deals_workspace(
         with db.engine.connect() as conn:
             sql = (
                 "SELECT DISTINCT d.*, "
+                "COALESCE(d.owner_id, l.owner_id) AS effective_owner_id, "
                 "l.name AS lead_name, l.company AS lead_company, "
                 "o.name AS organization_name, "
                 "a.full_name AS owner_name, a.email AS owner_email "
                 "FROM deals d "
                 "LEFT JOIN leads l ON l.id = d.lead_id "
                 "LEFT JOIN organizations o ON o.id = d.organization_id "
-                "LEFT JOIN agents a ON a.id = d.owner_id "
+                "LEFT JOIN agents a ON a.id = COALESCE(d.owner_id, l.owner_id) "
             )
             params: dict[str, Any] = {}
             where_clauses: list[str] = []
 
             if role in {"manager", "sales_manager"} and owner_id is None:
                 sql += (
-                    "LEFT JOIN team_members tm_deal ON tm_deal.agent_id = d.owner_id "
+                    "LEFT JOIN team_members tm_deal ON tm_deal.agent_id = COALESCE(d.owner_id, l.owner_id) "
                     "LEFT JOIN teams team_deal ON team_deal.id = tm_deal.team_id "
                 )
-                where_clauses.append("(d.owner_id = :mid OR team_deal.manager_id = :mid)")
+                where_clauses.append("(COALESCE(d.owner_id, l.owner_id) = :mid OR team_deal.manager_id = :mid)")
                 params["mid"] = requester_id
             elif role not in {"admin", "manager", "sales_manager"} and owner_id is None:
-                where_clauses.append("d.owner_id = :uid")
+                where_clauses.append("COALESCE(d.owner_id, l.owner_id) = :uid")
                 params["uid"] = requester_id
             elif owner_id is not None:
-                where_clauses.append("d.owner_id = :owner_id")
+                where_clauses.append("COALESCE(d.owner_id, l.owner_id) = :owner_id")
                 params["owner_id"] = str(owner_id)
 
             if stage:
