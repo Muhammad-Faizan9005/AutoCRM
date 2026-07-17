@@ -8,6 +8,9 @@ sqlalchemy>=2.0.36
 alembic>=1.17.0
 psycopg2-binary>=2.9.0
 
+# S3-compatible object storage (Supabase Storage avatars bucket)
+boto3>=1.35.0
+
 # Authentication & Security
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4

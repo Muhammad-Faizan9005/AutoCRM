@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from typing import List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from supabase import Client
 
 from app.auth.dependencies import require_admin, require_auth
@@ -83,6 +84,68 @@ async def _get_lead_profile(db: Client, lead_id: str) -> dict[str, str | None]:
             }
 
     return await run_db_operation(_query)
+
+
+async def _attach_lead_assignment_context(db: Client, leads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    lead_ids = [str(lead.get("id")) for lead in leads if lead.get("id")]
+    if not lead_ids:
+        return leads
+
+    def _query():
+        engine = getattr(db, "engine", None)
+        if engine is not None:
+            with engine.connect() as conn:
+                stmt = text(
+                        """
+                        SELECT l.id,
+                               owner.full_name AS owner_name,
+                               owner.email AS owner_email,
+                               COALESCE(team.manager_id, l.owner_id) AS assignment_manager_id,
+                               manager.full_name AS assignment_manager_name,
+                               manager.email AS assignment_manager_email
+                        FROM leads l
+                        LEFT JOIN agents owner ON owner.id = l.owner_id
+                        LEFT JOIN team_members tm ON tm.agent_id = l.owner_id
+                        LEFT JOIN teams team ON team.id = tm.team_id
+                        LEFT JOIN agents manager ON manager.id = COALESCE(team.manager_id, l.owner_id)
+                        WHERE l.id::text IN :lead_ids
+                        """
+                    ).bindparams(bindparam("lead_ids", expanding=True))
+                rows = conn.execute(
+                    stmt,
+                    {"lead_ids": lead_ids},
+                ).mappings().all()
+                return {str(row["id"]): dict(row) for row in rows}
+
+        tables = getattr(db, "tables", {})
+        agents = {str(agent.get("id")): agent for agent in tables.get("agents", [])}
+        teams = {str(team.get("id")): team for team in tables.get("teams", [])}
+        team_by_member = {}
+        for member in tables.get("team_members", []):
+            team = teams.get(str(member.get("team_id")))
+            if team:
+                team_by_member[str(member.get("agent_id"))] = team
+
+        context = {}
+        for lead in tables.get("leads", []):
+            lead_id = str(lead.get("id"))
+            if lead_id not in lead_ids:
+                continue
+            owner_id = str(lead.get("owner_id") or "")
+            owner = agents.get(owner_id, {})
+            manager_id = str(team_by_member.get(owner_id, {}).get("manager_id") or owner_id or "")
+            manager = agents.get(manager_id, {})
+            context[lead_id] = {
+                "owner_name": owner.get("full_name"),
+                "owner_email": owner.get("email"),
+                "assignment_manager_id": manager_id or None,
+                "assignment_manager_name": manager.get("full_name"),
+                "assignment_manager_email": manager.get("email"),
+            }
+        return context
+
+    context_by_id = await run_db_operation(_query)
+    return [{**lead, **context_by_id.get(str(lead.get("id")), {})} for lead in leads]
 
 
 async def _assert_can_view_lead(db: Client, current_user: dict, lead_id: str) -> None:
@@ -189,18 +252,16 @@ def _build_mock_lead_emails(lead_id: str, lead_name: str | None, lead_email: str
 
 
 async def _get_lead_workspace(db: Client, lead_id: str) -> dict[str, Any]:
-    def _query():
+    # The lead (+ its owner via JOIN) is fetched first because the rest of the
+    # payload only matters if the lead exists. The four independent child
+    # collections (calls, tasks, notes, ai_history) don't depend on each other,
+    # so they run CONCURRENTLY instead of serially — against a remote DB this
+    # collapses ~5 sequential round-trips (~1s) into ~2 (~0.4s).
+    def _fetch_lead():
         with db.engine.connect() as conn:
-            lead = conn.execute(
-                text("SELECT * FROM leads WHERE id = :lead_id"),
-                {"lead_id": lead_id},
-            ).mappings().first()
-            if not lead:
-                return None
-
-            owner = conn.execute(
+            return conn.execute(
                 text(
-                    "SELECT a.full_name, a.email "
+                    "SELECT l.*, a.full_name AS owner_full_name, a.email AS owner_email "
                     "FROM leads l "
                     "LEFT JOIN agents a ON a.id = l.owner_id "
                     "WHERE l.id = :lead_id"
@@ -208,7 +269,9 @@ async def _get_lead_workspace(db: Client, lead_id: str) -> dict[str, Any]:
                 {"lead_id": lead_id},
             ).mappings().first()
 
-            calls = conn.execute(
+    def _fetch_calls():
+        with db.engine.connect() as conn:
+            return conn.execute(
                 text(
                     "SELECT * FROM call_sessions "
                     "WHERE lead_id = :lead_id "
@@ -217,7 +280,9 @@ async def _get_lead_workspace(db: Client, lead_id: str) -> dict[str, Any]:
                 {"lead_id": lead_id},
             ).mappings().all()
 
-            tasks = conn.execute(
+    def _fetch_tasks():
+        with db.engine.connect() as conn:
+            return conn.execute(
                 text(
                     "SELECT t.*, l.name AS lead_name, a.full_name AS assignee_name, a.email AS assignee_email "
                     "FROM tasks t "
@@ -229,7 +294,9 @@ async def _get_lead_workspace(db: Client, lead_id: str) -> dict[str, Any]:
                 {"lead_id": lead_id},
             ).mappings().all()
 
-            notes = conn.execute(
+    def _fetch_notes():
+        with db.engine.connect() as conn:
+            return conn.execute(
                 text(
                     "SELECT * FROM notes "
                     "WHERE entity_type = 'lead' AND entity_id = :lead_id "
@@ -238,7 +305,9 @@ async def _get_lead_workspace(db: Client, lead_id: str) -> dict[str, Any]:
                 {"lead_id": lead_id},
             ).mappings().all()
 
-            ai_history = conn.execute(
+    def _fetch_ai_history():
+        with db.engine.connect() as conn:
+            return conn.execute(
                 text(
                     "SELECT aa.id, aa.action_type, aa.reason, aa.payload, aa.approval_status, "
                     "aa.dispatch_status, aa.crm_record_type, aa.crm_record_id, aa.created_at, "
@@ -250,29 +319,36 @@ async def _get_lead_workspace(db: Client, lead_id: str) -> dict[str, Any]:
                 {"lead_id": lead_id},
             ).mappings().all()
 
-            lead_dict = dict(lead)
-            owner_dict = dict(owner) if owner else {}
-            return {
-                "lead": lead_dict,
-                "owner": {
-                    "name": str(owner_dict.get("full_name")) if owner_dict.get("full_name") else None,
-                    "email": str(owner_dict.get("email")) if owner_dict.get("email") else None,
-                },
-                "emails": _build_mock_lead_emails(
-                    lead_id,
-                    str(lead_dict.get("name")) if lead_dict.get("name") else None,
-                    str(lead_dict.get("email")) if lead_dict.get("email") else None,
-                ),
-                "calls": [dict(row) for row in calls],
-                "tasks": [dict(row) for row in tasks],
-                "notes": [dict(row) for row in notes],
-                "ai_history": [dict(row) for row in ai_history],
-            }
-
-    workspace = await run_db_operation(_query)
-    if workspace is None:
+    lead = await run_db_operation(_fetch_lead)
+    if not lead:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lead not found")
-    return workspace
+
+    calls, tasks, notes, ai_history = await asyncio.gather(
+        run_db_operation(_fetch_calls),
+        run_db_operation(_fetch_tasks),
+        run_db_operation(_fetch_notes),
+        run_db_operation(_fetch_ai_history),
+    )
+
+    lead_dict = dict(lead)
+    owner_full_name = lead_dict.pop("owner_full_name", None)
+    owner_email = lead_dict.pop("owner_email", None)
+    return {
+        "lead": lead_dict,
+        "owner": {
+            "name": str(owner_full_name) if owner_full_name else None,
+            "email": str(owner_email) if owner_email else None,
+        },
+        "emails": _build_mock_lead_emails(
+            lead_id,
+            str(lead_dict.get("name")) if lead_dict.get("name") else None,
+            str(lead_dict.get("email")) if lead_dict.get("email") else None,
+        ),
+        "calls": [dict(row) for row in calls],
+        "tasks": [dict(row) for row in tasks],
+        "notes": [dict(row) for row in notes],
+        "ai_history": [dict(row) for row in ai_history],
+    }
 
 
 async def _assert_lead_assignment_permissions(
@@ -385,12 +461,13 @@ async def get_leads(
                 rows = [lead for lead in rows if search.lower() in str(lead.get("name") or "").lower()]
             return rows[skip : skip + limit]
 
-        return await run_db_operation(_query_team_leads)
+        rows = await run_db_operation(_query_team_leads)
+        return await _attach_lead_assignment_context(db, rows)
 
     if not _can_manage_leads(current_user):
         owner_id = UUID(requester_id)
 
-    return await repository.list_leads(
+    rows = await repository.list_leads(
         skip=skip,
         limit=limit,
         status=status,
@@ -399,6 +476,7 @@ async def get_leads(
         source=source,
         search=search,
     )
+    return await _attach_lead_assignment_context(db, rows)
 
 
 @router.get("/assignment-reps")

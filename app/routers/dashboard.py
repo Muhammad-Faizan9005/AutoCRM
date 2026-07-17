@@ -41,7 +41,9 @@ async def get_latest_ai_summary(
     current_user: dict = Depends(require_auth),
     db: PostgresClient = Depends(get_db),
 ):
-    """Return the latest AI daily summary note/action for dashboard display."""
+    """Return the latest AI daily summary note/action for the current user."""
+    user_id = str(current_user.get("id") or "")
+
     def _query():
         with db.engine.connect() as conn:
             row = conn.execute(
@@ -50,9 +52,10 @@ async def get_latest_ai_summary(
                     "FROM notes n "
                     "LEFT JOIN ai_agent_actions aa ON aa.crm_record_id = n.id "
                     "LEFT JOIN ai_agent_runs ar ON ar.id = aa.run_id "
-                    "WHERE n.source = 'ai' AND (ar.trigger_type = 'daily_summary' OR n.entity_type = 'user') "
+                    "WHERE n.source = 'ai' AND n.entity_type = 'user' AND n.entity_id = :uid "
                     "ORDER BY n.created_at DESC LIMIT 1"
-                )
+                ),
+                {"uid": user_id},
             ).mappings().first()
             return dict(row) if row else None
     return await run_db_operation(_query)

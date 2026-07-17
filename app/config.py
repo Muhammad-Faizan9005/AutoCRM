@@ -15,11 +15,14 @@ class Settings(BaseSettings):
     
     # Database Settings
     DATABASE_URL: Optional[str] = Field(default=None, validation_alias=AliasChoices("DATABASE_URL"))
-    DB_POOL_SIZE: int = Field(default=5, validation_alias=AliasChoices("DB_POOL_SIZE"))
-    DB_MAX_OVERFLOW: int = Field(default=5, validation_alias=AliasChoices("DB_MAX_OVERFLOW"))
+    DB_POOL_SIZE: int = Field(default=10, validation_alias=AliasChoices("DB_POOL_SIZE"))
+    DB_MAX_OVERFLOW: int = Field(default=10, validation_alias=AliasChoices("DB_MAX_OVERFLOW"))
     DB_POOL_TIMEOUT_SECONDS: int = Field(default=30, validation_alias=AliasChoices("DB_POOL_TIMEOUT_SECONDS"))
     DB_POOL_RECYCLE_SECONDS: int = Field(default=3600, validation_alias=AliasChoices("DB_POOL_RECYCLE_SECONDS"))
-    DB_MAX_CONCURRENT_OPERATIONS: int = Field(default=5, validation_alias=AliasChoices("DB_MAX_CONCURRENT_OPERATIONS"))
+    # Concurrency cap for run_db_operation. Raised so per-request query
+    # parallelism (dashboard / lead & deal workspaces) isn't serialized behind a
+    # small global semaphore. Kept <= pool_size + max_overflow to avoid waiters.
+    DB_MAX_CONCURRENT_OPERATIONS: int = Field(default=15, validation_alias=AliasChoices("DB_MAX_CONCURRENT_OPERATIONS"))
     LEAD_SCORE_SWEEP_CONCURRENCY: int = Field(default=5, validation_alias=AliasChoices("LEAD_SCORE_SWEEP_CONCURRENCY"))
 
     # Supabase Storage
@@ -37,6 +40,30 @@ class Settings(BaseSettings):
     )
     SUPABASE_AVATAR_BUCKET: str = Field(default="avatars", validation_alias=AliasChoices("SUPABASE_AVATAR_BUCKET"))
     SUPABASE_MAX_AVATAR_BYTES: int = Field(default=2_000_000, validation_alias=AliasChoices("SUPABASE_MAX_AVATAR_BYTES"))
+
+    # Supabase S3-compatible storage (avatars bucket).
+    # Credentials are loaded here from .env so application code never reads os.environ directly.
+    S3_ENDPOINT: Optional[str] = Field(default=None, validation_alias=AliasChoices("S3_ENDPOINT"))
+    S3_ACCESS_KEY: Optional[str] = Field(default=None, validation_alias=AliasChoices("S3_ACCESS_KEY"))
+    S3_SECRET_KEY: Optional[str] = Field(default=None, validation_alias=AliasChoices("S3_SECRET_KEY"))
+    S3_BUCKET_NAME: str = Field(default="avatars", validation_alias=AliasChoices("S3_BUCKET_NAME"))
+    S3_REGION: str = Field(default="ap-southeast-2", validation_alias=AliasChoices("S3_REGION"))
+    # TTL for the in-memory avatar byte cache so refreshes don't re-fetch from S3 every time.
+    AVATAR_CACHE_TTL_SECONDS: int = Field(default=3600, validation_alias=AliasChoices("AVATAR_CACHE_TTL_SECONDS"))
+    # Master switch for S3 avatar storage. Set AVATARS_ENABLED=false to skip S3
+    # entirely (e.g. on a dev network that blocks the Supabase storage host by
+    # SNI) so login/profile never pay the connection-reset timeout. Prod leaves
+    # it true. Credentials being present is still required for S3 to be used.
+    AVATARS_ENABLED: bool = Field(default=True, validation_alias=AliasChoices("AVATARS_ENABLED"))
+
+    @property
+    def s3_enabled(self) -> bool:
+        return bool(
+            self.AVATARS_ENABLED
+            and self.S3_ENDPOINT
+            and self.S3_ACCESS_KEY
+            and self.S3_SECRET_KEY
+        )
 
     # Local avatar storage
     AVATAR_STORAGE_DIR: str = Field(default="storage/avatars", validation_alias=AliasChoices("AVATAR_STORAGE_DIR"))

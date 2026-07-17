@@ -7,6 +7,12 @@ from typing import Any
 from sqlalchemy import text
 
 from app.postgres_client import PostgresClient
+from app.utils.cache import get_cache
+
+
+# Short-TTL cache for the computed overview payload (analytics, not real-time).
+_OVERVIEW_CACHE_PREFIX = "admin_overview:"
+_OVERVIEW_CACHE_TTL = 30
 
 
 OPEN_DEAL_STATES = {
@@ -24,6 +30,10 @@ DONE_TASK_STATES = {"done", "closed", "completed", "canceled", "cancelled"}
 
 
 class AdminOverviewService:
+    # Class-level so the cache survives across requests (the service is a
+    # per-request FastAPI dependency). Column sets are static for the DB schema.
+    _column_cache: dict[str, set[str]] = {}
+
     def __init__(self, db: PostgresClient):
         self.db = db
 
@@ -124,6 +134,12 @@ class AdminOverviewService:
         return int(value or 0)
 
     def _get_columns(self, conn, table_name: str) -> set[str]:
+        # Column sets are static for the process lifetime — cache them so we
+        # don't pay an information_schema round-trip (~185–400ms) on every
+        # dashboard load against the remote DB.
+        cached = self._column_cache.get(table_name)
+        if cached is not None:
+            return cached
         rows = conn.execute(
             text(
                 """
@@ -134,12 +150,15 @@ class AdminOverviewService:
             ),
             {"table_name": table_name},
         ).mappings().all()
-        return {str(row["column_name"]) for row in rows}
+        columns = {str(row["column_name"]) for row in rows}
+        self._column_cache[table_name] = columns
+        return columns
 
-    def _get_overview_sync(self, current_user: dict[str, Any]) -> dict[str, Any]:
+    def _get_overview_sync(self, current_user: dict[str, Any], days: int = 30) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
+        safe_days = max(1, min(days, 90))
         since_7d = now - timedelta(days=7)
-        since_30d = now - timedelta(days=30)
+        since_30d = now - timedelta(days=safe_days)
         scope = self._scope(current_user)
         params = self._scope_params(scope)
 
@@ -152,52 +171,28 @@ class AdminOverviewService:
             )
             closed_at_expr = "d.closed_at" if "closed_at" in deal_columns else "d.updated_at"
 
-            active_users = conn.execute(
+            # Single pass over `agents` for all user metrics (was 5 separate
+            # COUNT queries → 5 round-trips). FILTER + MAX collapse it into one.
+            user_summary = conn.execute(
                 text(
                     f"""
-                    SELECT COUNT(*)
+                    SELECT
+                        COUNT(*) FILTER (WHERE a.is_active = true) AS active_users,
+                        COUNT(*) AS total_users,
+                        COUNT(*) FILTER (WHERE a.status = 'invited') AS invited_users,
+                        MAX(a.updated_at) FILTER (WHERE a.status = 'invited') AS invited_latest,
+                        COUNT(*) FILTER (WHERE a.is_active = true AND a.updated_at < :since_30d) AS dormant_users
                     FROM agents a
-                    WHERE a.is_active = true {self._user_scope_clause(scope, "a")}
-                    """
-                ),
-                params,
-            ).scalar()
-            total_users = conn.execute(
-                text(f"SELECT COUNT(*) FROM agents a WHERE 1=1 {self._user_scope_clause(scope, 'a')}"),
-                params,
-            ).scalar()
-            invited_users = conn.execute(
-                text(
-                    f"""
-                    SELECT COUNT(*)
-                    FROM agents a
-                    WHERE a.status = 'invited' {self._user_scope_clause(scope, "a")}
-                    """
-                ),
-                params,
-            ).scalar()
-            invited_latest = conn.execute(
-                text(
-                    f"""
-                    SELECT MAX(a.updated_at) AS updated_at
-                    FROM agents a
-                    WHERE a.status = 'invited' {self._user_scope_clause(scope, "a")}
-                    """
-                ),
-                params,
-            ).mappings().first()
-            dormant_users = conn.execute(
-                text(
-                    f"""
-                    SELECT COUNT(*)
-                    FROM agents a
-                    WHERE a.is_active = true
-                      AND a.updated_at < :since_30d
-                      {self._user_scope_clause(scope, "a")}
+                    WHERE 1=1 {self._user_scope_clause(scope, "a")}
                     """
                 ),
                 {**params, "since_30d": since_30d},
-            ).scalar()
+            ).mappings().first() or {}
+            active_users = user_summary.get("active_users")
+            total_users = user_summary.get("total_users")
+            invited_users = user_summary.get("invited_users")
+            invited_latest = {"updated_at": user_summary.get("invited_latest")}
+            dormant_users = user_summary.get("dormant_users")
 
             deal_summary = conn.execute(
                 text(
@@ -474,12 +469,12 @@ class AdminOverviewService:
             {
                 "label": "Won Revenue",
                 "value": self._format_money(deal_summary.get("won_value_30d")),
-                "meta": f"{won_30d} won in 30 days",
+                "meta": f"{won_30d} won in {safe_days} days",
             },
             {
                 "label": "New Leads",
                 "value": new_leads_30d,
-                "meta": "Last 30 days",
+                "meta": f"Last {safe_days} days",
             },
             {
                 "label": "Overdue Tasks",
@@ -502,7 +497,7 @@ class AdminOverviewService:
             {
                 "title": "Stale open deals",
                 "value": f"{self._safe_int(stale_deals)} deals",
-                "note": "No updates in 30 days",
+                "note": f"No updates in {safe_days} days",
             },
             {
                 "title": "Overdue work",
@@ -517,7 +512,7 @@ class AdminOverviewService:
             {
                 "title": "Dormant accounts",
                 "value": f"{self._safe_int(dormant_users)} users",
-                "note": "No profile updates in 30 days",
+                "note": f"No profile updates in {safe_days} days",
             },
         ]
 
@@ -562,6 +557,20 @@ class AdminOverviewService:
             "activity": [dict(row) for row in activity_rows],
         }
 
-    async def get_overview(self, current_user: dict[str, Any]) -> dict[str, Any]:
+    async def get_overview(self, current_user: dict[str, Any], days: int = 30) -> dict[str, Any]:
+        # Short-TTL cache of the whole payload per (user, days). The dashboard is
+        # analytics, not real-time, so a ~30s cache lets repeat loads / multiple
+        # widgets return instantly (0 round-trips) instead of re-running the full
+        # query set against the remote DB every time.
+        cache = get_cache()
+        user_id = str(current_user.get("id") or "")
+        role = str(current_user.get("role") or "")
+        cache_key = f"{_OVERVIEW_CACHE_PREFIX}{user_id}:{role}:{days}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_overview_sync, current_user)
+        result = await loop.run_in_executor(None, self._get_overview_sync, current_user, days)
+        cache.set(cache_key, result, ttl_seconds=_OVERVIEW_CACHE_TTL)
+        return result

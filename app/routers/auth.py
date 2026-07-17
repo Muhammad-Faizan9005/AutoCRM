@@ -62,7 +62,14 @@ def _avatar_storage_dir() -> Path:
     return Path(settings.AVATAR_STORAGE_DIR)
 
 
-def _local_avatar_url(user_id: str | None) -> str | None:
+def _avatar_url(user_id: str | None) -> str | None:
+    """Build the URL for a user's locally-stored avatar.
+
+    Avatars are stored on the backend filesystem and served through the
+    /static/avatars mount. Returns None when no avatar exists so the frontend
+    falls back to initials. A version query param (file mtime) busts the browser
+    cache when the avatar changes.
+    """
     if not user_id:
         return None
 
@@ -76,10 +83,35 @@ def _local_avatar_url(user_id: str | None) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# S3 AVATAR STORAGE (disabled)
+# ---------------------------------------------------------------------------
+# Avatars were previously stored in the Supabase S3 bucket via
+# app.services.avatar_storage and served through a cached /auth/avatar/{user_id}
+# proxy endpoint. This was reverted to local filesystem storage (above) because
+# the Supabase storage host is unreachable from the dev network (ISP blocks the
+# *.supabase.co domain by SNI). The S3 service + proxy code is kept for
+# reference in case we move back to object storage from a reachable environment.
+#
+# def _avatar_url(user_id: str | None) -> str | None:
+#     if not user_id:
+#         return None
+#     if not avatar_storage.is_enabled():
+#         return None
+#     found = _cached_avatar_meta(str(user_id))
+#     if not found:
+#         return None
+#     extension, _ = found
+#     public_base = settings.AVATAR_PUBLIC_BASE_URL.rstrip("/")
+#     return f"{public_base}/api/auth/avatar/{user_id}?ext={extension}"
+# ---------------------------------------------------------------------------
+
+
+
 def _safe_auth_user(user: dict, permissions: dict[str, bool] | None = None) -> dict:
     safe_user = dict(user)
     safe_user.pop("password_hash", None)
-    safe_user["avatar_url"] = _local_avatar_url(str(safe_user.get("id") or ""))
+    safe_user["avatar_url"] = _avatar_url(str(safe_user.get("id") or ""))
     raw_settings = safe_user.get("settings")
     if isinstance(raw_settings, str):
         try:
@@ -100,14 +132,29 @@ def _safe_auth_user(user: dict, permissions: dict[str, bool] | None = None) -> d
     return safe_user
 
 
-async def _ensure_profile_columns(db: Client) -> None:
-    def _exec():
-        with db.engine.begin() as conn:
-            conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS avatar_url TEXT"))
-            conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS developer_mode BOOLEAN NOT NULL DEFAULT false"))
-            conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb"))
-
-    await run_db_operation(_exec)
+# ---------------------------------------------------------------------------
+# LEGACY RUNTIME DDL (disabled — moved to Alembic migrations)
+# ---------------------------------------------------------------------------
+# This function used to run `ALTER TABLE agents ADD COLUMN IF NOT EXISTS ...`
+# on every profile/avatar request to "self-heal" the schema. Against a remote
+# DB each ALTER is a full round-trip (~185ms) + an ACCESS EXCLUSIVE lock on
+# `agents`, so it added ~0.5s and lock contention to every write — a real
+# source of the app slowness. The three columns are now guaranteed by
+# migrations instead:
+#   - avatar_url     -> r4s5t6u7v8w9_add_agent_avatar_url
+#   - settings       -> y1z2a3b4c5d6_add_agent_settings_json
+#   - developer_mode -> f8g9h0i1j2k3_formalize_agent_developer_mode
+# Run `alembic upgrade head` to apply. Kept commented as a reference.
+#
+# async def _ensure_profile_columns(db: Client) -> None:
+#     def _exec():
+#         with db.engine.begin() as conn:
+#             conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS avatar_url TEXT"))
+#             conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS developer_mode BOOLEAN NOT NULL DEFAULT false"))
+#             conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb"))
+#
+#     await run_db_operation(_exec)
+# ---------------------------------------------------------------------------
 
 
 def _merge_settings(current: object, patch: object, *, allow_developer_mode: bool) -> dict:
@@ -314,8 +361,6 @@ async def update_current_user_profile(
     permission_service: PermissionService = Depends(get_permission_service),
 ):
     """Update the current user's profile settings."""
-    await _ensure_profile_columns(db)
-
     update_data = payload.model_dump(exclude_unset=True)
     if not update_data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
@@ -430,9 +475,7 @@ async def upload_current_user_avatar(
     db: Client = Depends(get_db),
     permission_service: PermissionService = Depends(get_permission_service),
 ):
-    """Upload the current user's avatar to local storage."""
-    await _ensure_profile_columns(db)
-
+    """Upload the current user's avatar to local filesystem storage."""
     user_id = str(current_user.get("id") or "")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
@@ -469,7 +512,7 @@ async def delete_current_user_avatar(
     db: Client = Depends(get_db),
     permission_service: PermissionService = Depends(get_permission_service),
 ):
-    """Delete the current user's locally stored avatar."""
+    """Delete the current user's locally-stored avatar."""
     user_id = str(current_user.get("id") or "")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
@@ -484,6 +527,21 @@ async def delete_current_user_avatar(
 
     await run_db_operation(_delete_avatar)
     return await _return_current_user(db, permission_service, user_id)
+
+
+# ---------------------------------------------------------------------------
+# S3 AVATAR UPLOAD / DELETE / PROXY (disabled)
+# ---------------------------------------------------------------------------
+# The S3-backed versions of the endpoints above, plus a cached
+# GET /auth/avatar/{user_id} proxy that streamed bytes from the Supabase bucket,
+# were reverted to local filesystem storage (the dev network blocks the Supabase
+# storage host by SNI). Local avatars are served directly by the /static/avatars
+# mount, so no proxy endpoint is needed. Kept commented for reference:
+#
+# @router.post("/avatar", ...)  -> avatar_storage.upload_avatar(...)
+# @router.delete("/avatar", ...) -> avatar_storage.delete_avatar(...)
+# @router.get("/avatar/{user_id}") -> cached avatar_storage.fetch_avatar[_ext](...)
+# ---------------------------------------------------------------------------
 
 
 @router.post("/refresh")

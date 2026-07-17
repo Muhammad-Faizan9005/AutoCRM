@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, List
 from uuid import UUID
@@ -200,11 +201,17 @@ async def _list_deals_workspace(
                 "COALESCE(d.owner_id, l.owner_id) AS effective_owner_id, "
                 "l.name AS lead_name, l.company AS lead_company, "
                 "o.name AS organization_name, "
-                "a.full_name AS owner_name, a.email AS owner_email "
+                "a.full_name AS owner_name, a.email AS owner_email, "
+                "COALESCE(owner_team.manager_id, COALESCE(d.owner_id, l.owner_id)) AS assignment_manager_id, "
+                "assignment_manager.full_name AS assignment_manager_name, "
+                "assignment_manager.email AS assignment_manager_email "
                 "FROM deals d "
                 "LEFT JOIN leads l ON l.id = d.lead_id "
                 "LEFT JOIN organizations o ON o.id = d.organization_id "
                 "LEFT JOIN agents a ON a.id = COALESCE(d.owner_id, l.owner_id) "
+                "LEFT JOIN team_members owner_tm ON owner_tm.agent_id = COALESCE(d.owner_id, l.owner_id) "
+                "LEFT JOIN teams owner_team ON owner_team.id = owner_tm.team_id "
+                "LEFT JOIN agents assignment_manager ON assignment_manager.id = COALESCE(owner_team.manager_id, COALESCE(d.owner_id, l.owner_id)) "
             )
             params: dict[str, Any] = {}
             where_clauses: list[str] = []
@@ -311,9 +318,13 @@ def _build_mock_deal_emails(deal_id: str, deal_name: str | None, lead_email: str
 
 
 async def _get_deal_workspace(db: Client, deal_id: str) -> dict[str, Any]:
-    def _query():
+    # The deal (with lead/org/customer/owner folded in via JOINs) is fetched
+    # first. Its child collections (calls, tasks, notes, status_logs,
+    # ai_history) are independent of each other, so they run CONCURRENTLY —
+    # collapsing ~6 sequential round-trips into ~2 against the remote DB.
+    def _fetch_deal():
         with db.engine.connect() as conn:
-            deal = conn.execute(
+            return conn.execute(
                 text(
                     "SELECT d.*, "
                     "l.name AS lead_name, l.email AS lead_email, l.phone AS lead_phone, l.company AS lead_company, "
@@ -329,24 +340,23 @@ async def _get_deal_workspace(db: Client, deal_id: str) -> dict[str, Any]:
                 ),
                 {"deal_id": deal_id},
             ).mappings().first()
-            if not deal:
-                return None
 
-            deal_dict = dict(deal)
-            lead_id = str(deal_dict.get("lead_id") or "")
+    def _fetch_calls(lead_id: str):
+        if not lead_id:
+            return []
+        with db.engine.connect() as conn:
+            return conn.execute(
+                text(
+                    "SELECT * FROM call_sessions "
+                    "WHERE lead_id = :lead_id "
+                    "ORDER BY started_at DESC NULLS LAST, created_at DESC LIMIT 50"
+                ),
+                {"lead_id": lead_id},
+            ).mappings().all()
 
-            calls = []
-            if lead_id:
-                calls = conn.execute(
-                    text(
-                        "SELECT * FROM call_sessions "
-                        "WHERE lead_id = :lead_id "
-                        "ORDER BY started_at DESC NULLS LAST, created_at DESC LIMIT 50"
-                    ),
-                    {"lead_id": lead_id},
-                ).mappings().all()
-
-            tasks = conn.execute(
+    def _fetch_tasks():
+        with db.engine.connect() as conn:
+            return conn.execute(
                 text(
                     "SELECT t.*, a.full_name AS assignee_name, a.email AS assignee_email "
                     "FROM tasks t "
@@ -357,7 +367,9 @@ async def _get_deal_workspace(db: Client, deal_id: str) -> dict[str, Any]:
                 {"deal_id": deal_id},
             ).mappings().all()
 
-            notes = conn.execute(
+    def _fetch_notes():
+        with db.engine.connect() as conn:
+            return conn.execute(
                 text(
                     "SELECT n.*, a.full_name AS author_name, a.email AS author_email "
                     "FROM notes n "
@@ -368,7 +380,9 @@ async def _get_deal_workspace(db: Client, deal_id: str) -> dict[str, Any]:
                 {"deal_id": deal_id},
             ).mappings().all()
 
-            status_logs = conn.execute(
+    def _fetch_status_logs():
+        with db.engine.connect() as conn:
+            return conn.execute(
                 text(
                     "SELECT scl.*, a.full_name AS changed_by_name, a.email AS changed_by_email "
                     "FROM status_change_logs scl "
@@ -379,7 +393,9 @@ async def _get_deal_workspace(db: Client, deal_id: str) -> dict[str, Any]:
                 {"deal_id": deal_id},
             ).mappings().all()
 
-            ai_history = conn.execute(
+    def _fetch_ai_history():
+        with db.engine.connect() as conn:
+            return conn.execute(
                 text(
                     "SELECT aa.id, aa.action_type, aa.reason, aa.payload, aa.approval_status, "
                     "aa.dispatch_status, aa.crm_record_type, aa.crm_record_id, aa.created_at, "
@@ -391,50 +407,61 @@ async def _get_deal_workspace(db: Client, deal_id: str) -> dict[str, Any]:
                 {"deal_id": deal_id},
             ).mappings().all()
 
-            deal_name = (
-                str(deal_dict.get("organization_name") or "")
-                or str(deal_dict.get("lead_company") or "")
-                or str(deal_dict.get("lead_name") or "")
-                or "Deal"
-            )
-            lead_email = str(deal_dict.get("lead_email")) if deal_dict.get("lead_email") else None
-
-            return {
-                "deal": deal_dict,
-                "owner": {
-                    "name": str(deal_dict.get("owner_name")) if deal_dict.get("owner_name") else None,
-                    "email": str(deal_dict.get("owner_email")) if deal_dict.get("owner_email") else None,
-                },
-                "lead": {
-                    "id": str(deal_dict.get("lead_id")) if deal_dict.get("lead_id") else None,
-                    "name": str(deal_dict.get("lead_name")) if deal_dict.get("lead_name") else None,
-                    "email": lead_email,
-                    "phone": str(deal_dict.get("lead_phone")) if deal_dict.get("lead_phone") else None,
-                    "company": str(deal_dict.get("lead_company")) if deal_dict.get("lead_company") else None,
-                },
-                "organization": {
-                    "id": str(deal_dict.get("organization_id")) if deal_dict.get("organization_id") else None,
-                    "name": str(deal_dict.get("organization_name")) if deal_dict.get("organization_name") else None,
-                    "website": str(deal_dict.get("organization_website")) if deal_dict.get("organization_website") else None,
-                    "industry": str(deal_dict.get("organization_industry")) if deal_dict.get("organization_industry") else None,
-                },
-                "customer": {
-                    "id": str(deal_dict.get("customer_id")) if deal_dict.get("customer_id") else None,
-                    "name": str(deal_dict.get("customer_name")) if deal_dict.get("customer_name") else None,
-                    "email": str(deal_dict.get("customer_email")) if deal_dict.get("customer_email") else None,
-                },
-                "emails": _build_mock_deal_emails(deal_id, deal_name, lead_email),
-                "calls": [dict(row) for row in calls],
-                "tasks": [dict(row) for row in tasks],
-                "notes": [dict(row) for row in notes],
-                "status_logs": [dict(row) for row in status_logs],
-                "ai_history": [dict(row) for row in ai_history],
-                "attachments": [],
-            }
-
-    workspace = await run_db_operation(_query)
-    if workspace is None:
+    deal = await run_db_operation(_fetch_deal)
+    if not deal:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
+
+    deal_dict = dict(deal)
+    lead_id = str(deal_dict.get("lead_id") or "")
+
+    calls, tasks, notes, status_logs, ai_history = await asyncio.gather(
+        run_db_operation(lambda: _fetch_calls(lead_id)),
+        run_db_operation(_fetch_tasks),
+        run_db_operation(_fetch_notes),
+        run_db_operation(_fetch_status_logs),
+        run_db_operation(_fetch_ai_history),
+    )
+
+    deal_name = (
+        str(deal_dict.get("organization_name") or "")
+        or str(deal_dict.get("lead_company") or "")
+        or str(deal_dict.get("lead_name") or "")
+        or "Deal"
+    )
+    lead_email = str(deal_dict.get("lead_email")) if deal_dict.get("lead_email") else None
+
+    return {
+        "deal": deal_dict,
+        "owner": {
+            "name": str(deal_dict.get("owner_name")) if deal_dict.get("owner_name") else None,
+            "email": str(deal_dict.get("owner_email")) if deal_dict.get("owner_email") else None,
+        },
+        "lead": {
+            "id": str(deal_dict.get("lead_id")) if deal_dict.get("lead_id") else None,
+            "name": str(deal_dict.get("lead_name")) if deal_dict.get("lead_name") else None,
+            "email": lead_email,
+            "phone": str(deal_dict.get("lead_phone")) if deal_dict.get("lead_phone") else None,
+            "company": str(deal_dict.get("lead_company")) if deal_dict.get("lead_company") else None,
+        },
+        "organization": {
+            "id": str(deal_dict.get("organization_id")) if deal_dict.get("organization_id") else None,
+            "name": str(deal_dict.get("organization_name")) if deal_dict.get("organization_name") else None,
+            "website": str(deal_dict.get("organization_website")) if deal_dict.get("organization_website") else None,
+            "industry": str(deal_dict.get("organization_industry")) if deal_dict.get("organization_industry") else None,
+        },
+        "customer": {
+            "id": str(deal_dict.get("customer_id")) if deal_dict.get("customer_id") else None,
+            "name": str(deal_dict.get("customer_name")) if deal_dict.get("customer_name") else None,
+            "email": str(deal_dict.get("customer_email")) if deal_dict.get("customer_email") else None,
+        },
+        "emails": _build_mock_deal_emails(deal_id, deal_name, lead_email),
+        "calls": [dict(row) for row in calls],
+        "tasks": [dict(row) for row in tasks],
+        "notes": [dict(row) for row in notes],
+        "status_logs": [dict(row) for row in status_logs],
+        "ai_history": [dict(row) for row in ai_history],
+        "attachments": [],
+    }
     return workspace
 
 

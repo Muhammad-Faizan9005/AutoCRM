@@ -8,6 +8,27 @@ from supabase import Client
 
 from app.config import settings
 from app.repositories.permission_repository import PermissionRepository
+from app.utils.cache import get_cache
+
+
+_PERMISSIONS_CACHE_PREFIX = "permissions:"
+# Permissions rarely change; a short TTL keeps them fresh enough while removing
+# a DB round-trip + permission-file read/write from every protected request
+# (important against a remote DB where each round-trip is ~185ms).
+_PERMISSIONS_CACHE_TTL = 300
+
+
+def invalidate_permissions_cache(user_id: str) -> None:
+    """Drop the cached effective-permissions map for a user.
+
+    Call whenever a user's permissions or role change (permission update,
+    role change, delete) so the next request recomputes from source. Clears
+    every role-scoped key for the user.
+    """
+    cache = get_cache()
+    prefix = f"{_PERMISSIONS_CACHE_PREFIX}{user_id}:"
+    for key in [k for k in list(cache._cache.keys()) if k.startswith(prefix)]:
+        cache.invalidate(key)
 
 
 CRM_CORE_PERMISSIONS = (
@@ -191,6 +212,17 @@ class PermissionService:
 
     async def get_effective_permissions(self, user: dict[str, Any]) -> dict[str, bool]:
         user_id = user.get("id")
+        cache = get_cache()
+        # Key includes role so a role change can't serve stale permissions even
+        # before explicit invalidation.
+        cache_key = None
+        if user_id:
+            role = str(user.get("role") or "")
+            cache_key = f"{_PERMISSIONS_CACHE_PREFIX}{user_id}:{role}"
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return cached
+
         overrides: dict[str, Any] | None = None
         file_name: str | None = None
         if user_id:
@@ -205,7 +237,10 @@ class PermissionService:
             if file_name:
                 self._write_permissions_file(str(file_name), derived)
             overrides = derived
-        return build_effective_permissions(user, overrides)
+        effective = build_effective_permissions(user, overrides)
+        if cache_key is not None:
+            cache.set(cache_key, effective, ttl_seconds=_PERMISSIONS_CACHE_TTL)
+        return effective
 
     async def set_permissions(self, user: dict[str, Any], permissions: dict[str, Any]) -> dict[str, Any]:
         user_id = str(user.get("id")) if user.get("id") else ""
@@ -215,4 +250,6 @@ class PermissionService:
         file_name = self._permission_file_name(user_id)
         derived = self._derive_permissions_for_file(user, permissions)
         self._write_permissions_file(file_name, derived)
-        return await self.repository.upsert_permission_file(user_id, file_name)
+        result = await self.repository.upsert_permission_file(user_id, file_name)
+        invalidate_permissions_cache(user_id)
+        return result

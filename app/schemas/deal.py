@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from app.utils.sanitization import sanitize_text
 from app.validators.custom_validators import validate_no_dangerous_sql_tokens
@@ -66,5 +66,11 @@ class DealResponse(DealBase):
     id: UUID
     created_at: datetime
     updated_at: datetime
+    effective_owner_id: Optional[UUID] = None
+    owner_name: Optional[str] = None
+    owner_email: Optional[EmailStr] = None
+    assignment_manager_id: Optional[UUID] = None
+    assignment_manager_name: Optional[str] = None
+    assignment_manager_email: Optional[EmailStr] = None
 
     model_config = ConfigDict(from_attributes=True)

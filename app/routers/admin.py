@@ -176,7 +176,8 @@ async def _archive_and_unassign_deleted_user(
     await _ensure_deleted_users_table(db)
 
     agent_id = str(target_user.get("id"))
-    permissions_json = json.dumps(permissions or {})
+    revoked_permissions = {key: False for key in (permissions or {})}
+    permissions_json = json.dumps(revoked_permissions)
 
     def _exec():
         metadata: dict[str, int] = {}
@@ -257,7 +258,7 @@ async def _archive_and_unassign_deleted_user(
                     "email": str(target_user.get("email") or ""),
                     "full_name": str(target_user.get("full_name") or target_user.get("email") or "Deleted user"),
                     "role": str(target_user.get("role") or "agent"),
-                    "status": str(target_user.get("status") or "disabled"),
+                    "status": "disabled",
                     "team_id": str(target_user.get("team_id")) if target_user.get("team_id") else None,
                     "permissions": permissions_json,
                     "permission_file": permission_file,
@@ -357,10 +358,11 @@ def _to_admin_user(user: dict[str, Any]) -> dict[str, Any]:
 
 @router.get("/overview", response_model=AdminOverview)
 async def get_admin_overview(
+    days: int = 30,
     current_user: dict = Depends(require_permissions(["admin_users"])),
     service: AdminOverviewService = Depends(get_overview_service),
 ):
-    return await service.get_overview(current_user)
+    return await service.get_overview(current_user, days=days)
 
 
 @router.get("/activity-log", response_model=AdminActivityLog)
@@ -626,10 +628,12 @@ async def update_admin_user(
     if update_data.get("status") == "disabled" and str(target_user.get("status")) == "invited":
         await invite_service.revoke_invited_user(str(user_id), reason="revoked")
         invalidate_user_cache(str(user_id))
+        permission_service.invalidate_permissions_cache(str(user_id))
         return _to_admin_user({**target_user, "status": "disabled", "is_active": False})
 
     updated = await repository.update_by_id(str(user_id), update_data)
     invalidate_user_cache(str(user_id))
+    permission_service.invalidate_permissions_cache(str(user_id))
     return _to_admin_user(updated)
 
 
@@ -655,6 +659,7 @@ async def delete_admin_user(
         permission_file=permission_file,
     )
     invalidate_user_cache(str(user_id))
+    permission_service.invalidate_permissions_cache(str(user_id))
     return None
 
 
