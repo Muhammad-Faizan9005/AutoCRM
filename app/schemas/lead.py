@@ -100,6 +100,11 @@ class LeadResponse(LeadBase):
     id: UUID
     created_at: datetime
     updated_at: datetime
+    owner_name: Optional[str] = None
+    owner_email: Optional[EmailStr] = None
+    assignment_manager_id: Optional[UUID] = None
+    assignment_manager_name: Optional[str] = None
+    assignment_manager_email: Optional[EmailStr] = None
 
     model_config = ConfigDict(from_attributes=True)
 

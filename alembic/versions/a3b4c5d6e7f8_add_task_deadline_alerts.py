@@ -18,6 +18,11 @@ branch_labels = None
 depends_on = None
 
 
+def _is_supabase_connection(bind) -> bool:
+    host = (bind.engine.url.host or "").lower()
+    return "supabase.co" in host
+
+
 def upgrade() -> None:
     op.create_table(
         "task_deadline_alerts",
@@ -35,10 +40,25 @@ def upgrade() -> None:
     )
     op.create_index("idx_task_deadline_alerts_task_created", "task_deadline_alerts", ["task_id", "created_at"])
     op.create_index("idx_task_deadline_alerts_cache", "task_deadline_alerts", ["llm_cache_key"])
+    bind = op.get_bind()
+    if _is_supabase_connection(bind):
+        op.execute("ALTER TABLE task_deadline_alerts ENABLE ROW LEVEL SECURITY;")
+        op.execute("ALTER TABLE task_deadline_alerts FORCE ROW LEVEL SECURITY;")
+        op.execute(
+            """
+            CREATE POLICY "task_deadline_alerts_service_role_access"
+                ON task_deadline_alerts FOR ALL TO service_role
+                USING (true)
+                WITH CHECK (true);
+            """
+        )
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
+    if _is_supabase_connection(bind):
+        op.execute('DROP POLICY IF EXISTS "task_deadline_alerts_service_role_access" ON task_deadline_alerts;')
+        op.execute("ALTER TABLE task_deadline_alerts DISABLE ROW LEVEL SECURITY;")
     op.drop_index("idx_task_deadline_alerts_cache", table_name="task_deadline_alerts")
     op.drop_index("idx_task_deadline_alerts_task_created", table_name="task_deadline_alerts")
     op.drop_table("task_deadline_alerts")
-

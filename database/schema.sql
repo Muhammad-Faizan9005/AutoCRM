@@ -753,6 +753,23 @@ CREATE TABLE IF NOT EXISTS ai_agent_approval_requests (
     decided_at TIMESTAMP WITH TIME ZONE
 );
 
+-- Safety net: if an approval request row is ever deleted directly (bypassing
+-- the approve/reject endpoints), resolve the linked action instead of leaving
+-- it stranded at approval_status='pending' forever.
+CREATE OR REPLACE FUNCTION resolve_action_on_approval_delete()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE ai_agent_actions
+    SET approval_status = 'rejected', dispatch_status = 'rejected'
+    WHERE id = OLD.action_id AND approval_status = 'pending';
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_resolve_action_on_approval_delete
+    BEFORE DELETE ON ai_agent_approval_requests
+    FOR EACH ROW EXECUTE FUNCTION resolve_action_on_approval_delete();
+
 CREATE INDEX IF NOT EXISTS idx_ai_agent_runs_entity ON ai_agent_runs(entity_id, entity_type);
 CREATE INDEX IF NOT EXISTS idx_ai_agent_runs_status ON ai_agent_runs(status);
 CREATE INDEX IF NOT EXISTS idx_ai_agent_run_traces_run ON ai_agent_run_traces(run_id, created_at);

@@ -202,6 +202,20 @@ async def _load_control_center_snapshot_fast(
                     {"limit": source_window},
                 ).mappings().all()
             ]
+            agent_runs = [
+                dict(row)
+                for row in conn.execute(
+                    text(
+                        """
+                        SELECT id, external_run_id, trigger_type, entity_id, entity_type,
+                               status, summary, started_at, finished_at
+                        FROM ai_agent_runs
+                        ORDER BY started_at DESC
+                        LIMIT 5000
+                        """
+                    )
+                ).mappings().all()
+            ]
             approvals = [
                 dict(row)
                 for row in conn.execute(
@@ -252,11 +266,29 @@ async def _load_control_center_snapshot_fast(
                     {"limit": max(1000, runs_limit * 40)},
                 ).mappings().all()
             ]
+            metrics = dict(
+                conn.execute(
+                    text(
+                        """
+                        SELECT
+                            COUNT(*) FILTER (WHERE lower(COALESCE(status, '')) IN ('running', 'pending')) AS running,
+                            COUNT(*) FILTER (WHERE lower(COALESCE(status, '')) LIKE '%fail%') AS failed,
+                            COUNT(*) FILTER (WHERE lower(COALESCE(status, '')) LIKE '%complete%') AS completed,
+                            COUNT(*) AS total_runs
+                        FROM ai_agent_runs
+                        """
+                    )
+                ).mappings().first()
+                or {}
+            )
+            metrics["pending_approvals"] = len(approvals)
         return {
             "runs": runs,
+            "agent_runs": agent_runs,
             "approvals": approvals,
             "agents": agents,
             "actions": actions,
+            "metrics": metrics,
         }
 
     try:
@@ -295,6 +327,19 @@ async def _load_pending_approvals_fast(db: Client, *, limit: int = 100) -> list[
         return await run_db_operation(_query)
     except Exception:
         return None
+
+
+def _build_control_center_metrics(
+    runs: list[dict[str, Any]],
+    approvals: list[dict[str, Any]],
+) -> dict[str, int]:
+    return {
+        "running": sum(1 for run in runs if str(run.get("status") or "").lower() in {"running", "pending"}),
+        "failed": sum(1 for run in runs if "fail" in str(run.get("status") or "").lower()),
+        "completed": sum(1 for run in runs if "complete" in str(run.get("status") or "").lower()),
+        "pending_approvals": len(approvals),
+        "total_runs": len(runs),
+    }
 
 
 def _normalize_entity_type(value: object) -> str:
@@ -711,8 +756,15 @@ async def get_control_center_snapshot(
                 "limit": runs_limit,
                 "has_more": len(sorted_runs) > offset + runs_limit,
             },
+            "metrics": {
+                "running": int(fast_snapshot.get("metrics", {}).get("running") or 0),
+                "failed": int(fast_snapshot.get("metrics", {}).get("failed") or 0),
+                "completed": int(fast_snapshot.get("metrics", {}).get("completed") or 0),
+                "pending_approvals": len(approvals),
+                "total_runs": int(fast_snapshot.get("metrics", {}).get("total_runs") or 0),
+            },
             "approvals": approvals,
-            "ai_agents": _build_ai_agent_rows(fast_snapshot["agents"], runs, fast_snapshot["actions"]),
+            "ai_agents": _build_ai_agent_rows(fast_snapshot["agents"], _sort_runs(fast_snapshot["agent_runs"]), fast_snapshot["actions"]),
         }
 
     current_runs = await run_repository.list(limit=source_window, order_by="started_at", order_desc=True)
@@ -725,6 +777,7 @@ async def get_control_center_snapshot(
     approvals = await _enrich_approvals_with_actions(await approval_repository.list_pending(), get_action_repository(db), db)
     agents = await _ensure_ai_agent_registry(ai_agent_repo)
     actions = await _safe_table_select(db, "ai_agent_actions", order_by="created_at", order_desc=True, limit=1000)
+    agent_runs = await run_repository.list(limit=5000, order_by="started_at", order_desc=True)
 
     return {
         "runs": runs,
@@ -733,8 +786,9 @@ async def get_control_center_snapshot(
             "limit": runs_limit,
             "has_more": len(sorted_runs) > offset + runs_limit,
         },
+        "metrics": _build_control_center_metrics(sorted_runs, approvals),
         "approvals": approvals,
-        "ai_agents": _build_ai_agent_rows(agents, runs, actions),
+        "ai_agents": _build_ai_agent_rows(agents, agent_runs or sorted_runs, actions),
     }
 
 
@@ -1785,12 +1839,14 @@ async def ai_service_record_task_deadline_alert(
 
 @router.post("/tasks/deadline-sweep", status_code=status.HTTP_202_ACCEPTED)
 async def ai_service_task_deadline_sweep(
+    background_tasks: BackgroundTasks,
     limit: int = Query(default=100, ge=1, le=500),
     _current_user: dict = Depends(require_human_or_ai_agent_auth),
     service: TaskDeadlineService = Depends(get_task_deadline_service),
 ):
-    """Run the deterministic task deadline notification sweep."""
-    return await service.process_due_alerts(limit=limit)
+    """Queue the deterministic task deadline notification sweep."""
+    background_tasks.add_task(service.process_due_alerts, limit=limit)
+    return {"status": "queued", "limit": limit}
 
 
 @router.get("/users/summary-candidates", status_code=status.HTTP_200_OK)
@@ -1911,46 +1967,92 @@ async def ai_service_user_summary_context(
     _ai_agent: dict = Depends(require_ai_agent_auth),
     db: Client = Depends(get_db),
 ):
-    """Return compact lead/deal context owned by a user for daily summaries."""
+    """Return role-scoped lead/deal/task context for a user's daily summary.
+
+    Scope by the recipient's role:
+    - admin: global (no owner filter)
+    - sales_manager: records owned/assigned to their team members
+    - sales_rep (default): records they own/are assigned
+    """
     owner_id = str(user_id)
 
-    def _query() -> dict[str, list[dict]]:
+    def _query() -> dict[str, object]:
         with db.engine.connect() as conn:
+            role = str(
+                conn.execute(
+                    text("SELECT role FROM agents WHERE id = :id"), {"id": owner_id}
+                ).scalar()
+                or ""
+            ).strip().lower()
+
+            # Scope clause per role. team_members/teams pattern reused from
+            # admin_overview_service. {alias} is the owner/assignee column expr.
+            if role == "admin":
+                scope_type = "global"
+
+                def scope(_alias: str) -> str:
+                    return ""
+            elif role in {"sales_manager", "manager"}:
+                scope_type = "team"
+
+                def scope(alias: str) -> str:
+                    # team members' records OR the manager's own
+                    return (
+                        f" AND ({alias} = :owner_id OR EXISTS ("
+                        "SELECT 1 FROM team_members tm JOIN teams team_scope ON team_scope.id = tm.team_id "
+                        f"WHERE team_scope.manager_id = :owner_id AND tm.agent_id = {alias})) "
+                    )
+            else:
+                scope_type = "owned"
+
+                def scope(alias: str) -> str:
+                    return f" AND {alias} = :owner_id "
+
+            params = {"owner_id": owner_id, "limit": limit}
+
             leads = conn.execute(
                 text(
                     "SELECT id::text, name, company, email, status, source, owner_id::text, "
                     "organization_id::text, score, score_reason, updated_at, created_at "
-                    "FROM leads WHERE owner_id = :owner_id "
+                    f"FROM leads WHERE 1=1 {scope('owner_id')} "
                     "ORDER BY updated_at DESC LIMIT :limit"
                 ),
-                {"owner_id": owner_id, "limit": limit},
+                params,
             ).mappings().all()
             deals = conn.execute(
                 text(
                     "SELECT d.id::text, d.title, d.stage, d.value, d.currency, d.owner_id::text, "
                     "d.lead_id::text, d.organization_id::text, d.customer_id::text, "
                     "d.expected_close_at, d.deal_type, d.updated_at, d.created_at "
-                    "FROM deals d "
-                    "LEFT JOIN leads l ON l.id = d.lead_id "
-                    "WHERE d.owner_id = :owner_id OR l.owner_id = :owner_id "
+                    "FROM deals d LEFT JOIN leads l ON l.id = d.lead_id "
+                    f"WHERE 1=1 {scope('COALESCE(d.owner_id, l.owner_id)')} "
                     "ORDER BY d.updated_at DESC LIMIT :limit"
                 ),
-                {"owner_id": owner_id, "limit": limit},
+                params,
             ).mappings().all()
-            return {"owned_leads": [dict(row) for row in leads], "owned_deals": [dict(row) for row in deals]}
+            tasks = conn.execute(
+                text(
+                    "SELECT id::text, title, status, priority, due_at, assigned_to::text, "
+                    "entity_type, entity_id::text, updated_at "
+                    f"FROM tasks t WHERE 1=1 {scope('assigned_to')} "
+                    "ORDER BY (due_at IS NULL), due_at ASC, updated_at DESC LIMIT :limit"
+                ),
+                params,
+            ).mappings().all()
+            return {
+                "scope": scope_type,
+                "owned_leads": [dict(row) for row in leads],
+                "owned_deals": [dict(row) for row in deals],
+                "tasks": [dict(row) for row in tasks],
+            }
 
     try:
         return await run_db_operation(_query)
     except Exception:
-        leads = [
-            row
-            for row in await _safe_table_select(db, "leads", filters={"owner_id": owner_id}, order_by="updated_at", order_desc=True, limit=limit)
-        ]
-        deals = [
-            row
-            for row in await _safe_table_select(db, "deals", filters={"owner_id": owner_id}, order_by="updated_at", order_desc=True, limit=limit)
-        ]
-        return {"owned_leads": leads, "owned_deals": deals}
+        # Fallback: owned-only via the safe table select (no scope escalation).
+        leads = await _safe_table_select(db, "leads", filters={"owner_id": owner_id}, order_by="updated_at", order_desc=True, limit=limit)
+        deals = await _safe_table_select(db, "deals", filters={"owner_id": owner_id}, order_by="updated_at", order_desc=True, limit=limit)
+        return {"scope": "owned", "owned_leads": list(leads), "owned_deals": list(deals), "tasks": []}
 
 
 @router.get("/rag/snapshot", status_code=status.HTTP_200_OK)
