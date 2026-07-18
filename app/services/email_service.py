@@ -49,11 +49,21 @@ class MailjetEmailService:
     def _require_credentials(self) -> tuple[str, str]:
         api_key = settings.MAILJET_API_KEY
         secret_key = settings.MAILJET_SECRET_KEY
-        if not api_key or not secret_key:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Mailjet credentials are not configured",
-            )
+        # -------------------------------------------------------------------
+        # DISABLED (2026-07-18): mid-request Mailjet credential config check.
+        # What it was: a lazy guard that returned 503 the first time an email
+        #   send was attempted if MAILJET_API_KEY / MAILJET_SECRET_KEY were unset.
+        # Why disabled: config should fail fast at boot. Presence of both keys is
+        #   now validated at startup by `verify_startup_config()`
+        #   (app/core/startup_checks.py) — aborts in prod, warns in dev.
+        # Kept commented (not deleted) as reference / fallback.
+        #
+        # if not api_key or not secret_key:
+        #     raise HTTPException(
+        #         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        #         detail="Mailjet credentials are not configured",
+        #     )
+        # -------------------------------------------------------------------
         return api_key, secret_key
 
     def _load_sender_email(self, api_key: str, secret_key: str) -> str:
