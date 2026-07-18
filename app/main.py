@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
+from app.core.startup_checks import verify_startup_config
 from app.database import get_db, run_db_operation
 from app.auth.cookies import csrf_middleware
 from app.middleware.error_handler import error_handler_middleware, setup_exception_handlers
@@ -18,6 +19,10 @@ from app.utils.logger import configure_logging
 
 configure_logging(settings.DEBUG)
 logger = logging.getLogger(__name__)
+
+# Fail-fast on invalid configuration before the server binds. Aborts startup in
+# production (DEBUG=False), warns and continues in development.
+verify_startup_config()
 
 os.makedirs(settings.CALL_RECORDINGS_DIR, exist_ok=True)
 os.makedirs(settings.AVATAR_STORAGE_DIR, exist_ok=True)
