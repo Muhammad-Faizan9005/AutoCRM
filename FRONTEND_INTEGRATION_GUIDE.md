@@ -1,6 +1,6 @@
 # Frontend Integration Guide
 
-Last Updated: 2026-04-06
+Last Updated: 2026-07-28
 
 This guide explains how frontend teams should connect with the current backend implementation.
 
@@ -14,11 +14,15 @@ Use this guide for implementation workflow and the API document for exact endpoi
 
 1. Set backend base URL:
    - Local: `http://localhost:8000`
-  - Production: your current deployment URL
+   - Production: your current deployment URL
 2. Confirm backend health using `GET /health`.
 3. Confirm API docs are reachable on `/docs`.
-4. Implement auth storage for access and refresh tokens.
-5. Add a centralized API client with automatic token refresh.
+4. Send every request with `credentials: "include"` — auth is cookie-based, so
+   there is nothing to store client-side.
+5. Add a centralized API client that attaches the CSRF header and refreshes on `401`.
+
+The reference implementation of all of this is
+`src/api/client.js` in the frontend repo.
 
 ## 2. Important Corrections for Frontend
 
@@ -38,21 +42,53 @@ Use trailing slash for collection routes:
 - `GET/POST /api/customers/`
 - `GET/POST /api/tickets/`
 
-Calling collection endpoints without trailing slash can return `307` redirect.
-Some clients drop `Authorization` on redirected requests, causing false `401/403` errors.
+Calling collection endpoints without trailing slash returns a `307` redirect.
+Prefer canonical paths — the redirect costs an extra round trip and not every
+client replays the body.
+
+Note: team routes are registered **without** a trailing slash
+(`/api/admin/teams`).
 
 ## 3. Auth Flow (Required)
+
+Auth is **HttpOnly cookies plus double-submit CSRF**. There are no tokens in any
+response body and no `Authorization` header anywhere in the flow.
 
 1. Login/register:
    - `POST /api/auth/login`
    - `POST /api/auth/register`
-2. Store returned `access_token` and `refresh_token`.
-3. Send `Authorization: Bearer <access_token>` for protected endpoints.
-4. On `401` (expired/invalid access token), call `POST /api/auth/refresh`.
-5. Do not run refresh flow on `403`.
-6. Replace both tokens with returned values (rotation).
-7. Retry the failed request once.
-8. On refresh failure, clear session and redirect to login.
+   - Both must be sent with `credentials: "include"`. The response body is
+     `{ "user": { ... } }`; the backend sets `access_token`, `refresh_token`,
+     and `csrf_token` cookies.
+2. Send `credentials: "include"` on every subsequent request.
+3. On every `POST`, `PUT`, `PATCH`, and `DELETE`, read the non-HttpOnly
+   `csrf_token` cookie and send it as `X-CSRF-Token`. Login and register are
+   exempt. A missing or mismatched value returns `403 CSRF token missing or
+   invalid`.
+4. On `401`, call `POST /api/auth/refresh` once (with credentials and the CSRF
+   header). It takes no body and returns `{ "success": true }`; new cookies are
+   set automatically.
+5. Do not run the refresh flow on `403`.
+6. Retry the original request once after a successful refresh.
+7. On refresh failure, clear client state and redirect to login.
+8. Never write tokens to `localStorage` — the cookies are HttpOnly by design and
+   are not readable from JS.
+
+Reading the CSRF cookie:
+
+```js
+const csrf = document.cookie
+  .match(/(?:^|; )csrf_token=([^;]*)/)?.[1] ?? "";
+```
+
+Cookies are `Secure` + `SameSite=None` when the backend runs with `DEBUG=False`,
+and `SameSite=Lax` locally. The `refresh_token` cookie is scoped to `/api/auth`.
+
+### CORS
+
+Origins are allow-listed in `app/main.py`, and `allow_credentials=True` means a
+wildcard origin is rejected. A new frontend domain must be added there before
+cookies will be accepted.
 
 ## 4. RBAC Rules Frontend Must Respect
 
@@ -62,6 +98,7 @@ Some clients drop `Authorization` on redirected requests, causing false `401/403
   - `DELETE /api/users/{user_id}`
   - `DELETE /api/customers/{customer_id}`
   - `DELETE /api/tickets/{ticket_id}`
+  - The `/api/admin/*` console and `/api/admin/teams` routes
 - Ticket assignment (`assigned_to`) can be changed only by:
   - `admin`
   - `sales_manager`
@@ -72,10 +109,22 @@ Some clients drop `Authorization` on redirected requests, causing false `401/403
 - `POST /api/auth/register` always creates users with role `sales_rep`.
 - `DELETE /api/users/{user_id}` is a soft delete (`is_active=false`), not row removal.
 
+### Record-level scoping
+
+List endpoints filter by the caller's role before any query param is applied:
+
+- `sales_rep` sees only records they own.
+- `sales_manager` sees their team's records (resolved via `team_members`).
+- `admin` sees everything.
+
+So an empty list is often correct rather than a bug — check the caller's role
+and team membership before treating it as one.
+
 ## 4.1 Data Import Endpoints (CSV/XLSX)
 
 Implemented import routes:
 
+- `POST /api/import/leads`
 - `POST /api/import/customers`
 - `POST /api/import/tickets`
 
@@ -83,6 +132,12 @@ Request type:
 
 - `multipart/form-data`
 - file field key must be `file`
+
+Do **not** set `Content-Type` manually for these; let the browser set the
+multipart boundary. The CSRF header is still required.
+
+Limits: `IMPORT_MAX_FILE_BYTES` (default 5 MB) and `IMPORT_MAX_ROWS`
+(default 5000).
 
 Supported file types:
 
@@ -140,38 +195,37 @@ Example shape:
 
 UI handling recommendations:
 
-- `401`: try refresh flow
-- `403`: show permission/auth message (RBAC, missing bearer, or inactive user)
+- `401`: try refresh flow once, then log out
+- `403`: show permission/auth message (RBAC, missing/invalid CSRF token, or inactive user)
 - `413`: show request too large
 - `422`: map field-level errors
 - `429`: show retry countdown from `Retry-After`
 
 ## 6. Required Frontend Env Variables
 
-Use one of these based on your stack:
+The shipped frontend is Vite and reads:
 
 ```env
-NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
-# or
 VITE_API_BASE_URL=http://localhost:8000
-# or
-REACT_APP_API_BASE_URL=http://localhost:8000
 ```
+
+It falls back to `http://localhost:8000` when unset.
 
 ## 7. Integration Checklist
 
-- [ ] Login/register works and stores tokens
-- [ ] Protected requests include bearer token
+- [ ] Login/register succeed and the auth cookies appear in devtools
+- [ ] Every request sends `credentials: "include"`
+- [ ] Mutating requests send `X-CSRF-Token` from the `csrf_token` cookie
 - [ ] Auto-refresh works and retries once
 - [ ] Refresh runs on `401` only (not on `403`)
+- [ ] Nothing writes tokens to `localStorage`
 - [ ] Enum values are aligned with backend
 - [ ] PATCH requests are used for updates
 - [ ] Collection endpoints use canonical trailing-slash paths
 - [ ] RBAC actions are hidden/disabled in UI
 - [ ] 422 field errors display correctly in forms
 - [ ] 429 and 413 are handled with user-friendly messages
-- [ ] Customer CSV import works for manager/admin users
-- [ ] Ticket Excel import works for manager/admin users
+- [ ] Lead/customer/ticket imports work for manager/admin users
 - [ ] Import failure rows are visible in UI
 
 ## 8. Source of Truth

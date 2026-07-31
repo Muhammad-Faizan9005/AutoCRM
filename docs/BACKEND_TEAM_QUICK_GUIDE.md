@@ -1,14 +1,25 @@
 # AutoCRM Backend Quick Guide
 
-## 2) What This Backend Does
+Last Updated: 2026-07-28
 
-- Provides CRM APIs for auth, users, customers, tickets, ticket messages, and file imports.
-- Uses PostgreSQL via a custom query client.
-- Uses JWT authentication with access + refresh tokens.
-- Applies role-based access control (admin, sales_manager, sales_rep).
-- Adds production-focused middleware (security headers, request size guard, rate limiting, request ID, logging, error format).
+An orientation document for people new to this backend. For exact endpoint
+contracts use [API.md](API.md).
 
-## 3) Fundamentals (simple definitions)
+## 1) What This Backend Does
+
+- Provides CRM APIs for auth, users, leads, deals, organizations, customers,
+  tasks, notes, tickets, notifications, calls, imports, teams, and the admin console.
+- Hosts the **AI control plane** (`/api/agent`): the backend is the source of
+  truth for AI runs, traces, proposed actions, and approvals. The separate AI
+  service calls into these endpoints rather than writing CRM data directly.
+- Uses PostgreSQL (Supabase-hosted) through a custom query client.
+- Uses JWT authentication delivered as HttpOnly cookies, with refresh rotation.
+- Applies role-based access control (`admin`, `sales_manager`, `sales_rep`)
+  plus per-user permission overrides.
+- Adds production-focused middleware (CSRF, security headers, request size
+  guard, rate limiting, request ID, logging, error format).
+
+## 2) Fundamentals (simple definitions)
 
 ### FastAPI
 
@@ -20,7 +31,7 @@
 
 - A style of API where resources are exposed via URLs and HTTP methods.
 - Example in this backend:
-  - `GET /api/customers/` -> list customers
+  - `GET /api/leads/` -> list leads
   - `POST /api/tickets/` -> create ticket
 
 ### JWT (JSON Web Token)
@@ -28,29 +39,41 @@
 - A signed token used for stateless authentication.
 - Backend verifies signature and claims on every protected request.
 - This project uses:
-  - Access token (short-lived)
-  - Refresh token (longer-lived)
+  - Access token (short-lived, default 30 minutes)
+  - Refresh token (longer-lived, default 7 days)
 
 ### Access Token vs Refresh Token
 
-- Access token: sent on protected API calls in `Authorization: Bearer <token>`.
-- Refresh token: used only to ask for a new token pair when access token expires.
-- This backend rotates refresh tokens and revokes old ones.
+- Access token: sent automatically as the HttpOnly `access_token` cookie.
+- Refresh token: the `refresh_token` cookie, scoped to `/api/auth`, used only to
+  mint a new pair when the access token expires.
+- This backend rotates refresh tokens and revokes old ones in `revoked_tokens`.
+- There is **no** `Authorization: Bearer` path for user auth — `get_current_user`
+  reads the cookie only.
+
+### CSRF (double-submit)
+
+- Because auth rides on cookies, mutating requests need proof they came from our
+  frontend and not another site.
+- The backend also sets a readable `csrf_token` cookie. The client copies its
+  value into an `X-CSRF-Token` header on every `POST`/`PUT`/`PATCH`/`DELETE`.
+- `csrf_middleware` in `app/auth/cookies.py` compares the two and returns `403`
+  on a mismatch. Login and register are exempt.
 
 ### RBAC (Role-Based Access Control)
 
 - Authorization based on user role.
 - Roles here: `admin`, `sales_manager`, `sales_rep`.
-- Example: deleting users/customers/tickets requires admin-level permission.
+- Enforced by `require_role` / `require_admin` / `require_permissions` in
+  `app/auth/dependencies.py`.
+- Beyond route guards, list endpoints filter rows by role: a rep sees what they
+  own, a manager sees their team (via `team_members`), an admin sees everything.
 
 ### Middleware
 
 - Code that runs around each request/response.
-- This backend middleware handles:
-  - request ID
-  - logs
-  - rate limiting
-  - security headers + request size limit
+- Registered in `app/main.py`; last registered runs first. The chain is:
+  error handler → logging → rate limiter → security → CSRF.
 
 ### Dependency Injection (DI)
 
@@ -64,127 +87,211 @@
 
 ### Repository Pattern
 
-- Data access is isolated in repository classes.
+- Data access is isolated in repository classes under `app/repositories/`.
 - Routers stay focused on API behavior; repositories handle DB operations.
 
 ### CORS
 
 - Controls which frontend origins can call this API from browsers.
-- Currently open (`allow_origins=["*"]`) and should be restricted in production.
+- Origins are **allow-listed** in `app/main.py`. Because `allow_credentials=True`,
+  a wildcard is not permitted — a new frontend domain must be added there
+  explicitly or the browser will reject the cookies.
 
 ### RLS (Row-Level Security)
 
 - Database-level access policies in PostgreSQL/Supabase.
-- Schema enables RLS for core tables; policy behavior depends on DB role/JWT context.
+- Migrations enable RLS on core tables (leads, calls, teams, customers,
+  organizations, task deadline alerts, and the AI tables).
 
-## 4) Project Flow In One View
+## 3) Project Flow In One View
 
 ```text
 Client
   -> FastAPI app (app/main.py)
-  -> Middleware chain (security, rate limit, logging, error handler)
+  -> Middleware chain (error handler, logging, rate limit, security, CSRF)
   -> Router endpoint (app/routers/*)
   -> Auth dependency (if protected)
   -> Pydantic schema validation (app/schemas/*)
+  -> Service layer (app/services/*) for cross-entity logic
   -> Repository (app/repositories/*)
   -> Postgres client/query builder
   -> PostgreSQL tables
   -> JSON response (+ X-Request-ID, rate-limit headers)
 ```
 
-## 5) Request Lifecycle (protected endpoint example)
+## 4) Request Lifecycle (protected endpoint example)
 
-Example: `GET /api/customers/`
+Example: `GET /api/leads/`
 
 1. Request enters FastAPI app.
 2. Middleware runs:
-   - security checks request size and adds headers
-   - rate limiter checks per-IP and per-path budget
-   - logging writes start/completion logs
    - error middleware ensures `X-Request-ID`
-3. Auth dependency validates bearer token:
-   - checks token blacklist (revoked tokens)
+   - logging writes start/completion logs
+   - rate limiter checks per-IP and per-path budget
+   - security checks request size and adds headers
+   - CSRF check (mutating requests only — skipped for this `GET`)
+3. Auth dependency validates the `access_token` cookie:
+   - checks the token blacklist (`revoked_tokens`)
    - verifies JWT signature + claims
-   - loads current user from `agents` table
-4. Router validates query params and calls repository.
-5. Repository executes DB query through the query client.
+   - loads the current user from `agents` (5-minute in-process cache)
+   - rejects inactive users with `403`
+4. Router applies role scoping, validates query params, calls the repository.
+5. Repository executes the DB query through the query client.
 6. Response is returned in a consistent JSON shape.
 
-## 6) Auth Flow In This Codebase
+## 5) Auth Flow In This Codebase
+
+All of these set or clear cookies; none return tokens in the body.
 
 - `POST /api/auth/register`
-  - creates a new `sales_rep` user
-  - hashes password
-  - returns access + refresh token
+  - creates a new `sales_rep` user, hashes the password
+  - returns `{ "user": ... }` and sets the auth cookies
 
 - `POST /api/auth/login`
   - verifies email/password
-  - returns access + refresh token
+  - returns `{ "user": ... }` and sets the auth cookies
 
 - `GET /api/auth/me`
-  - reads current user from bearer token
+  - reads the current user from the access-token cookie
+  - also returns the caller's resolved permission set
 
 - `POST /api/auth/refresh`
-  - validates refresh token
-  - issues new token pair
-  - blacklists old refresh token (rotation)
+  - validates the refresh-token cookie (no request body)
+  - issues a new pair, blacklists the old refresh token (rotation)
 
 - `POST /api/auth/logout`
-  - blacklists access token and optional refresh token
+  - blacklists both tokens, clears cookies, invalidates the cached user
 
-## 7) Core Data Model (what to memorize)
+- `POST /api/auth/forgot-password` / `POST /api/auth/reset-password`
+  - emailed single-use reset token, TTL `RESET_TOKEN_TTL_MINUTES`
 
-- `agents`: backend users, roles, password hash, active flag
+## 6) Core Data Model (what to memorize)
+
+Identity and access:
+
+- `agents`: backend users, roles, password hash, active flag, settings
+- `agent_permissions`: per-user permission overrides
 - `revoked_tokens`: invalidated JWT token hashes
-- `customers`: CRM customer profiles
-- `tickets`: support/service records linked to customers
-- `ticket_messages`: conversation thread per ticket
-- `ai_interactions`: placeholder/log table for AI-related operations
+- `teams` / `team_members`: manager-to-rep grouping that drives row scoping
+- `deleted_users`, `invites`, `failed_invites`, `password_reset_tokens`
+
+CRM core:
+
+- `leads`: primary ingestion entity, scored and owned
+- `deals`: created from leads; `won` triggers customer creation
+- `organizations`: company records leads/deals hang off
+- `customers`: terminal entity, created from won deals
+- `tasks`, `notes`: attached to any entity via `entity_type` + `entity_id`
+- `tickets`, `ticket_messages`: support threads
+- `notifications`, `status_change_logs`, `task_deadline_alerts`
+- `call_sessions`, `call_room_tokens`: call module
+
+AI control plane:
+
+- `ai_agents`: registry of logical agents (enabled/status/heartbeat)
+- `ai_agent_credentials`: hashed service tokens with scopes
+- `ai_agent_runs` / `ai_agent_run_traces`: run records and step traces
+- `ai_agent_actions` / `ai_agent_approval_requests`: proposed writes and approvals
+- `ai_agent_settings`, `ai_interactions`
 
 Relationship summary:
 
-- one customer -> many tickets
-- one ticket -> many ticket messages
-- one agent can be assigned to many tickets
+- one lead -> at most one deal -> at most one customer
+- one organization -> many leads and deals
+- one customer -> many tickets; one ticket -> many ticket messages
+- one agent can own many leads/deals and be assigned many tasks/tickets
+- one team -> many members (an agent appears at most once per team)
 
-## 8) Endpoint Cheat Sheet (most used)
+## 7) Endpoint Cheat Sheet (most used)
 
 - Auth:
-  - `POST /api/auth/register`
-  - `POST /api/auth/login`
-  - `GET /api/auth/me`
-  - `POST /api/auth/refresh`
-  - `POST /api/auth/logout`
+  - `POST /api/auth/register`, `POST /api/auth/login`
+  - `GET /api/auth/me`, `POST /api/auth/refresh`, `POST /api/auth/logout`
 
-- Users (admin-focused):
-  - `GET /api/users/`
-  - `POST /api/users/`
-  - `PATCH /api/users/{user_id}`
+- Leads:
+  - `GET /api/leads/`, `POST /api/leads/`
+  - `GET /api/leads/{lead_id}/workspace` (aggregated detail payload)
+  - `POST /api/leads/{lead_id}/convert-to-deal`
 
-- Customers:
-  - `GET /api/customers/`
-  - `POST /api/customers/`
-  - `PATCH /api/customers/{customer_id}`
+- Deals:
+  - `GET /api/deals/`, `GET /api/deals/workspace`
+  - `PATCH /api/deals/{deal_id}` (setting `won` creates the customer)
 
-- Tickets:
-  - `GET /api/tickets/`
-  - `POST /api/tickets/`
-  - `GET /api/tickets/{ticket_id}/messages`
-  - `POST /api/tickets/{ticket_id}/messages`
+- Tasks / Notes:
+  - `GET /api/tasks/`, `GET /api/notes/` (filter by `entity_type` + `entity_id`)
+
+- Dashboard:
+  - `GET /api/dashboard/summary`, `GET /api/dashboard/activity`
+
+- AI control plane:
+  - `GET /api/agent/control-center`, `GET /api/agent/approvals`
+  - `POST /api/agent/approvals/{approval_id}/approve`
 
 - Imports:
-  - `POST /api/import/customers`
-  - `POST /api/import/tickets`
+  - `POST /api/import/leads`, `/customers`, `/tickets`
 
-## 9) 3-Minute Demo Script
+## 8) 3-Minute Demo Script
 
 - Start backend and open `/docs`.
-- Call `POST /api/auth/login` and copy access token.
-- Authorize in Swagger with `Bearer <token>`.
-- Call `GET /api/customers/` and `GET /api/tickets/`.
-- Explain where auth, validation, and repository logic are applied.
+- Call `POST /api/auth/login` from the frontend (or curl with a cookie jar) —
+  Swagger's "Authorize" button will not help here, since auth is cookie-based
+  rather than a bearer header.
+- Call `GET /api/leads/` and `GET /api/dashboard/summary`.
+- Open the AI Control Center in the UI and walk one run → trace → approval.
+- Explain where auth, role scoping, validation, and repository logic are applied.
 
-## 10) Quick Glossary (backend terms)
+## 9) Disabled User Detection (frontend behavior)
+
+We need disabled users to lose access quickly. These are the options:
+
+1) Server-push (SSE or WebSocket)
+   - Backend publishes a "user_disabled" event to the specific user.
+   - Frontend reacts instantly and clears the session.
+   - Best long-term scalability, requires persistent connections and auth on the channel.
+
+2) Short-interval polling (**current**)
+   - Frontend polls `GET /api/auth/me` every 6 seconds while logged in
+     (`src/App.jsx`).
+   - If the backend returns `403 Inactive user`, the client clears the session
+     and shows the inactive modal.
+   - Simple and reliable; load scales with concurrent active users.
+
+3) Token revocation + short-lived access tokens
+   - Disable action blacklists active tokens and uses shorter access token TTLs.
+   - User is blocked on the next API request, without polling.
+   - Lowest steady-state load, but not instant unless requests are frequent.
+
+## 10) CRM Porting Priorities
+
+### Shipped
+
+1) Lead/Deal default status rules
+2) Lost reason capture for Lead/Deal
+3) Status change logging (`status_change_logs`)
+4) Owner assignment rules and manager/admin scope checks
+5) Canonical status taxonomy (`app/utils/statuses.py`)
+
+### Later pipeline (documented for follow-up)
+
+1) SLA lifecycle (first response/rolling response, breach tracking)
+   - Reason: valuable for support ops, but not required for core CRM CRUD.
+
+2) Lead -> Contact/Organization auto-creation
+   - Reason: helpful for CRM completeness, but can be manual without breaking flows.
+
+3) Deal forecasting rules (probability, expected close/value requirements)
+   - Reason: analytics-driven; safe to add once basic lifecycle is stable.
+
+4) Exchange rate/multi-currency handling
+   - Reason: needed for global sales, not a blocker for initial deployments.
+
+5) Lead enrichment (gravatar/image)
+   - Reason: UI polish only; no impact on business logic.
+
+6) Task kanban metadata defaults
+   - Reason: UI-specific configuration; can be added after core task CRUD.
+
+## 11) Quick Glossary (backend terms)
 
 - API: contract for how systems communicate.
 - Endpoint: one API URL + method.
@@ -198,77 +305,17 @@ Relationship summary:
 - TTL: how long a token/resource remains valid.
 - Idempotent: same request repeated gives same effect (for suitable operations).
 - Pagination: returning data in chunks (`skip`, `limit`).
-
-## 11) Disabled User Detection (frontend behavior)
-
-We need disabled users to lose access quickly. These are the options:
-
-1) Server-push (SSE or WebSocket)
-  - Backend publishes a "user_disabled" event to the specific user.
-  - Frontend reacts instantly and clears the session.
-  - Best long-term scalability, requires persistent connections and auth on the channel.
-
-2) Short-interval polling (current)
-  - Frontend polls `GET /api/auth/me` every ~6 seconds while logged in.
-  - If the backend returns `403 Inactive user`, the client clears the session
-    and shows the inactive modal.
-  - Simple and reliable; load scales with concurrent active users.
-
-3) Token revocation + short-lived access tokens
-  - Disable action blacklists active tokens and uses shorter access token TTLs.
-  - User is blocked on the next API request, without polling.
-  - Lowest steady-state load, but not instant unless requests are frequent.
-
-## 12) Day 8 CRM Porting Priorities
-
-### Must-haves (implement now)
-
-1) Lead/Deal default status rules
-  - Reason: prevents inconsistent states and matches CRM expectations on creation.
-
-2) Lost reason enforcement for Lead/Deal
-  - Reason: ensures pipeline analytics are meaningful and prevents silent loss states.
-
-3) Status change logging for Lead/Deal
-  - Reason: auditability and visibility into lifecycle transitions.
-
-4) Owner assignment rules and permission checks
-  - Reason: avoids unauthorized reassignment and mirrors manager/admin scope.
-
-5) Task reassignment unassigns previous assignee
-  - Reason: prevents duplicate responsibility and matches CRM assignment behavior.
-
-6) Canonical status taxonomy across API/UI
-  - Reason: avoids mismatched values, broken filters, and reporting drift.
-
-### Later pipeline (documented for follow-up)
-
-1) SLA lifecycle (first response/rolling response, breach tracking)
-  - Reason: valuable for support ops, but not required for core CRM CRUD.
-
-2) Lead -> Contact/Organization auto-creation
-  - Reason: helpful for CRM completeness, but can be manual without breaking flows.
-
-3) Deal forecasting rules (probability, expected close/value requirements)
-  - Reason: analytics-driven; safe to add once basic lifecycle is stable.
-
-4) Exchange rate/multi-currency handling
-  - Reason: needed for global sales, not a blocker for initial deployments.
-
-5) Lead enrichment (gravatar/image)
-  - Reason: UI polish only; no impact on business logic.
-
-6) Task kanban metadata defaults
-  - Reason: UI-specific configuration; can be added after core task CRUD.
 - Middleware: pre/post request processing layer.
 - Dependency: reusable logic injected into route handlers.
 - Repository: abstraction over DB operations.
 - RLS: DB-level per-row access policy.
 
-## 11) What Team Members Should Know After 20 Minutes
+## 12) What Team Members Should Know After 20 Minutes
 
 - Where requests enter and how they move through the backend.
-- How JWT auth and refresh-token rotation work in this project.
-- Where role checks are enforced.
+- How cookie auth, CSRF, and refresh-token rotation work in this project.
+- Where role checks are enforced — both route guards and row-level scoping.
 - Where to add new endpoints, schemas, and repository logic safely.
 - Which tables are core for day-to-day CRM operations.
+- That the AI service never writes CRM data directly; it proposes actions
+  through `/api/agent` and waits for approval.
