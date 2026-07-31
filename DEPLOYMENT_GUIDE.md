@@ -53,11 +53,13 @@ chmod +x deploy.sh
 
 The script will:
 1. ✓ Check Railway CLI installation
-2. ✓ Verify authentication
-3. ✓ Check project linking
-4. ✓ Check for uncommitted changes
-5. ✓ Deploy to Railway
-6. ✓ Provide post-deployment options
+2. ✓ Verify authentication (prompts `railway login` if needed)
+3. ✓ Check project linking (offers `railway init` if none)
+4. ✓ Warn about uncommitted changes and ask before continuing
+5. ✓ Deploy with `railway up`
+6. ✓ Offer to open the deployment
+
+The scripts do not modify git state and do not run migrations.
 
 ### Manual Deployment
 
@@ -83,14 +85,42 @@ After first deployment, configure environment variables in Railway dashboard:
 
 ### Required Variables:
 ```
-SUPABASE_URL=https://snwheczzakjyhfaitmoq.supabase.co
-SUPABASE_KEY=your_supabase_key_here
-DATABASE_URL=postgresql://postgres.xxxxx:password@aws-0-us-east-1.pooler.supabase.com:6543/postgres
-jwt_secret_key=your_generated_secret_key
-jwt_algorithm=HS256
-jwt_access_token_expire_minutes=30
-jwt_refresh_token_expire_days=7
+DATABASE_URL=postgresql://postgres.<project-ref>:<password>@aws-<region>.pooler.supabase.com:6543/postgres?sslmode=require
+JWT_SECRET_KEY=<min-32-char-random-secret>
+JWT_ALGORITHM=HS256
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=30
+JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
+DEBUG=False
+FRONTEND_BASE_URL=https://<your-frontend-domain>
 ```
+
+`DEBUG=False` is important in production: it makes auth cookies `Secure` and
+causes `app/core/startup_checks.py` to abort startup on unsafe configuration.
+
+### Recommended Variables:
+```
+# Invite + notification email
+MAILJET_API_KEY=
+MAILJET_SECRET_KEY=
+MAILJET_SENDER_EMAIL=
+MAILJET_SENDER_NAME=AutoCRM
+
+# AI service callbacks
+AI_SERVICE_BASE_URL=https://<your-ai-service-host>
+AI_SERVICE_WEBHOOK_TOKEN=<shared-token>
+AI_TRANSCRIPTION_NOTIFY_ENABLED=true
+
+# Avatar storage (optional Supabase S3)
+AVATAR_PUBLIC_BASE_URL=https://<your-backend-domain>
+S3_ENDPOINT=
+S3_ACCESS_KEY=
+S3_SECRET_KEY=
+```
+
+Never commit real values. Set them only in the Railway dashboard or a secret
+manager. AI service credentials are generated from **Profile Settings →
+Developer Mode**; the backend stores only hashed tokens, so no raw AI service
+token belongs in these variables.
 
 ### Setting Variables:
 
@@ -102,21 +132,30 @@ jwt_refresh_token_expire_days=7
 
 **Via CLI:**
 ```bash
-railway variables set SUPABASE_URL=your_value_here
-railway variables set SUPABASE_KEY=your_value_here
-railway variables set DATABASE_URL=your_value_here
-railway variables set jwt_secret_key=your_value_here
+railway variables set DATABASE_URL=<value>
+railway variables set JWT_SECRET_KEY=<value>
+railway variables set DEBUG=False
 ```
 
 ## Database Migration
 
-After deployment and configuring environment variables, run migrations:
+Migrations are not run automatically by the start command. After deployment and
+configuring environment variables, apply them explicitly:
 
 ```bash
-railway run alembic upgrade head
+railway run python -m alembic upgrade head
+railway run python -m alembic current
 ```
 
-This will apply all pending database migrations to your Supabase database.
+Re-run this whenever a release adds new Alembic revisions. See
+`MIGRATION_GUIDE.md` for details.
+
+## Allow the Frontend Origin
+
+CORS origins are hardcoded in `app/main.py`. A deployed frontend domain must be
+added to `allow_origins` there and redeployed, because `allow_credentials=True`
+means wildcard origins are rejected and cookie auth will fail silently in the
+browser.
 
 ## Verify Deployment
 
@@ -137,8 +176,12 @@ railway open
 
 ### Test API
 ```bash
+curl https://your-railway-url.railway.app/health
 curl https://your-railway-url.railway.app/docs
 ```
+
+`GET /health` returns `{"status": "healthy"}` and `GET /` returns the service
+banner.
 
 ## Deployment Files Overview
 
@@ -215,21 +258,20 @@ After setup, every push to your connected branch will trigger automatic deployme
 
 ## Cost Considerations
 
-Railway offers:
-- **Hobby Plan**: $5/month credit (free trial available)
-- **Pro Plan**: $20/month credit
-
-Monitor usage in Railway dashboard to avoid unexpected charges.
+Railway is a paid platform with usage-based billing on top of a monthly plan
+credit. Check the current plans and pricing at https://railway.app/pricing and
+monitor usage in the Railway dashboard to avoid unexpected charges.
 
 ## Next Steps
 
 1. ✅ Deploy backend to Railway
-2. ✅ Configure environment variables
+2. ✅ Configure environment variables (`DEBUG=False`, `DATABASE_URL`, `JWT_SECRET_KEY`)
 3. ✅ Run database migrations
-4. ✅ Test API endpoints
-5. ⏭️ Update frontend to use Railway URL
-6. ⏭️ Set up custom domain (optional)
-7. ⏭️ Enable auto-deployment from GitHub
+4. ✅ Add the frontend origin to `allow_origins` in `app/main.py`
+5. ✅ Test `/health` and `/docs`
+6. ⏭️ Point the frontend at the Railway URL
+7. ⏭️ Set up a custom domain (optional)
+8. ⏭️ Enable auto-deployment from GitHub
 
 ## Support
 

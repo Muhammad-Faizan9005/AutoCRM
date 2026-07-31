@@ -1,6 +1,6 @@
 # AutoCRM Backend API Handover
 
-Last Updated: 2026-04-30
+Last Updated: 2026-07-28
 Backend Version: 1.0.0
 
 This document is the implementation-accurate API contract for frontend teams.
@@ -11,25 +11,25 @@ It reflects the endpoints, payloads, validation rules, and security middleware c
 Implemented and ready for frontend integration:
 
 - Health endpoints
-- Authentication (register, login, me, refresh, logout)
+- Authentication (register, login, me, profile, avatar, refresh, logout, forgot/reset password)
 - Users (RBAC-protected CRUD + deactivation)
 - Customers (CRUD)
 - Tickets (CRUD)
 - Ticket messages
 - Organizations (CRUD)
-- Leads (CRUD + lead-to-deal conversion)
-- Deals (CRUD + deal-to-customer conversion)
+- Leads (CRUD + scoring, bulk assign, workspace, ingestion, lead-to-deal conversion)
+- Deals (CRUD + workspace + deal-to-customer conversion)
 - Tasks (CRUD)
 - Notes (CRUD)
-- Dashboard metrics
-- Data import (CSV/XLSX for customers and tickets)
+- Notifications (list, mark read, mark all read)
+- Dashboard metrics + activity + latest AI summary
+- Data import (CSV/XLSX for customers, tickets, and leads)
+- Invites (validate + accept) and admin invite management
+- Admin console (overview, activity log, users, deleted users, failed invites, permissions)
+- Teams (admin-managed)
+- Calls (session start/end, chunked recording upload, recording download)
+- AI control plane (`/api/agent`): runs, traces, actions, approvals, settings, AI agent registry, service credentials, RAG snapshot/reconcile
 - Request ID, structured errors, rate limiting, and security headers
-
-Not yet implemented in this backend version:
-
-- Telephony endpoints
-- AI endpoints
-- Notification/activity timeline endpoints
 
 ## 2. Base URLs and API Docs
 
@@ -38,17 +38,62 @@ Not yet implemented in this backend version:
 - OpenAPI/Swagger: `/docs`
 - ReDoc: `/redoc`
 
+CORS origins are allow-listed in `app/main.py`. Because `allow_credentials=True`,
+wildcard origins are rejected — a new frontend domain must be added there.
+
 ## 3. Authentication Model
 
-- Auth type: JWT Bearer tokens
+- Auth transport: **HttpOnly cookies** (`access_token`, `refresh_token`) with a
+  `csrf_token` cookie for double-submit CSRF protection.
+- Cookies are the **only** transport for human users. `get_current_user` reads
+  the `access_token` cookie and has no `Authorization: Bearer` fallback, so a
+  bearer header alone returns `401 Not authenticated`. Tests and tooling must
+  set the cookie (see `tests/test_live_http_audit.py`).
+- Service-to-service calls from the AI service use the AI headers instead — see
+  section 3.1.
 - Access token TTL: `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` (default 30 minutes)
 - Refresh token TTL: `JWT_REFRESH_TOKEN_EXPIRE_DAYS` (default 7 days)
 - Refresh token rotation: enabled (old refresh token is blacklisted after refresh)
-- Logout invalidation: access token + optional refresh token can be revoked
+- Logout invalidation: access token + refresh token are revoked in `revoked_tokens`
 
-### Required Header for Protected Endpoints
+### Cookie Scopes
 
-`Authorization: Bearer <access_token>`
+| Cookie          | HttpOnly | Path        | Purpose                        |
+| --------------- | -------- | ----------- | ------------------------------ |
+| `access_token`  | yes      | `/`         | Authenticates API requests     |
+| `refresh_token` | yes      | `/api/auth` | Rotates the access token       |
+| `csrf_token`    | no       | `/`         | Read by JS for the CSRF header |
+
+Cookies are `Secure` + `SameSite=None` when `DEBUG=False`, and `SameSite=Lax`
+locally.
+
+### Required Headers
+
+- Browser clients: send cookies (`credentials: "include"`), plus
+  `X-CSRF-Token: <csrf_token cookie>` on every `POST`, `PUT`, `PATCH`, and
+  `DELETE`. Login and register are exempt.
+- Non-browser clients: send the `access_token` cookie (e.g. `-b
+  "access_token=<jwt>"` with curl) plus the CSRF cookie/header pair on mutating
+  requests. There is no bearer-token path for user auth.
+
+### 3.1 AI Service Authentication
+
+Endpoints wrapped in `require_ai_agent_auth` / `require_human_or_ai_agent_auth`
+accept service credentials instead of a user cookie:
+
+| Header               | Required | Purpose                                              |
+| -------------------- | -------- | ---------------------------------------------------- |
+| `X-AI-Service-Token` | yes      | Raw token; matched by SHA-256 hash against `ai_agent_credentials` |
+| `X-AI-Agent-Key`     | no       | Runtime attribution only (e.g. `deal_risk_watcher`)  |
+
+The token authenticates the AI service globally, not one logical agent. The
+credential must be `is_active` and unexpired; a supplied agent key must resolve
+to an enabled, `active` row in `ai_agents` or the request is rejected `403`.
+Issue tokens via `POST /api/agent/service-credentials` (Profile Settings →
+Developer Mode). When both an AI header and a cookie are present on a
+`require_human_or_ai_agent_auth` route, the AI headers win.
+
+Missing or mismatched CSRF tokens return `403 CSRF token missing or invalid`.
 
 ### Canonical Collection Paths
 
@@ -62,9 +107,13 @@ Collection routes in this API are defined with trailing slash:
 - `/api/deals/`
 - `/api/tasks/`
 - `/api/notes/`
+- `/api/notifications/`
 
 Calling these without the trailing slash returns `307 Temporary Redirect`.
-Some clients may not preserve `Authorization` across redirect hops; prefer canonical paths directly.
+Prefer the canonical paths directly — a redirect hop costs a round trip and not
+every client replays the request body on `307`.
+
+Note: team routes are registered without a trailing slash (`/api/admin/teams`).
 
 ## 4. Global Middleware Contract
 
@@ -78,7 +127,8 @@ Some clients may not preserve `Authorization` across redirect hops; prefer canon
 
 - Configured by:
   - `RATE_LIMIT_ENABLED` (default `True`)
-  - `RATE_LIMIT_REQUESTS_PER_MINUTE` (default `120`)
+  - `RATE_LIMIT_REQUESTS_PER_MINUTE` (default `100`)
+  - `RATE_LIMIT_MAX_QUEUE_SIZE` (default `500`)
 - Current strategy: per-IP + per-path, in-memory bucket
 - Response headers:
   - `X-RateLimit-Limit`
@@ -132,7 +182,7 @@ Common status codes:
 
 - `400` bad request
 - `401` unauthorized/invalid token
-- `403` forbidden (RBAC, missing bearer header, or inactive user)
+- `403` forbidden (RBAC, missing/invalid CSRF token, or inactive user)
 - `307` temporary redirect (typically path trailing-slash normalization)
 - `404` resource not found
 - `413` request body too large
@@ -245,7 +295,7 @@ Important constraints:
 
 ```json
 {
-  "message": "Welcome to AutoCRM API",
+  "message": "Welcome to AutoCRM an Agentic AI Enabled CRM System",
   "status": "running"
 }
 ```
@@ -280,9 +330,6 @@ Important constraints:
 
 ```json
 {
-  "access_token": "<jwt>",
-  "refresh_token": "<jwt>",
-  "token_type": "bearer",
   "user": {
     "id": "uuid",
     "email": "rep@example.com",
@@ -294,6 +341,8 @@ Important constraints:
 }
 ```
 
+- Tokens are **not** returned in the body. They are issued only as the
+  `access_token`, `refresh_token`, and `csrf_token` cookies.
 - Note: newly registered users are always created with role `sales_rep`.
 
 ### POST /api/auth/login
@@ -308,7 +357,8 @@ Important constraints:
 }
 ```
 
-- Response `200`: same shape as register.
+- Response `200`: `{ "user": { ... } }` — same shape as register, and sets the
+  same auth cookies. Tokens are cookie-only.
 
 ### GET /api/auth/me
 
@@ -322,42 +372,54 @@ Important constraints:
   "full_name": "Sales Rep",
   "role": "sales_rep",
   "is_active": true,
+  "avatar_url": "http://localhost:8000/static/avatars/<file>",
   "created_at": "2026-04-03T12:00:00+00:00"
 }
 ```
 
+- Response also includes the caller's resolved permission set.
+
+### PATCH /api/auth/profile
+
+- Auth: required
+- Request (partial): `full_name`, `phone`, and other self-editable profile fields
+- Response `200`: `UserResponse`
+
+### POST /api/auth/avatar
+
+- Auth: required
+- Content type: `multipart/form-data`, field name `file`
+- Allowed types: JPEG, PNG, WebP, GIF
+- Response `200`: `UserResponse` with the updated `avatar_url`
+
+### DELETE /api/auth/avatar
+
+- Auth: required
+- Response `200`: `UserResponse` with `avatar_url` cleared
+
 ### POST /api/auth/refresh
 
-- Auth: none (uses refresh token payload)
-- Request:
-
-```json
-{
-  "refresh_token": "<jwt>"
-}
-```
+- Auth: none (reads the `refresh_token` cookie)
+- Request: no body. A missing cookie returns `401 Missing refresh token`; a
+  reused/blacklisted one returns `401 Refresh token has been invalidated`.
 
 - Response `200`:
 
 ```json
 {
-  "access_token": "<jwt>",
-  "refresh_token": "<jwt>",
-  "token_type": "bearer",
-  "expires_in": 1800
+  "success": true
 }
 ```
+
+- Rotates all auth cookies and revokes the previous refresh token. No tokens
+  appear in the response body.
+- The `refresh_token` cookie is scoped to `/api/auth`, so refresh must be called on that path.
 
 ### POST /api/auth/logout
 
 - Auth: required
-- Request body is optional. If provided, refresh token is also revoked.
-
-```json
-{
-  "refresh_token": "<jwt>"
-}
-```
+- Request: no body. Both the access and refresh tokens are read from cookies and
+  blacklisted in `revoked_tokens`.
 
 - Response `200`:
 
@@ -367,6 +429,21 @@ Important constraints:
   "message": "Successfully logged out"
 }
 ```
+
+- Revokes tokens, clears all auth cookies, and invalidates the cached user.
+
+### POST /api/auth/forgot-password
+
+- Auth: none
+- Request: `{ "email": "rep@example.com" }`
+- Response `200`: always a generic success message (does not disclose whether the account exists)
+- Sends a reset link to `FRONTEND_BASE_URL`; token TTL is `RESET_TOKEN_TTL_MINUTES` (default 30)
+
+### POST /api/auth/reset-password
+
+- Auth: none
+- Request: `{ "token": "<reset-token>", "password": "secure-pass-123" }`
+- Response `200`: `{ "message": "Password reset successful" }`; the token is single-use
 
 ## 8.3 Users (`/api/users`)
 
@@ -635,21 +712,238 @@ Import behavior:
 - If `customer_id` is missing and `customer_email` is provided, customer is resolved by email.
 - If customer lookup fails, row is reported in `failures`.
 
+## 8.8 Leads (`/api/leads`)
+
+Scoping: `sales_rep` sees only owned leads; `sales_manager` sees their team's
+leads (via `team_members`); `admin` sees all. Passing `owner_id` narrows within
+whatever the caller may already see.
+
+| Method   | Path                              | Notes                                                     |
+| -------- | --------------------------------- | --------------------------------------------------------- |
+| `GET`    | `/api/leads/`                     | Filters: `skip`, `limit`, `status`, `owner_id`, `organization_id`, `source`, `search` |
+| `POST`   | `/api/leads/`                     | Creates a lead; `201`                                     |
+| `GET`    | `/api/leads/{lead_id}`            | Single lead                                               |
+| `PATCH`  | `/api/leads/{lead_id}`            | Partial update                                            |
+| `DELETE` | `/api/leads/{lead_id}`            | `204`                                                     |
+| `GET`    | `/api/leads/{lead_id}/workspace`  | Aggregated detail payload (lead + tasks + notes + activity) in one round trip |
+| `GET`    | `/api/leads/{lead_id}/owner`      | Resolved owner record                                     |
+| `GET`    | `/api/leads/{lead_id}/ai-history` | AI runs/actions recorded against this lead                |
+| `GET`    | `/api/leads/{lead_id}/emails`     | Logged email activity                                     |
+| `GET`    | `/api/leads/{lead_id}/calls`      | `CallSessionResponse[]`                                   |
+| `GET`    | `/api/leads/assignment-reps`      | Reps the caller may assign to                             |
+| `POST`   | `/api/leads/assign-bulk`          | Bulk owner reassignment; returns updated leads            |
+| `POST`   | `/api/leads/{lead_id}/convert-to-deal` | Creates a deal, sets lead `qualified`; `201`         |
+| `POST`   | `/api/leads/{lead_id}/discard-deal` | Marks the lead's deal lost                              |
+| `POST`   | `/api/leads/{lead_id}/score/recalculate` | Recomputes the lead score                          |
+| `POST`   | `/api/leads/ingest`               | External/inbound lead intake; `201`                       |
+
+## 8.9 Deals (`/api/deals`)
+
+| Method   | Path                                    | Notes                                                    |
+| -------- | --------------------------------------- | -------------------------------------------------------- |
+| `GET`    | `/api/deals/`                           | Filters: `skip`, `limit`, `stage`, `owner_id`, `organization_id`, `lead_id` |
+| `POST`   | `/api/deals/`                           | `201`                                                    |
+| `GET`    | `/api/deals/workspace`                  | Pipeline board payload for all visible deals             |
+| `GET`    | `/api/deals/{deal_id}`                  | Single deal                                              |
+| `PATCH`  | `/api/deals/{deal_id}`                  | Partial update; moving to `won` triggers customer creation |
+| `DELETE` | `/api/deals/{deal_id}`                  | `204`                                                    |
+| `GET`    | `/api/deals/{deal_id}/workspace`        | Aggregated detail payload                                |
+| `GET`    | `/api/deals/{deal_id}/ai-history`       | AI runs/actions for this deal                            |
+| `GET`    | `/api/deals/assignment-owners`          | Owners the caller may assign to                          |
+| `POST`   | `/api/deals/{deal_id}/convert-to-customer` | `201` `CustomerResponse`                              |
+
+## 8.10 Organizations (`/api/organizations`)
+
+| Method   | Path                                             | Notes                       |
+| -------- | ------------------------------------------------ | --------------------------- |
+| `GET`    | `/api/organizations/`                            | Filters: `skip`, `limit`    |
+| `POST`   | `/api/organizations/`                            | `201`                       |
+| `GET`    | `/api/organizations/{organization_id}`           | Single org                  |
+| `PATCH`  | `/api/organizations/{organization_id}`           | Partial update              |
+| `DELETE` | `/api/organizations/{organization_id}`           | `204`                       |
+| `GET`    | `/api/organizations/{organization_id}/workspace` | Org + related leads/deals   |
+
+## 8.11 Tasks (`/api/tasks`)
+
+| Method   | Path                    | Notes                                                                 |
+| -------- | ----------------------- | --------------------------------------------------------------------- |
+| `GET`    | `/api/tasks/`           | Filters: `skip`, `limit`, `status`, `assigned_to`, `entity_type`, `entity_id`, `priority` |
+| `POST`   | `/api/tasks/`           | `201`                                                                 |
+| `GET`    | `/api/tasks/{task_id}`  | Single task                                                           |
+| `PATCH`  | `/api/tasks/{task_id}`  | Partial update                                                        |
+| `DELETE` | `/api/tasks/{task_id}`  | `204`                                                                 |
+
+Callers without manage-all rights are restricted to tasks on entities they can
+access; lead-scoped requests are authorization-checked against lead ownership.
+
+## 8.12 Notes (`/api/notes`)
+
+| Method   | Path                    | Notes                                                            |
+| -------- | ----------------------- | ---------------------------------------------------------------- |
+| `GET`    | `/api/notes/`           | Filters: `skip`, `limit`, `entity_type`, `entity_id`, `author_id` |
+| `POST`   | `/api/notes/`           | `201`                                                            |
+| `GET`    | `/api/notes/{note_id}`  | Single note                                                      |
+| `PATCH`  | `/api/notes/{note_id}`  | Partial update                                                   |
+| `DELETE` | `/api/notes/{note_id}`  | `204`                                                            |
+
+## 8.13 Notifications (`/api/notifications`)
+
+| Method  | Path                                      | Notes                          |
+| ------- | ----------------------------------------- | ------------------------------ |
+| `GET`   | `/api/notifications/`                     | Caller's notifications         |
+| `PATCH` | `/api/notifications/{notification_id}/read` | Mark one read                |
+| `PATCH` | `/api/notifications/read-all`             | Mark all read                  |
+
+## 8.14 Dashboard (`/api/dashboard`)
+
+| Method | Path                              | Notes                                              |
+| ------ | --------------------------------- | -------------------------------------------------- |
+| `GET`  | `/api/dashboard/summary`          | Role-scoped KPI metrics                            |
+| `GET`  | `/api/dashboard/activity`         | Recent activity feed                               |
+| `GET`  | `/api/dashboard/ai-summary/latest` | Most recent AI daily summary for the caller       |
+
+## 8.15 Calls (`/api/calls`)
+
+Recordings upload in chunks and are written under `CALL_RECORDINGS_DIR`. Chunk
+size is capped by `CALL_RECORDING_CHUNK_MAX_BYTES` (default 5 MB) and total size
+by `CALL_RECORDING_MAX_BYTES` (default 100 MB).
+
+| Method | Path                                    | Notes                                       |
+| ------ | --------------------------------------- | ------------------------------------------- |
+| `POST` | `/api/calls/start`                      | Opens a call session, returns room token    |
+| `POST` | `/api/calls/{call_id}/end`              | Closes the session                          |
+| `POST` | `/api/calls/{call_id}/recording/start`  | Begins a chunked upload                     |
+| `POST` | `/api/calls/{call_id}/recording/chunks` | Uploads one chunk (`multipart/form-data`)   |
+| `POST` | `/api/calls/{call_id}/recording/complete` | Finalizes; notifies the AI service for transcription |
+| `POST` | `/api/calls/{call_id}/recording`        | Single-shot recording upload                |
+| `GET`  | `/api/calls/{call_id}/recording/file`   | Streams the stored recording                |
+
+Room token TTL is `CALL_ROOM_TOKEN_TTL_MINUTES` (default 15).
+
+## 8.16 Invites (`/api/invites`)
+
+| Method | Path                      | Notes                                                  |
+| ------ | ------------------------- | ------------------------------------------------------ |
+| `GET`  | `/api/invites/validate`   | Auth: none. Validates an invite token before signup    |
+| `POST` | `/api/invites/accept`     | Auth: none. Accepts the invite and sets a password      |
+
+Invite token TTL is `INVITE_TOKEN_TTL_HOURS` (default 72). Invites are created
+from the admin routes below and delivered via Mailjet.
+
+## 8.17 Admin (`/api/admin`)
+
+All routes require `admin` unless noted.
+
+| Method   | Path                                                | Notes                                    |
+| -------- | --------------------------------------------------- | ---------------------------------------- |
+| `GET`    | `/api/admin/overview`                               | Tenant-wide metrics                      |
+| `GET`    | `/api/admin/activity-log`                           | Audit/activity log                       |
+| `GET`    | `/api/admin/users`                                  | All users                                |
+| `POST`   | `/api/admin/users`                                  | Creates a user and sends an invite       |
+| `PATCH`  | `/api/admin/users/{user_id}`                        | Update role/status/profile               |
+| `DELETE` | `/api/admin/users/{user_id}`                        | Soft delete; recorded in `deleted_users` |
+| `GET`    | `/api/admin/deleted-users`                          | Previously deleted users                 |
+| `POST`   | `/api/admin/invites/{user_id}/revoke`               | Revokes a pending invite                 |
+| `GET`    | `/api/admin/failed-invites`                         | Invites whose delivery failed            |
+| `POST`   | `/api/admin/failed-invites/{failed_id}/reinvite`    | Retry delivery                           |
+| `DELETE` | `/api/admin/failed-invites/{failed_id}`             | Discard the record                       |
+| `GET`    | `/api/admin/users/{user_id}/permissions`            | Effective permission set                 |
+| `PUT`    | `/api/admin/users/{user_id}/permissions`            | Replace permission overrides             |
+
+## 8.18 Teams (`/api/admin/teams`)
+
+Registered **without** a trailing slash.
+
+| Method   | Path                                            | Notes                          |
+| -------- | ----------------------------------------------- | ------------------------------ |
+| `GET`    | `/api/admin/teams`                              | All teams                      |
+| `POST`   | `/api/admin/teams`                              | Create a team                  |
+| `GET`    | `/api/admin/teams/mine`                         | Teams the caller manages       |
+| `GET`    | `/api/admin/teams/{team_id}`                    | Single team with members       |
+| `PATCH`  | `/api/admin/teams/{team_id}`                    | Rename / reassign manager      |
+| `DELETE` | `/api/admin/teams/{team_id}`                    | Delete team                    |
+| `POST`   | `/api/admin/teams/{team_id}/members`            | Add a member                   |
+| `DELETE` | `/api/admin/teams/{team_id}/members/{agent_id}` | Remove a member                |
+
+A given agent may appear at most once per team (unique constraint).
+
+## 8.19 AI Control Plane (`/api/agent`)
+
+The backend is the source of truth for AI runs, traces, actions, and approvals.
+Routes marked **service** accept `X-AI-Service-Token` (section 3.1); the rest are
+cookie-authenticated UI routes, most of them admin-only.
+
+Runs and traces:
+
+| Method  | Path                                | Notes                                        |
+| ------- | ----------------------------------- | -------------------------------------------- |
+| `POST`  | `/api/agent/runs`                   | service — create a run with a stable external ID |
+| `GET`   | `/api/agent/runs`                   | Paginated run list                           |
+| `GET`   | `/api/agent/runs/{run_id}`          | Single run                                   |
+| `PATCH` | `/api/agent/runs/{run_id}`          | service — update status/result               |
+| `POST`  | `/api/agent/runs/{run_id}/trace`    | service — append a trace step                |
+| `GET`   | `/api/agent/runs/{run_id}/trace`    | Ordered trace steps                          |
+| `GET`   | `/api/agent/control-center`         | Combined control-center payload              |
+
+Actions and approvals:
+
+| Method | Path                                        | Notes                                       |
+| ------ | ------------------------------------------- | ------------------------------------------- |
+| `POST` | `/api/agent/actions`                        | service — dispatch a proposed action        |
+| `GET`  | `/api/agent/approvals`                      | Pending approval requests                   |
+| `POST` | `/api/agent/approvals/{approval_id}/approve` | Approve and execute the CRM write          |
+| `POST` | `/api/agent/approvals/{approval_id}/reject` | Reject the proposal                         |
+
+Settings, registry, and credentials:
+
+| Method   | Path                                                     | Notes                              |
+| -------- | -------------------------------------------------------- | ---------------------------------- |
+| `GET`    | `/api/agent/settings`                                    | Per-agent-type settings            |
+| `PATCH`  | `/api/agent/settings/{agent_type}`                       | Update one agent type              |
+| `GET`    | `/api/agent/ai-agents`                                   | AI agent registry                  |
+| `PATCH`  | `/api/agent/ai-agents/{agent_key}`                       | Enable/disable, change status      |
+| `GET`    | `/api/agent/ai-agents/runtime`                           | Runtime/heartbeat view             |
+| `POST`   | `/api/agent/ai-service/heartbeat`                        | service — liveness ping            |
+| `GET`    | `/api/agent/service-credentials`                         | List issued credentials (no raw tokens) |
+| `POST`   | `/api/agent/service-credentials`                         | Issue a credential; raw token returned **once** |
+| `DELETE` | `/api/agent/service-credentials/{credential_id}`         | Revoke                             |
+| `GET`    | `/api/agent/ai-agents/{agent_key}/credentials`           | Credentials scoped to an agent     |
+| `POST`   | `/api/agent/ai-agents/{agent_key}/credentials`           | Issue agent-scoped credential      |
+| `DELETE` | `/api/agent/ai-agents/{agent_key}/credentials/{credential_id}` | Revoke                       |
+
+Workflow data feeds (all **service**, consumed by the AI service scheduler):
+
+| Method | Path                                              | Notes                                        |
+| ------ | ------------------------------------------------- | -------------------------------------------- |
+| `GET`  | `/api/agent/users/summary-candidates`             | Users due a daily summary                    |
+| `GET`  | `/api/agent/users/{user_id}/summary-context`      | Role-scoped context for that user's summary  |
+| `GET`  | `/api/agent/leads/stale-candidates`               | Leads needing a nudge                        |
+| `POST` | `/api/agent/leads/score/sweep`                    | Triggers a lead-score recompute sweep        |
+| `GET`  | `/api/agent/deals/risk-candidates`                | Deals to evaluate for risk                   |
+| `GET`  | `/api/agent/tasks/deadline-candidates`            | Tasks approaching their deadline             |
+| `POST` | `/api/agent/tasks/deadline-alerts`                | Records deadline alert output                |
+| `POST` | `/api/agent/tasks/deadline-sweep`                 | Runs the rule-based deadline sweep           |
+| `GET`  | `/api/agent/memory/{entity_type}/{entity_id}`     | Prior AI actions for an entity               |
+| `GET`  | `/api/agent/entity-snapshot/{entity_type}/{entity_id}` | Current entity state for prompt context |
+| `GET`  | `/api/agent/rag/snapshot`                         | CRM documents for RAG indexing               |
+| `POST` | `/api/agent/rag/reconcile`                        | Reconciles index state with the backend      |
+| `GET`  | `/api/agent/team-stats`                           | Manager-scoped team AI stats                 |
+
 ## 9. Frontend Integration Playbook
 
 ## 9.1 Recommended Auth Flow
 
-1. Login/register and store `access_token` + `refresh_token`.
-2. Send bearer token on all protected requests.
-3. On `401`, call `/api/auth/refresh` once.
-4. Do not run refresh flow on `403`; treat it as permission/auth-header/inactive-user problem.
-5. Replace stored tokens with rotated values.
-6. Retry original request once.
-7. If refresh fails, clear session and redirect to login.
+1. Login/register with `credentials: "include"`; the backend sets the auth cookies.
+2. Send cookies on every request and `X-CSRF-Token` on mutating requests.
+3. On `401`, call `/api/auth/refresh` once (also with credentials).
+4. Do not run refresh flow on `403`; treat it as a permission, CSRF, or inactive-user problem.
+5. Retry the original request once after a successful refresh.
+6. If refresh fails, clear client state and redirect to login.
+7. Do not store tokens in `localStorage` — the cookies are HttpOnly by design.
 
-## 9.1.1 File Upload Note (Import Endpoints)
+## 9.1.1 File Upload Note (Import and Avatar Endpoints)
 
-For `/api/import/*` endpoints, use `FormData` instead of JSON:
+For `/api/import/*`, `/api/auth/avatar`, and call-recording uploads, use `FormData`:
 
 ```ts
 const formData = new FormData();
@@ -657,8 +951,9 @@ formData.append("file", fileInput.files[0]);
 
 await fetch(`${API_BASE}/api/import/customers`, {
   method: "POST",
+  credentials: "include",
   headers: {
-    Authorization: `Bearer ${accessToken}`,
+    "X-CSRF-Token": readCookie("csrf_token"),
   },
   body: formData,
 });
@@ -670,32 +965,40 @@ Do not manually set `Content-Type` when sending `FormData`; browser sets multipa
 
 ```ts
 const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+
+function readCookie(name: string): string | undefined {
+  return document.cookie
+    .split("; ")
+    .find((row) => row.startsWith(`${name}=`))
+    ?.split("=")[1];
+}
 
 async function apiFetch(path: string, init: RequestInit = {}, retry = true) {
-  const accessToken = localStorage.getItem("access_token");
+  const method = (init.method || "GET").toUpperCase();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(init.headers as Record<string, string>),
   };
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
 
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+    const csrf = readCookie("csrf_token");
+    if (csrf) headers["X-CSRF-Token"] = csrf;
+  }
+
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers,
+    credentials: "include",
+  });
+
   if (response.status !== 401 || !retry) return response;
-
-  const refreshToken = localStorage.getItem("refresh_token");
-  if (!refreshToken) return response;
 
   const refreshRes = await fetch(`${API_BASE}/api/auth/refresh`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ refresh_token: refreshToken }),
+    credentials: "include",
   });
-
   if (!refreshRes.ok) return response;
-  const refreshData = await refreshRes.json();
-  localStorage.setItem("access_token", refreshData.access_token);
-  localStorage.setItem("refresh_token", refreshData.refresh_token);
 
   return apiFetch(path, init, false);
 }
@@ -705,14 +1008,14 @@ async function apiFetch(path: string, init: RequestInit = {}, retry = true) {
 
 - `400`: show request correction message
 - `401`: trigger refresh flow or logout
-- `403`: show permission denied UI
+- `403`: show permission denied UI (also check the CSRF header)
 - `404`: show not found/empty state
 - `413`: show payload too large message
 - `422`: map `error.details` to form fields
 - `429`: read `Retry-After` and show retry countdown
 - `500`: show generic server error banner
 
-## 9. CRM Workflow
+## 10. CRM Workflow
 
 The AutoCRM follows a strict lead-to-deal-to-customer conversion workflow, matching the reference CRM (Frappe) pattern.
 
@@ -728,7 +1031,8 @@ The AutoCRM follows a strict lead-to-deal-to-customer conversion workflow, match
 
 2. **Lead-to-Deal Conversion** (Manual)
    - Endpoint: `POST /api/leads/{lead_id}/convert-to-deal`
-   - Requires: `sales_manager` or `admin` role
+   - Auth: any authenticated user (`require_auth`). There is no additional role
+     guard on this route — access is bounded by which leads the caller can see.
    - Payload:
      ```json
      {
@@ -792,15 +1096,15 @@ The AutoCRM follows a strict lead-to-deal-to-customer conversion workflow, match
 - Customers are created only when deal is won
 - Clear status semantics: lead → deal → customer
 
-## 10. Frontend QA Checklist
+## 11. Frontend QA Checklist
 
-- Login and register both store tokens correctly.
-- Protected calls include bearer token.
-- Auto-refresh works and retries original request.
+- Login and register set the auth cookies (visible in devtools → Application → Cookies).
+- Protected calls send `credentials: "include"`; mutating calls send `X-CSRF-Token`.
+- Auto-refresh works on `401` and retries the original request once.
 - Role-protected screens hide unauthorized actions.
 - `PATCH` methods are used where required (not `PUT`).
 - Rate-limit and validation errors are user-friendly in UI.
-- Logout clears local session and revokes current token.
+- Logout clears client state; server revokes both tokens and clears cookies.
 - CSV import works for leads.
 - Connected site payload ingestion works for leads.
 - Excel import works for tickets.
@@ -810,11 +1114,11 @@ The AutoCRM follows a strict lead-to-deal-to-customer conversion workflow, match
 - Deal status update to "lost" closes deal without customer creation.
 - Customers are never created from leads directly (only via won deals).
 
-## 11. Notes for Maintainers
+## 12. Notes for Maintainers
 
 - Use this file as the source of truth for endpoint contracts.
 - Re-export OpenAPI spec from `/openapi.json` for generated clients if needed.
 - Keep frontend enum values synchronized with section 6.
 - If backend contracts change, bump API docs and notify frontend team in the same PR.
-- CRM Workflow (section 9) defines the lead → deal → customer conversion rules.
-- Database schema now includes: leads.converted, deals.status, deals.customer_id, deals.closed_at.
+- CRM Workflow (section 10) defines the lead → deal → customer conversion rules.
+- Auth is cookie-only for users; there is no bearer-token path. See section 3.

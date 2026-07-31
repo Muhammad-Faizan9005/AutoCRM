@@ -55,13 +55,25 @@ AutoCRM addresses these challenges by integrating AI-powered automation.
 - 🧱 **Repository Architecture** - Centralized data access layer
 - 🛡️ **Security Hardening** - Request IDs, structured logs, rate limits, secure headers
 
-### Planned AI Features
+### AI Features (backend control plane)
 
-- 🧠 **Smart Ticket Categorization** - Automatic classification of incoming tickets
-- 📊 **Sentiment Analysis** - Real-time customer mood detection
-- 💡 **AI Response Suggestions** - Context-aware reply recommendations
-- 📝 **Automatic Summarization** - Concise summaries of long conversation threads
-- 📈 **Analytics & Insights** - AI-driven reporting and trend analysis
+The backend is the source of truth for AI runs, traces, actions, and approvals. The AI service (separate repo) executes workflows and calls back into these APIs.
+
+Registered AI agents (`/api/agent`):
+
+- 🧩 **Action Manager Agent** - Creates and dispatches playbook task actions
+- 🎯 **Lead Assistant** - Monitors lead health and suggests follow-ups
+- ⚠️ **Deal Risk Watcher** - Detects at-risk deals and triggers alerts
+- � **Daily Summary Assistant** - Produces daily CRM performance digests
+- 🎙️ **Meeting Agent** - Summarizes completed meetings and creates actions
+- ⏰ **Task Deadline Watcher** - Escalates due/overdue tasks and drafts recovery guidance
+
+Supporting backend capabilities:
+
+- 📈 **Lead Scoring** - Scheduled and on-demand lead score sweeps
+- ✅ **Approval Workflow** - Risky AI actions require human approval before CRM writes
+- 🔑 **Service Credentials** - Scoped AI agent credentials issued via Developer Mode
+- 🧾 **Run Traces** - Persisted, redacted execution traces per run
 
 ---
 
@@ -69,10 +81,13 @@ AutoCRM addresses these challenges by integrating AI-powered automation.
 
 | Layer              | Technology                                           |
 | ------------------ | ---------------------------------------------------- |
-| **Backend**        | Python, FastAPI                                      |
+| **Backend**        | Python, FastAPI, Uvicorn                             |
 | **Database**       | PostgreSQL (Supabase/Neon/managed Postgres)          |
-| **AI/LLM**         | Configurable (OpenAI, Anthropic, Gemini, Local LLMs) |
-| **Authentication** | JWT, RBAC, refresh-token rotation + revocation       |
+| **Migrations**     | Alembic (+ legacy raw SQL scripts)                   |
+| **Storage**        | Local filesystem + optional Supabase S3 (avatars)    |
+| **Email**          | Mailjet (invites, resets, notifications)             |
+| **AI/LLM**         | Delegated to the separate AutoCRM AI service         |
+| **Authentication** | JWT, RBAC, refresh-token rotation + revocation, CSRF |
 | **API Docs**       | OpenAPI/Swagger                                      |
 
 ---
@@ -91,14 +106,13 @@ AutoCRM addresses these challenges by integrating AI-powered automation.
 1. **Clone the repository**
 
    ```bash
-   git clone https://github.com/yourusername/AutoCRM.git
-   cd AutoCRM
+   git clone <backend-repo-url> AutoCRM-backend
+   cd AutoCRM-backend
    ```
 
 2. **Set up Python environment**
 
    ```bash
-   cd backend
    python -m venv venv
 
    # Windows
@@ -153,11 +167,34 @@ Core:
 ```env
 DATABASE_URL=postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=require
 JWT_SECRET_KEY=<min-32-char-secret>
+JWT_ALGORITHM=HS256
 JWT_ACCESS_TOKEN_EXPIRE_MINUTES=30
 JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
+DEBUG=True
 ```
 
-Invites + email:
+Database pool + concurrency:
+
+```env
+DB_POOL_SIZE=10
+DB_MAX_OVERFLOW=10
+DB_POOL_TIMEOUT_SECONDS=30
+DB_POOL_RECYCLE_SECONDS=3600
+DB_MAX_CONCURRENT_OPERATIONS=15
+LEAD_SCORE_SWEEP_CONCURRENCY=5
+```
+
+Security middleware:
+
+```env
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_REQUESTS_PER_MINUTE=100
+RATE_LIMIT_MAX_QUEUE_SIZE=500
+MAX_REQUEST_SIZE_BYTES=1048576
+SECURITY_HEADERS_ENABLED=true
+```
+
+Invites, password reset + email:
 
 ```env
 MAILJET_API_KEY=
@@ -166,29 +203,48 @@ MAILJET_SENDER_EMAIL=
 MAILJET_SENDER_NAME=AutoCRM
 FRONTEND_BASE_URL=http://localhost:5173
 INVITE_TOKEN_TTL_HOURS=72
+RESET_TOKEN_TTL_MINUTES=30
+```
+
+Avatar storage (local + optional Supabase S3):
+
+```env
+AVATAR_STORAGE_DIR=storage/avatars
+AVATAR_PUBLIC_BASE_URL=http://localhost:8000
+AVATARS_ENABLED=true
+AVATAR_CACHE_TTL_SECONDS=3600
+S3_ENDPOINT=
+S3_ACCESS_KEY=
+S3_SECRET_KEY=
+S3_BUCKET_NAME=avatars
+S3_REGION=ap-southeast-2
 ```
 
 Optional AI:
 
 ```env
 LLM_API_KEY=
-LLM_MODEL=gpt-4
+LLM_MODEL=
 LLM_BASE_URL=
 AI_SERVICE_BASE_URL=http://localhost:8001
 AI_SERVICE_WEBHOOK_TOKEN=<shared-dev-token>
-AUTOCRM_AI_AGENT_KEY=<agent-key>
-AUTOCRM_AI_SERVICE_TOKEN=<agent-service-token>
+AI_TRANSCRIPTION_NOTIFY_ENABLED=true
+AI_SERVICE_NOTIFY_TIMEOUT_SECONDS=10
 ```
 
 Operational limits:
 
 ```env
 CALL_RECORDINGS_DIR=storage/recordings
+CALL_ROOM_TOKEN_TTL_MINUTES=15
 CALL_RECORDING_CHUNK_MAX_BYTES=5000000
 CALL_RECORDING_MAX_BYTES=100000000
 IMPORT_MAX_FILE_BYTES=5000000
 IMPORT_MAX_ROWS=5000
+PERMISSIONS_STORAGE_DIR=storage/permissions
 ```
+
+Configuration is validated at startup by `app/core/startup_checks.py`, which aborts boot on invalid production config (`DEBUG=False`) and warns in development.
 
 ---
 
@@ -205,33 +261,66 @@ IMPORT_MAX_ROWS=5000
 ## 📁 Project Structure
 
 ```
-AutoCRM/
-├── backend/
-│   ├── alembic/                  # Alembic environment + revision scripts
-│   ├── app/
-│   │   ├── main.py                # FastAPI application entry
-│   │   ├── config.py              # Settings & environment config
-│   │   ├── database.py            # Database client bootstrap
-│   │   ├── postgres_client.py     # PostgreSQL query adapter
-│   │   ├── auth/                  # JWT helpers, dependencies, token revocation
-│   │   ├── middleware/            # Error handling, logging, security, rate limiting
-│   │   ├── repositories/          # Data access layer
-│   │   ├── routers/               # API route handlers
-│   │   ├── schemas/               # Pydantic models
-│   │   ├── services/              # Business logic
-│   │   └── utils/                 # Utilities and helpers
-│   ├── database/
-│   │   ├── schema.sql             # Base schema
-│   │   ├── migrations/            # Raw SQL migration notes/scripts
-│   │   └── seeds/
-│   ├── docs/                      # API docs and guides
-│   ├── storage/                   # Permissions JSON (per user)
-│   ├── tests/
-│   ├── requirements.txt
-│   ├── .env.example
-│   └── .env
-└── README.md
+backend/
+├── alembic/                       # Alembic environment + revision scripts
+├── app/
+│   ├── main.py                    # FastAPI application entry + router registration
+│   ├── config.py                  # Settings & environment config
+│   ├── database.py                # Database client bootstrap + run_db_operation
+│   ├── postgres_client.py         # PostgreSQL query adapter
+│   ├── auth/                      # JWT helpers, cookies/CSRF, dependencies, token store
+│   ├── core/                      # Startup configuration checks
+│   ├── db/                        # SQLAlchemy session management
+│   ├── exceptions/                # Custom exception types
+│   ├── middleware/                # Error handling, logging, security, rate limiting
+│   ├── models/
+│   ├── repositories/              # Data access layer
+│   ├── routers/                   # API route handlers
+│   ├── schemas/                   # Pydantic models
+│   ├── services/                  # Business logic
+│   ├── utils/                     # Cache, circuit breaker, retry, sanitization, RBAC helpers
+│   └── validators/                # Reusable field validators
+├── database/
+│   ├── schema.sql                 # Base schema
+│   ├── migrations/                # Raw SQL migration scripts
+│   └── seeds/
+├── docs/                          # API docs and guides
+├── scripts/
+├── storage/                       # Local avatars + per-user permissions JSON
+├── tests/
+├── requirements.txt
+├── Procfile / railway.json / runtime.txt
+├── deploy.ps1 / deploy.sh
+└── .env.example
 ```
+
+---
+
+## 🔌 Registered Routers
+
+All routers are mounted under `/api` in `app/main.py`:
+
+| Prefix                | Tag             |
+| --------------------- | --------------- |
+| `/api/auth`           | Authentication  |
+| `/api/users`          | Users           |
+| `/api/customers`      | Customers       |
+| `/api/tickets`        | Tickets         |
+| `/api/import`         | Import          |
+| `/api/leads`          | Leads           |
+| `/api/deals`          | Deals           |
+| `/api/organizations`  | Organizations   |
+| `/api/tasks`          | Tasks           |
+| `/api/notes`          | Notes           |
+| `/api/notifications`  | Notifications   |
+| `/api/invites`        | Invites         |
+| `/api/dashboard`      | Dashboard       |
+| `/api/admin`          | Admin           |
+| `/api/admin/teams`    | Teams           |
+| `/api/calls`          | Calls           |
+| `/api/agent`          | Agent Actions   |
+
+Unprefixed: `GET /` (service banner) and `GET /health` (liveness).
 
 ---
 
@@ -293,14 +382,30 @@ For implementation-accurate endpoint contracts, payload examples, auth flow, and
 
 Core tables currently used by the backend:
 
-- `customers`
-- `tickets`
-- `ticket_messages`
-- `agents`
-- `permissions`
-- `failed_invites`
-- `teams` + `team_members`
-- `revoked_tokens`
+**Identity, access + auth**
+- `agents` (users), `agent_permissions`, `deleted_users`
+- `teams`, `team_members`
+- `revoked_tokens`, `password_reset_tokens`
+- `invites`, `failed_invites`, `email_preferences`
+
+**CRM records**
+- `organizations`, `customers`
+- `leads`, `deals`
+- `tasks`, `notes`
+- `tickets`, `ticket_messages`
+- `notifications`, `status_change_logs`
+- `task_deadline_alerts`
+
+**Calls**
+- `call_sessions`, `call_room_tokens`
+
+**AI control plane**
+- `ai_agents` (registry), `ai_agent_credentials`
+- `ai_agent_runs`, `ai_agent_run_traces`
+- `ai_agent_actions`, `ai_agent_approval_requests`
+- `ai_agent_settings`, `ai_interactions`
+
+Row Level Security is enabled on the sensitive tables via dedicated Alembic revisions. Schema changes are managed through `alembic/versions/` (`python -m alembic upgrade head`); `database/migrations/*.sql` holds the earlier raw SQL scripts.
 
 ---
 
@@ -311,12 +416,6 @@ Core tables currently used by the backend:
 3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
 4. Push to the branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
 

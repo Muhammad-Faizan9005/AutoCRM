@@ -1,196 +1,177 @@
-# Running Your First Migration
+# Database Migration Guide
 
-## ✅ Setup Complete!
+Schema changes for the AutoCRM backend are managed with **Alembic**. Alembic is
+already configured in this repo; revisions live in `alembic/versions/`.
 
-I've set up Alembic migrations for your project. Here's what was done:
+The project uses a repository layer rather than SQLAlchemy ORM models, so
+`target_metadata` is `None` in `alembic/env.py`. Autogenerate will **not** detect
+model changes — write migration operations explicitly.
 
-1. ✅ Installed `alembic` and `psycopg2-binary`
-2. ✅ Initialized Alembic in your project
-3. ✅ Configured Alembic to use your app settings
-4. ✅ Created first migration: `add_password_hash_to_agents`
-5. ✅ Updated `requirements.txt`
+---
 
-## 🔧 Before Running Migrations
+## Prerequisites
 
-You need to set up your database connection string in `.env`:
-
-### Get Your Database Password from Supabase:
-
-1. Go to your Supabase Dashboard: https://supabase.com/dashboard
-2. Select your project: **AutoCRM**
-3. Go to **Settings** (gear icon) → **Database**
-4. Scroll to **Connection string** section
-5. Select **URI** tab
-6. Copy the connection string (it looks like):
-   ```
-   postgresql://postgres.snwheczzakjyhfaitmoq:[YOUR-PASSWORD]@aws-0-ap-south-1.pooler.supabase.com:6543/postgres
-   ```
-7. Replace `[YOUR-PASSWORD]` with your actual database password
-
-### Update Your `.env` File:
+Set `DATABASE_URL` in `backend/.env` before running any Alembic command.
+`alembic/env.py` reads it from settings and fails fast if it is missing or still
+the placeholder value.
 
 ```env
-DATABASE_URL=postgresql://postgres.snwheczzakjyhfaitmoq:[YOUR-ACTUAL-PASSWORD]@aws-0-ap-south-1.pooler.supabase.com:6543/postgres
+DATABASE_URL=postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=require
 ```
 
-**⚠️ IMPORTANT:** Replace `[YOUR-ACTUAL-PASSWORD]` with the real password from Supabase!
+Get the connection string from your database provider (Supabase, Neon, or other
+managed Postgres). For Supabase: **Dashboard → Settings → Database → Connection
+string → URI**, then substitute your real password.
 
-## 🚀 Running the Migration
+Keep credentials in `.env` or a secret manager only — never commit them.
 
-Once you've updated the `DATABASE_URL` in `.env`, run:
+---
+
+## Applying Migrations
 
 ```bash
 # Apply all pending migrations
-alembic upgrade head
+python -m alembic upgrade head
+
+# Confirm the applied revision
+python -m alembic current
 ```
 
-Expected output:
-```
-INFO  [alembic.runtime.migration] Running upgrade  -> 945b9872d621, add_password_hash_to_agents
-```
+Using `python -m alembic` ensures the project root is on `sys.path` so
+`app.config` imports resolve.
 
-## ✅ Verify Migration Success
+---
 
-Test if it worked:
+## Command Reference
 
 ```bash
-python -c "from app.database import get_db; db = get_db(); result = db.table('agents').select('password_hash').limit(1).execute(); print('✓ password_hash column exists!')"
+# Current revision
+python -m alembic current
+
+# Full history
+python -m alembic history
+
+# Apply everything / step forward one
+python -m alembic upgrade head
+python -m alembic upgrade +1
+
+# Roll back one revision / to a specific revision
+python -m alembic downgrade -1
+python -m alembic downgrade <revision_id>
+
+# Create a new empty revision
+python -m alembic revision -m "description_of_change"
 ```
 
-## 📋 Migration Commands Reference
+---
 
-```bash
-# View current migration version
-alembic current
+## Creating a New Migration
 
-# View migration history
-alembic history
+1. Generate the revision file:
 
-# Apply all migrations
-alembic upgrade head
-
-# Apply one migration forward
-alembic upgrade +1
-
-# Rollback one migration
-alembic downgrade -1
-
-# Rollback to specific version
-alembic downgrade 945b9872d621
-
-# Create new migration
-alembic revision -m "description_of_change"
-```
-
-## 🔄 Creating Future Migrations
-
-### Example: Add a new column
-
-1. Create migration:
    ```bash
-   alembic revision -m "add_avatar_to_agents"
+   python -m alembic revision -m "add_avatar_to_agents"
    ```
 
-2. Edit the generated file in `alembic/versions/`:
+2. Implement both `upgrade()` and `downgrade()` in the new file under
+   `alembic/versions/`:
+
    ```python
    def upgrade() -> None:
-       op.add_column('agents', 
-           sa.Column('avatar_url', sa.String(500), nullable=True)
-       )
-   
+       op.add_column("agents", sa.Column("avatar_url", sa.String(500), nullable=True))
+
+
    def downgrade() -> None:
-       op.drop_column('agents', 'avatar_url')
+       op.drop_column("agents", "avatar_url")
    ```
 
-3. Apply migration:
+3. Apply it:
+
    ```bash
-   alembic upgrade head
+   python -m alembic upgrade head
    ```
 
-### Example: Add an index
+### Common operations
 
 ```python
-def upgrade() -> None:
-    op.create_index('idx_tickets_status', 'tickets', ['status'])
+# Index
+op.create_index("idx_tickets_status", "tickets", ["status"])
+op.drop_index("idx_tickets_status", table_name="tickets")
 
-def downgrade() -> None:
-    op.drop_index('idx_tickets_status', table_name='tickets')
+# Foreign key
+op.create_foreign_key(
+    "fk_tickets_assigned_to",
+    "tickets", "agents",
+    ["assigned_to"], ["id"],
+    ondelete="SET NULL",
+)
+op.drop_constraint("fk_tickets_assigned_to", "tickets", type_="foreignkey")
 ```
 
-### Example: Add a foreign key
+### Row Level Security
 
-```python
-def upgrade() -> None:
-    op.create_foreign_key(
-        'fk_tickets_assigned_to',
-        'tickets', 'agents',
-        ['assigned_to'], ['id'],
-        ondelete='SET NULL'
-    )
+Several tables are RLS-protected. When adding a table that stores user-scoped
+data, add the enabling policy in the same or a follow-up revision — see
+`b2c3d4e5f6a1_add_teams_rls.py`, `j2k3l4m5n7_add_rls_leads_calls.py`, and
+`t6u7v8w9x0y1_add_customer_organization_rls.py` for the established pattern.
 
-def downgrade() -> None:
-    op.drop_constraint('fk_tickets_assigned_to', 'tickets', type_='foreignkey')
-```
+---
 
-## 📁 Project Structure
+## Layout
 
 ```
 backend/
 ├── alembic/
-│   ├── versions/
-│   │   └── 945b9872d621_add_password_hash_to_agents.py
-│   ├── env.py              # Configuration
+│   ├── versions/           # Revision scripts (linear chain)
+│   ├── env.py              # Reads DATABASE_URL from app.config
+│   ├── script.py.mako
 │   └── README
-├── alembic.ini             # Alembic settings
-├── requirements.txt        # Updated with alembic
-└── .env                    # Add DATABASE_URL here
+├── alembic.ini
+├── database/
+│   ├── schema.sql          # Base schema reference
+│   └── migrations/         # Legacy raw SQL scripts (historical)
+└── .env                    # DATABASE_URL
 ```
 
-## 🐛 Troubleshooting
-
-### "Could not connect to database"
-- Check `DATABASE_URL` in `.env` is correct
-- Verify database password
-- Check internet connection to Supabase
-
-### "Target database is not up to date"
-```bash
-alembic stamp head
-```
-
-### "Column already exists"
-The migration was already applied manually. You can:
-1. Mark as applied: `alembic stamp head`
-2. Or rollback and reapply: `alembic downgrade -1 && alembic upgrade head`
-
-### "Multiple heads detected"
-```bash
-alembic merge heads -m "merge_migrations"
-```
-
-## 🎯 Next Steps
-
-After running your first migration:
-
-1. ✅ The `password_hash` column will be added to `agents` table
-2. ✅ Your authentication system will work fully
-3. ✅ You can register and login users
-4. ✅ Frontend can connect and authenticate
-
-## 🔒 Production Best Practices
-
-- ✅ Always test migrations on staging first
-- ✅ Backup database before running migrations in production
-- ✅ Review migration code before applying
-- ✅ Keep migrations in version control (Git)
-- ✅ Never edit applied migrations
-- ✅ Write both upgrade() and downgrade() functions
-- ✅ Test rollback before deploying
+`database/migrations/*.sql` predates Alembic and is kept for reference only.
+All new schema changes must go through Alembic.
 
 ---
 
-**Ready to run?** Update your `.env` with the database password and run:
+## Troubleshooting
+
+**"Database URL is required before running Alembic migrations"**
+`DATABASE_URL` is unset in `backend/.env`, or `alembic.ini` still has the
+placeholder `sqlalchemy.url`.
+
+**"Could not connect to database"**
+Verify the host, port, password, and `sslmode`. Pooled Supabase connections
+typically use port `6543`; direct connections use `5432`.
+
+**"Target database is not up to date"**
+The DB is behind the revision chain. Run `python -m alembic upgrade head`, or
+`python -m alembic stamp head` if the schema was already applied out-of-band.
+
+**"Column/table already exists"**
+The change was applied manually. Either mark it applied with
+`python -m alembic stamp <revision>`, or make the migration idempotent
+(`IF NOT EXISTS`).
+
+**"Multiple heads detected"**
+Two branches were created in parallel:
 
 ```bash
-alembic upgrade head
+python -m alembic heads
+python -m alembic merge heads -m "merge_migrations"
 ```
+
+---
+
+## Production Practices
+
+- Test migrations against staging before production
+- Back up the database before applying migrations in production
+- Review the generated SQL/operations before applying
+- Keep every revision in version control
+- Never edit a revision that has already been applied — add a new one
+- Always implement `downgrade()` and verify rollback
