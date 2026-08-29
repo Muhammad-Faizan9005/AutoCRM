@@ -30,3 +30,6 @@ openpyxl>=3.1.5
 # Testing
 pytest>=8.3.0
 httpx>=0.28.0
+
+# Windows/slim images ship no system tz database; ZoneInfo("Asia/Karachi") needs this.
+tzdata==2025.2

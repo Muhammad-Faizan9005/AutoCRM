@@ -149,6 +149,19 @@ class Settings(BaseSettings):
     AI_SERVICE_NOTIFY_TIMEOUT_SECONDS: int = Field(default=10, validation_alias=AliasChoices("AI_SERVICE_NOTIFY_TIMEOUT_SECONDS"))
     AI_SERVICE_WEBHOOK_TOKEN: Optional[str] = Field(default=None, validation_alias=AliasChoices("AI_SERVICE_WEBHOOK_TOKEN"))
 
+    # Cal.com scheduling
+    CAL_API_KEY: Optional[str] = Field(default=None, validation_alias=AliasChoices("CAL_API_KEY"))
+    CAL_USERNAME: Optional[str] = Field(default=None, validation_alias=AliasChoices("CAL_USERNAME"))
+    CAL_EVENT_TYPE_SLUG: Optional[str] = Field(default=None, validation_alias=AliasChoices("CAL_EVENT_TYPE_SLUG"))
+    # The zone the business books in. A bare clock time from a visitor ("3pm")
+    # means this zone, never UTC.
+    CAL_TIMEZONE: str = Field(default="UTC", validation_alias=AliasChoices("CAL_TIMEZONE"))
+    CAL_TIMEOUT_SECONDS: int = Field(default=20, validation_alias=AliasChoices("CAL_TIMEOUT_SECONDS"))
+
+    # Grace period after a handoff during which a rep can still join and answer
+    # live. Only once it lapses is the visitor told they'll be emailed instead.
+    FRONTDESK_HANDOFF_WAIT_MINUTES: int = Field(default=5, validation_alias=AliasChoices("FRONTDESK_HANDOFF_WAIT_MINUTES"))
+
     model_config = SettingsConfigDict(env_file=ENV_FILE, case_sensitive=True, extra="ignore")
 
     @field_validator("DEBUG", mode="before")

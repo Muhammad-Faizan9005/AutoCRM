@@ -41,6 +41,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "https://auto-crm-frontend-henna.vercel.app",
     ],  # only allow known frontend origins
     allow_credentials=True,
@@ -111,7 +112,7 @@ async def health_check():
 
 
 # Include routers
-from app.routers import auth, customers, deals, imports, leads, notes, organizations, tasks, tickets, users, dashboard, admin, teams, notifications, invites, calls, agent
+from app.routers import auth, customers, deals, imports, leads, notes, organizations, tasks, tickets, users, dashboard, admin, teams, notifications, invites, calls, agent, frontdesk, frontdesk_internal
 
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(users.router, prefix="/api/users", tags=["Users"])
@@ -130,3 +131,5 @@ app.include_router(admin.router, prefix="/api/admin", tags=["Admin"])
 app.include_router(teams.router, prefix="/api/admin/teams", tags=["Teams"])
 app.include_router(calls.router, prefix="/api/calls", tags=["Calls"])
 app.include_router(agent.router, prefix="/api/agent", tags=["Agent Actions"])
+app.include_router(frontdesk.router, prefix="/api/frontdesk", tags=["Front Desk"])
+app.include_router(frontdesk_internal.router, prefix="/api/internal/frontdesk", tags=["Front Desk Internal"])

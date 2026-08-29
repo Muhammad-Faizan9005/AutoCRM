@@ -64,6 +64,7 @@ AI_AGENT_RUNTIME_ALIASES = {
     "daily_summary_assistant": {"daily_summary_assistant", "daily_summary", "summary_assistant"},
     "meeting_agent": {"meeting_agent", "meeting_assistant", "meeting_complete", "meeting_intel"},
     "task_deadline_watcher": {"task_deadline_watcher", "task_deadline_watch", "deadline_watch"},
+    "frontdesk_agent": {"frontdesk_agent", "frontdesk", "frontdesk_message"},
 }
 IMPLEMENTED_AI_AGENT_KEYS = set(AI_AGENT_RUNTIME_ALIASES.keys())
 
@@ -103,6 +104,12 @@ DEFAULT_AI_AGENT_REGISTRY = [
         "display_name": "Task Deadline Watcher",
         "description": "Monitors due and overdue tasks, escalates risk, and drafts internal recovery guidance.",
         "agent_type": "task_deadline_watcher",
+    },
+    {
+        "agent_key": "frontdesk_agent",
+        "display_name": "Front Desk Agent",
+        "description": "Handles web chat and email intake, approved knowledge answers, handoffs, and meeting requests.",
+        "agent_type": "frontdesk_agent",
     },
 ]
 
@@ -1417,6 +1424,7 @@ async def _ensure_agent_settings(setting_repository: AgentSettingRepository) -> 
         ("deal_risk_watcher", True),
         ("daily_summary_assistant", True),
         ("task_deadline_watcher", True),
+        ("frontdesk_agent", True),
     ]
     existing = await setting_repository.list_settings()
     by_type = {item.get("agent_type"): item for item in existing}
