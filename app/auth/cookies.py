@@ -14,6 +14,9 @@ CSRF_HEADER = "X-CSRF-Token"
 _AUTH_COOKIE_PATH = "/api/auth"
 _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _CSRF_EXEMPT_PATHS = {"/api/auth/login", "/api/auth/register"}
+# Public front-desk endpoints authenticate with X-Visitor-Token, not cookies.
+# A logged-in CRM user's access_token otherwise rides along and trips the check.
+_CSRF_EXEMPT_PREFIXES = ("/api/frontdesk/public/",)
 
 
 def _cookie_secure() -> bool:
@@ -69,6 +72,7 @@ async def csrf_middleware(request: Request, call_next):
     if (
         request.method.upper() in _MUTATING_METHODS
         and request.url.path not in _CSRF_EXEMPT_PATHS
+        and not request.url.path.startswith(_CSRF_EXEMPT_PREFIXES)
         and (ACCESS_TOKEN_COOKIE in request.cookies or REFRESH_TOKEN_COOKIE in request.cookies)
     ):
         cookie_value = request.cookies.get(CSRF_TOKEN_COOKIE)
