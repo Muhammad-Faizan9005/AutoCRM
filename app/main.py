@@ -39,10 +39,14 @@ app.mount("/static/avatars", StaticFiles(directory=settings.AVATAR_STORAGE_DIR),
 # requests receive CORS headers before any custom middleware intercepts them.
 app.add_middleware(
     CORSMiddleware,
+    # Deploy origins come from ALLOWED_ORIGINS (comma-separated); dev defaults stay.
     allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://auto-crm-frontend-henna.vercel.app",
+        o.strip()
+        for o in os.getenv(
+            "ALLOWED_ORIGINS",
+            "http://localhost:5173,http://127.0.0.1:5173,https://auto-crm-frontend-henna.vercel.app",
+        ).split(",")
+        if o.strip()
     ],  # only allow known frontend origins
     allow_credentials=True,
     allow_methods=["*"],
