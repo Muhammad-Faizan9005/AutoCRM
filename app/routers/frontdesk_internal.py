@@ -9,6 +9,7 @@ Auth: X-AI-Service-Token (require_ai_agent_auth) - no human cookie access.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -148,14 +149,27 @@ DDL_STATEMENTS = [
 ]
 
 _tables_ready = False
+# Without this, concurrent first requests each start a full DDL pass and then
+# serialize behind each other's ACCESS EXCLUSIVE locks, blowing request timeouts.
+_tables_lock = asyncio.Lock()
 
 async def ensure_tables(db: PostgresClient) -> None:
     global _tables_ready
     if _tables_ready:
         return
-    for statement in DDL_STATEMENTS:
-        await query(db, statement)
-    _tables_ready = True
+    async with _tables_lock:
+        if _tables_ready:
+            return
+
+        # One transaction, one round trip: 30 separate round trips to a hosted
+        # Postgres was slow enough to time out the first page load.
+        def execute():
+            with db.engine.begin() as conn:
+                for statement in DDL_STATEMENTS:
+                    conn.execute(text(statement))
+
+        await run_db_operation(execute)
+        _tables_ready = True
 
 def new_visitor_token() -> tuple[str, str]:
     raw = secrets.token_urlsafe(32)

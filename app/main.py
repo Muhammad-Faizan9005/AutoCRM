@@ -106,6 +106,16 @@ async def _warmup_database_metadata_background() -> None:
     except Exception:
         logger.exception("database_metadata_warmup_failed")
 
+    # The front-desk tables are raw SQL, so metadata warmup does nothing for
+    # them; what the first request pays for is the DDL pass. Do it here instead.
+    try:
+        # Local import: the routers are imported below this function.
+        from app.routers.frontdesk_internal import ensure_tables as ensure_frontdesk_tables
+
+        await ensure_frontdesk_tables(db)
+    except Exception:
+        logger.exception("frontdesk_tables_warmup_failed")
+
 @app.get("/")
 async def root():
     return {"message": "Welcome to AutoCRM an Agentic AI Enabled CRM System", "status": "running"}
